@@ -6,23 +6,47 @@ import numpy as np
 
 
 def MA(series, n):
-    """简单移动平均"""
-    return series.rolling(window=n, min_periods=1).mean()
+    """
+    简单移动平均 - 正确处理倒序排列的数据（最新日期在前）
+    
+    对于倒序数据，MA(n)应该取当前及之后n-1个数据的平均值
+    实现方式：反转数据 -> 计算rolling -> 反转回来
+    """
+    # 反转数据，使数据按时间正序排列
+    reversed_series = series.iloc[::-1]
+    
+    # 在正序数据上计算MA（向前看n个值）
+    ma_reversed = reversed_series.rolling(window=n, min_periods=1).mean()
+    
+    # 反转回来，恢复倒序
+    return ma_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
 
 def EMA(series, n):
-    """指数移动平均"""
-    return series.ewm(span=n, adjust=False, min_periods=1).mean()
+    """
+    指数移动平均 - 正确处理倒序排列的数据
+    """
+    reversed_series = series.iloc[::-1]
+    ema_reversed = reversed_series.ewm(span=n, adjust=False, min_periods=1).mean()
+    return ema_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
 
 def LLV(series, n):
-    """N周期最低值"""
-    return series.rolling(window=n, min_periods=1).min()
+    """
+    N周期最低值 - 正确处理倒序排列的数据
+    """
+    reversed_series = series.iloc[::-1]
+    llv_reversed = reversed_series.rolling(window=n, min_periods=1).min()
+    return llv_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
 
 def HHV(series, n):
-    """N周期最高值"""
-    return series.rolling(window=n, min_periods=1).max()
+    """
+    N周期最高值 - 正确处理倒序排列的数据
+    """
+    reversed_series = series.iloc[::-1]
+    hhv_reversed = reversed_series.rolling(window=n, min_periods=1).max()
+    return hhv_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
 
 def SMA(X, n, m):
@@ -39,13 +63,24 @@ def SMA(X, n, m):
 
 
 def REF(series, n):
-    """向前引用N周期"""
-    return series.shift(n)
+    """
+    向前引用N周期 - 正确处理倒序排列的数据
+    
+    对于倒序数据（最新在前），REF(series, 1)应该获取"前一天"的数据
+    实现方式：反转数据 -> shift -> 反转回来
+    """
+    reversed_series = series.iloc[::-1]
+    ref_reversed = reversed_series.shift(n)
+    return ref_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
 
 def EXIST(cond, n):
-    """N周期内是否存在满足COND的情况"""
-    return cond.rolling(window=n, min_periods=1).max().astype(bool)
+    """
+    N周期内是否存在满足COND的情况 - 正确处理倒序排列的数据
+    """
+    reversed_cond = cond.iloc[::-1]
+    exist_reversed = reversed_cond.rolling(window=n, min_periods=1).max().astype(bool)
+    return exist_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
 
 
 def FINANCE(df, field_code):
@@ -124,7 +159,7 @@ def KDJ(df, n=9, m1=3, m2=3):
     return result
 
 
-def calculate_zhixing_trend(df):
+def calculate_zhixing_trend(df, m1=14, m2=28, m3=57, m4=114):
     """
     计算知行趋势线指标
     
@@ -132,15 +167,18 @@ def calculate_zhixing_trend(df):
     - 知行短期趋势线 = EMA(EMA(CLOSE,10),10)
       对收盘价连续做两次10日指数移动平均
     
-    - 知行多空线 = (MA(CLOSE,5) + MA(CLOSE,10) + MA(CLOSE,20) + MA(CLOSE,30)) / 4
-      5日、10日、20日、30日简单移动平均的平均值
+    - 知行多空线 = (MA(CLOSE,m1) + MA(CLOSE,m2) + MA(CLOSE,m3) + MA(CLOSE,m4)) / 4
+      四条均线平均值，默认使用 14, 28, 57, 114
+    
+    参数:
+        m1, m2, m3, m4: 多空线计算用的MA周期，默认14, 28, 57, 114
     """
     # 知行短期趋势线 = EMA(EMA(CLOSE,10),10)
     short_term_trend = EMA(EMA(df['close'], 10), 10)
     
-    # 知行多空线 = (MA5 + MA10 + MA20 + MA30) / 4
-    bull_bear_line = (MA(df['close'], 14) + MA(df['close'], 28) + 
-                      MA(df['close'], 57) + MA(df['close'], 114)) / 4
+    # 知行多空线 = (MA(m1) + MA(m2) + MA(m3) + MA(m4)) / 4
+    bull_bear_line = (MA(df['close'], m1) + MA(df['close'], m2) + 
+                      MA(df['close'], m3) + MA(df['close'], m4)) / 4
     
     return pd.DataFrame({
         'short_term_trend': short_term_trend,

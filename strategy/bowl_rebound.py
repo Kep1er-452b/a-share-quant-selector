@@ -55,10 +55,10 @@ class BowlReboundStrategy(BaseStrategy):
             'M': 15,             # 回溯天数
             'CAP': 4000000000,   # 流通市值>40亿
             'J_VAL': 30,         # J值上限
-            'M1': 5,             # MA周期1
-            'M2': 10,            # MA周期2
-            'M3': 20,            # MA周期3
-            'M4': 30             # MA周期4
+            'M1': 14,            # MA周期1 (多空线)
+            'M2': 28,            # MA周期2 (多空线)
+            'M3': 57,            # MA周期3 (多空线)
+            'M4': 114            # MA周期4 (多空线)
         }
         
         # 合并用户参数
@@ -73,8 +73,14 @@ class BowlReboundStrategy(BaseStrategy):
         """
         result = df.copy()
         
-        # 1. 知行趋势线
-        trend_df = calculate_zhixing_trend(result)
+        # 1. 知行趋势线 (使用可配置的MA周期参数)
+        trend_df = calculate_zhixing_trend(
+            result, 
+            m1=self.params['M1'],
+            m2=self.params['M2'],
+            m3=self.params['M3'],
+            m4=self.params['M4']
+        )
         result['short_term_trend'] = trend_df['short_term_trend']
         result['bull_bear_line'] = trend_df['bull_bear_line']
         
@@ -133,76 +139,79 @@ class BowlReboundStrategy(BaseStrategy):
     
     def select_stocks(self, df, stock_name='') -> list:
         """
-        选股逻辑 - 返回最新的选股信号
+        选股逻辑 - 基于最新一天的数据进行筛选
+        只有最新一天满足所有条件时，才返回选股信号
         """
         if df.empty:
             return []
         
         # 过滤退市/异常股票
         if stock_name:
-            # 过滤名称包含退市标识的股票
             invalid_keywords = ['退', '未知', '退市', '已退']
             if any(kw in stock_name for kw in invalid_keywords):
                 return []
         
-        # 过滤数据异常的股票（如J值极端异常，可能是退市股票）
-        recent_df = df.head(30)  # 最近30天
+        # 获取最新一天的数据
+        latest = df.iloc[0]
+        latest_date = latest['date']
+        
+        # 检查最新一天是否有有效交易
+        if latest['volume'] <= 0 or pd.isna(latest['close']):
+            return []
+        
+        # 过滤数据异常的股票（J值极端异常，可能是退市股票）
+        recent_df = df.head(30)
         if recent_df['J'].abs().mean() > 80:
-            # J值长期极端，可能是停牌/退市股票
             return []
         
-        # 检查最近是否有有效交易（成交量>0）
-        if recent_df['volume'].sum() <= 0:
+        # ========== 核心条件检查：最新一天必须满足所有选股条件 ==========
+        
+        # 1. 趋势线在上
+        if not latest['trend_above']:
             return []
         
-        signals = []
-        
-        # 获取最近有信号的日子
-        signal_df = df[df['signal'] == True].copy()
-        
-        if signal_df.empty:
+        # 2. 回落碗中 或 回落短期趋势
+        if not (latest['fall_in_bowl'] or latest['near_short_trend']):
             return []
         
-        # 取最新的信号
-        latest = signal_df.iloc[0]
+        # 3. J值条件
+        if not latest['j_low']:
+            return []
         
-        # 获取最新信号的索引位置
-        latest_idx = df.index[df['date'] == latest['date']][0]
-        
-        # 在回溯期内(M天内)查找关键K线，并确保是阳线
-        lookback_start = max(0, latest_idx)
-        lookback_end = min(len(df), latest_idx + self.params['M'] + 1)
-        lookback_df = df.iloc[lookback_start:lookback_end]
-        
-        # 关键K线必须是阳线 (close > open)
-        key_candles_in_range = lookback_df[
+        # 4. 异动条件：在M天内存在关键K线（以最新一天为基准向前回溯）
+        # 在回溯期(M天内)查找关键K线
+        lookback_df = df.head(self.params['M'])
+        key_candles = lookback_df[
             (lookback_df['key_candle'] == True) & 
             (lookback_df['close'] > lookback_df['open'])  # 确保是阳线
         ]
         
-        # 如果没有符合条件的阳线关键K线，则放弃此信号
-        if key_candles_in_range.empty:
+        if key_candles.empty:
             return []
         
-        # 构建信号详情
-        signal_info = {
-            'date': latest['date'],
-            'close': round(latest['close'], 2),
-            'J': round(latest['J'], 2),
-            'volume_ratio': round(latest['vol_ratio'], 2) if not pd.isna(latest['vol_ratio']) else 1.0,
-            'market_cap': round(latest['market_cap'] / 1e8, 2),  # 转换为亿
-            'reasons': []
-        }
+        # ========== 所有条件满足，构建选股信号 ==========
         
-        # 判断买入理由
+        signals = []
+        
+        # 买入理由
+        reasons = []
         if latest['fall_in_bowl']:
-            signal_info['reasons'].append('回落碗中')
+            reasons.append('回落碗中')
         if latest['near_short_trend']:
-            signal_info['reasons'].append('回落短期趋势线')
+            reasons.append('回落短期趋势线')
         
-        # 记录最近的关键K线日期（已确保是阳线）
-        latest_key = key_candles_in_range.iloc[0]
-        signal_info['key_candle_date'] = latest_key['date']
+        # 最近的关键K线
+        latest_key = key_candles.iloc[0]
+        
+        signal_info = {
+            'date': latest_date,                    # 当前日期（最新）
+            'close': round(latest['close'], 2),     # 当前最新价格
+            'J': round(latest['J'], 2),             # 当前J值
+            'volume_ratio': round(latest['vol_ratio'], 2) if not pd.isna(latest['vol_ratio']) else 1.0,
+            'market_cap': round(latest['market_cap'] / 1e8, 2),
+            'reasons': reasons,
+            'key_candle_date': latest_key['date'],  # 最近的关键K线日期
+        }
         
         signals.append(signal_info)
         

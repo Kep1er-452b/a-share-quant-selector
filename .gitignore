@@ -40,6 +40,7 @@ data/
 *.log
 
 # Config with sensitive info (user should create their own)
+config/config.yaml
 config/config_local.yaml
 
 # OS

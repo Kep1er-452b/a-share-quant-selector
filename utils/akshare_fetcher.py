@@ -655,6 +655,7 @@ class AKShareFetcher:
     def daily_update(self, max_stocks=None):
         """
         每日增量更新 - 只获取实际需要的天数
+        优化：使用快速缓存机制，避免重复读取已更新的股票
         """
         from datetime import datetime
         
@@ -676,34 +677,79 @@ class AKShareFetcher:
         print("=" * 60)
         
         today = datetime.now().date()
+        today_str = today.strftime('%Y-%m-%d')
         
-        for i, code in enumerate(existing_stocks, 1):
-            # 读取现有数据，检查最新日期
-            existing_df = self.csv_manager.read_stock(code)
+        # 快速缓存：检查上次更新记录
+        update_cache_file = self.full_data_dir / '.update_cache.json'
+        update_cache = {}
+        if update_cache_file.exists():
+            try:
+                with open(update_cache_file, 'r', encoding='utf-8') as f:
+                    update_cache = json.load(f)
+            except:
+                update_cache = {}
+        
+        # 如果今天已经更新过，直接跳过
+        cache_date = update_cache.get('last_update_date')
+        if cache_date == today_str and not max_stocks:
+            print(f"✓ 数据已于 {cache_date} 更新过，无需重复更新")
+            print("=" * 60)
+            return
+        
+        # 预筛选：快速检查哪些股票需要更新（只读取第一行）
+        stocks_to_update = []
+        print("  正在检查股票更新状态...")
+        
+        for code in existing_stocks:
+            # 快速读取：只读CSV第一行（最新日期）
+            path = self.csv_manager.get_stock_path(code)
+            if not path.exists():
+                stocks_to_update.append((code, 30))  # 默认取30天
+                continue
             
-            if not existing_df.empty:
-                latest_date = existing_df.iloc[0]['date'].date()
-                days_needed = (today - latest_date).days
-                
-                # 如果数据已经是今天的，跳过
-                if days_needed <= 0:
-                    skipped += 1
-                    if i % 100 == 0:  # 每100只显示一次进度
-                        print(f"[{i}/{total}] {code} 已是最新数据，跳过")
+            try:
+                # 只读取第一行（header + 第一行数据）
+                df_quick = pd.read_csv(path, nrows=1)
+                if df_quick.empty:
+                    stocks_to_update.append((code, 30))
                     continue
                 
-                # 多取2天确保覆盖周末/节假日
-                days_to_fetch = min(days_needed + 2, 60)  # 最多取60天
-            else:
-                days_to_fetch = 30  # 默认取30天
+                latest_date = pd.to_datetime(df_quick.iloc[0]['date']).date()
+                days_needed = (today - latest_date).days
+                
+                if days_needed > 0:
+                    days_to_fetch = min(days_needed + 2, 60)
+                    stocks_to_update.append((code, days_to_fetch))
+                else:
+                    skipped += 1
+            except Exception:
+                stocks_to_update.append((code, 30))
+        
+        need_update = len(stocks_to_update)
+        print(f"  需要更新: {need_update} 只, 已最新: {skipped} 只")
+        
+        if need_update == 0:
+            # 更新缓存记录
+            update_cache['last_update_date'] = today_str
+            with open(update_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(update_cache, f)
+            print("✓ 所有数据已是最新")
+            print("=" * 60)
+            return
+        
+        print(f"\n开始更新 {need_update} 只股票...")
+        print("=" * 60)
+        
+        for i, (code, days_to_fetch) in enumerate(stocks_to_update, 1):
+            print(f"[{i}/{need_update}] 更新 {code} (需获取 {days_to_fetch} 天数据)...", end=" ")
             
-            print(f"[{i}/{total}] 更新 {code} (需获取 {days_to_fetch} 天数据)...", end=" ")
+            # 重新读取现有数据以获取旧记录数
+            existing_df = self.csv_manager.read_stock(code)
+            old_count = len(existing_df)
             
             df = self.fetch_stock_update(code, days=days_to_fetch)
             
             if df is not None and not df.empty:
-                # 检查实际新增的数据条数
-                old_count = len(existing_df)
                 self.csv_manager.update_stock(code, df)
                 new_df = self.csv_manager.read_stock(code)
                 new_count = len(new_df)
@@ -716,6 +762,11 @@ class AKShareFetcher:
             
             if i % 10 == 0:
                 time.sleep(0.1)  # 降低限速
+        
+        # 更新缓存记录
+        update_cache['last_update_date'] = today_str
+        with open(update_cache_file, 'w', encoding='utf-8') as f:
+            json.dump(update_cache, f)
         
         print("=" * 60)
         print(f"完成! 更新成功: {updated}, 跳过: {skipped}, 失败: {failed}")

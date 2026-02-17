@@ -177,7 +177,8 @@ class QuantSystem:
                 code = signal['code']
                 name = signal.get('name', stock_names.get(code, '未知'))
                 for s in signal['signals']:
-                    print(f"  - {code} {name}: 价格={s['close']}, J={s['J']}")
+                    # 显示最新一天的数据（策略基于最新一天筛选）
+                    print(f"  - {code} {name}: 日期={s['date']}, 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
         
         return results, stock_names
     
