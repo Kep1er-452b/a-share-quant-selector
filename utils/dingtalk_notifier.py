@@ -400,14 +400,118 @@ class DingTalkNotifier:
 
     def send_stock_selection(self, results, stock_names=None, category_filter='all'):
         """
-        发送选股结果到钉钉
+        发送选股结果到钉钉（按分类单独发送，避免截断）
         :param results: 选股结果
         :param stock_names: 股票名称字典
-        :param category_filter: 分类筛选，用于显示在通知中
+        :param category_filter: 分类筛选
         """
-        content = self.format_stock_results(results, stock_names, category_filter)
-        # 优先使用纯文本格式，手机端兼容性更好
-        return self.send_text(content)
+        if stock_names is None:
+            stock_names = {}
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        category_names = {
+            'bowl_center': '🥣 回落碗中',
+            'near_duokong': '📊 靠近多空线',
+            'near_short_trend': '📈 靠近短期趋势线'
+        }
+        
+        total_sent = 0
+        total_failed = 0
+        
+        # 先发送汇总消息
+        summary = f"📊 A股量化选股结果\n⏰ {now}\n"
+        if category_filter != 'all':
+            summary += f"🔍 筛选: {category_names.get(category_filter, category_filter)}\n"
+        summary += "━" * 20 + "\n\n"
+        
+        # 统计各分类数量
+        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
+        for strategy_name, signals in results.items():
+            for signal in signals:
+                for s in signal['signals']:
+                    cat = s.get('category', 'unknown')
+                    if category_filter == 'all' or cat == category_filter:
+                        category_count[cat] = category_count.get(cat, 0) + 1
+        
+        summary += f"🥣 回落碗中: {category_count.get('bowl_center', 0)} 只\n"
+        summary += f"📊 靠近多空线: {category_count.get('near_duokong', 0)} 只\n"
+        summary += f"📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只\n"
+        total = sum(category_count.values())
+        summary += f"📈 共选出: {total} 只\n\n"
+        summary += "详细列表见下方消息 👇"
+        
+        if self.send_text(summary):
+            total_sent += 1
+        else:
+            total_failed += 1
+        
+        time.sleep(1)  # 间隔1秒
+        
+        # 按分类单独发送详细列表
+        for strategy_name, signals in results.items():
+            # 按分类分组
+            category_groups = {}
+            for signal in signals:
+                for s in signal['signals']:
+                    cat = s.get('category', 'unknown')
+                    if category_filter != 'all' and cat != category_filter:
+                        continue
+                    if cat not in category_groups:
+                        category_groups[cat] = []
+                    category_groups[cat].append((signal, s))
+            
+            # 按优先级顺序发送
+            for cat in ['bowl_center', 'near_duokong', 'near_short_trend']:
+                if cat not in category_groups or not category_groups[cat]:
+                    continue
+                
+                group = category_groups[cat]
+                cat_name = category_names.get(cat, cat)
+                
+                # 构建该分类的消息
+                content = f"{cat_name} ({len(group)}只)\n"
+                content += "━" * 20 + "\n\n"
+                
+                for i, (signal, s) in enumerate(group, 1):
+                    code = signal['code']
+                    name = signal.get('name', stock_names.get(code, '未知'))
+                    close = s.get('close', '-')
+                    j_val = s.get('J', '-')
+                    key_date = s.get('key_candle_date', '-')
+                    if isinstance(key_date, pd.Timestamp):
+                        key_date = key_date.strftime("%m-%d")
+                    
+                    # 紧凑格式
+                    content += f"{i}. {code} {name}\n"
+                    content += f"   价格:{close} J:{j_val} 关键K:{key_date}\n\n"
+                    
+                    # 每20只分段发送，避免单条过长
+                    if i % 20 == 0 and i < len(group):
+                        if self.send_text(content):
+                            total_sent += 1
+                        else:
+                            total_failed += 1
+                        time.sleep(1)
+                        content = f"{cat_name} (续 {i+1}-{len(group)}只)\n"
+                        content += "━" * 20 + "\n\n"
+                
+                # 发送该分类的最后一段
+                if content.strip():
+                    if self.send_text(content):
+                        total_sent += 1
+                    else:
+                        total_failed += 1
+                    time.sleep(1)
+        
+        # 发送结束提示
+        footer = f"⚠️ 提示: 以上结果仅供参考\n共 {total} 只股票"
+        if self.send_text(footer):
+            total_sent += 1
+        else:
+            total_failed += 1
+        
+        print(f"✓ 钉钉通知发送完成 ({total_sent}条成功, {total_failed}条失败)")
+        return total_failed == 0
 
 
 # 为了处理 pandas 导入
