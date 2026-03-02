@@ -28,6 +28,7 @@ from utils.akshare_fetcher import AKShareFetcher
 from utils.csv_manager import CSVManager
 from utils.dingtalk_notifier import DingTalkNotifier
 from strategy.strategy_registry import get_registry
+from utils.kline_chart import generate_kline_chart
 import yaml
 
 
@@ -89,6 +90,55 @@ class QuantSystem:
         self.fetcher.init_full_data(max_stocks=max_stocks)
         print("\n✓ 数据初始化完成")
     
+    def _smart_update(self, max_stocks=None, check_latest=True):
+        """智能更新：3点前不更新，检查每只股票是否有当天数据"""
+        from datetime import datetime
+        import pandas as pd
+        
+        today = datetime.now().date()
+        current_time = datetime.now().time()
+        market_close_time = datetime.strptime("15:00", "%H:%M").time()
+        
+        # 3点前：不更新，使用旧数据
+        if current_time < market_close_time:
+            print("\n⏰ 当前时间尚未收盘 (15:00)")
+            print("  使用本地已有数据，跳过网络更新")
+            return
+        
+        # 检查每只股票是否有当天数据
+        if check_latest:
+            print("\n🔍 检查数据更新状态...")
+            stock_codes = self.csv_manager.list_all_stocks()
+            if max_stocks:
+                stock_codes = stock_codes[:max_stocks]
+            
+            total = len(stock_codes)
+            has_today = 0
+            no_today = 0
+            check_limit = min(100, total)  # 抽样检查100只
+            
+            for code in stock_codes[:check_limit]:
+                df = self.csv_manager.read_stock(code)
+                if not df.empty:
+                    latest_date = pd.to_datetime(df.iloc[0]['date']).date()
+                    if latest_date == today:
+                        has_today += 1
+                    else:
+                        no_today += 1
+            
+            # 如果100%股票都有今天数据，跳过更新
+            if check_limit > 0 and has_today == check_limit:
+                print(f"  ✓ 已检查 {check_limit} 只股票，全部已有今天数据")
+                print("  数据已是最新，跳过网络更新")
+                return
+            else:
+                print(f"  已检查 {check_limit} 只，{has_today} 只有今天数据，{no_today} 只需要更新")
+        
+        # 执行更新
+        print("\n🔄 执行数据更新...")
+        self.fetcher.daily_update(max_stocks=max_stocks)
+        print("\n✓ 数据更新完成")
+    
     def update_data(self, max_stocks=None):
         """每日增量更新"""
         print("=" * 60)
@@ -97,12 +147,17 @@ class QuantSystem:
         self.fetcher.daily_update(max_stocks=max_stocks)
         print("\n✓ 数据更新完成")
     
-    def select_stocks(self, category='all'):
+    def select_stocks(self, category='all', max_stocks=None, return_data=False):
         """执行选股
         :param category: 股票分类筛选，'all'表示全部，其他值按分类筛选
+        :param max_stocks: 限制处理的股票数量（用于快速测试）
+        :param return_data: 是否返回股票数据字典（用于K线图生成）
+        :return: (results, stock_names) 或 (results, stock_names, stock_data_dict)
         """
         print("=" * 60)
         print("🎯 执行选股策略")
+        if max_stocks:
+            print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
         print("=" * 60)
         
         # 加载策略
@@ -167,10 +222,15 @@ class QuantSystem:
             if i % 500 == 0 or i == len(stock_codes):
                 print(f"  进度: [{i}/{len(stock_codes)}] 有效 {valid_count} 只，过滤 {invalid_count} 只...")
         
-        print(f"\n✓ 有效数据: {len(stock_data)} 只 (过滤 {invalid_count} 只异常股票)")
+        # 快速测试模式：限制处理数量
+        if max_stocks and len(stock_data) > max_stocks:
+            stock_data = dict(list(stock_data.items())[:max_stocks])
+            print(f"\n✓ 有效数据: {len(stock_data)} 只 (快速测试模式，已限制数量)")
+        else:
+            print(f"\n✓ 有效数据: {len(stock_data)} 只 (过滤 {invalid_count} 只异常股票)")
         
-        # 执行选股（运行所有策略）
-        results = self.registry.run_all(stock_data)
+        # 执行选股（运行所有策略，同时返回计算了指标的数据）
+        results, indicators_dict = self.registry.run_all(stock_data, return_indicators=True)
         
         # 分类统计
         category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
@@ -207,26 +267,46 @@ class QuantSystem:
         print(f"  📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只")
         print("-" * 60)
         
+        # 如果需要返回数据字典（用于K线图生成）
+        if return_data:
+            # 返回计算了指标的数据（包含趋势线）
+            return results, stock_names, indicators_dict
+        
         return results, stock_names
     
-    def run_full(self, category='all'):
-        """完整流程：更新 + 选股 + 通知
-        :param category: 股票分类筛选
+    def run_full(self, category='all', max_stocks=None):
+        """完整流程：更新 + 选股 + 通知（带K线图）
+        :param max_stocks: 限制处理的股票数量（用于快速测试）
         """
+        from datetime import datetime
+        import json
+        from pathlib import Path
+        
         print("=" * 60)
         print("🚀 执行完整流程")
+        if max_stocks:
+            print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
         print("=" * 60)
-        
-        # 1. 更新数据
-        self.update_data()
-        
-        # 2. 选股
-        results, stock_names = self.select_stocks(category=category)
-        
-        # 3. 发送通知（传递分类筛选参数）
+
+        # 1. 更新数据（内置逻辑：3点前不更新，检查每只股票是否有当天数据）
+        self._smart_update(max_stocks=max_stocks)
+
+        # 2. 选股（返回数据和结果）
+        results, stock_names, stock_data_dict = self.select_stocks(category=category, max_stocks=max_stocks, return_data=True)
+
+        # 3. 发送通知（带K线图）
         if results:
-            self.notifier.send_stock_selection(results, stock_names, category_filter=category)
-        
+
+            # 使用带K线图的发送方法
+            self.notifier.send_stock_selection_with_charts(
+                results,
+                stock_names,
+                category_filter=category,
+                stock_data_dict=stock_data_dict,
+                params=self.registry.strategies.get('BowlReboundStrategy', {}).params if self.registry.strategies else {},
+                send_text_first=True
+            )
+
         return results
     
     def run_schedule(self):
@@ -297,16 +377,16 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['init', 'update', 'select', 'run', 'schedule', 'web'],
+        choices=['init', 'update', 'run', 'web'],
         nargs='?',
-        help='要执行的命令'
+        help='要执行的命令: init(初始化数据), update(更新数据), run(执行选股), web(启动Web服务器)'
     )
 
     parser.add_argument(
         '--max-stocks',
         type=int,
         default=None,
-        help='限制处理的股票数量（用于测试）'
+        help='限制处理的股票数量（用于快速测试）'
     )
 
     parser.add_argument(
@@ -361,17 +441,8 @@ def main():
     elif args.command == 'update':
         quant.update_data(max_stocks=args.max_stocks)
     
-    elif args.command == 'select':
-        quant.select_stocks(category=args.category)
-
     elif args.command == 'run':
-        quant.run_full(category=args.category)
-    
-    elif args.command == 'schedule':
-        # 定时任务暂时禁用，避免开发冲突
-        print("⚠️  定时任务功能暂时禁用（开发中）")
-        print("   请使用 'python3 main.py run' 手动执行选股")
-        # quant.run_schedule()
+        quant.run_full(category=args.category, max_stocks=args.max_stocks)
     
     elif args.command == 'web':
         # 启动Web服务器

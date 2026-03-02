@@ -121,13 +121,15 @@ class StrategyRegistry:
         print(f"  ✓ 选股完成: 共 {len(signals)} 只股票符合策略")
         return {strategy_name: signals}
     
-    def run_all(self, stock_data_dict):
+    def run_all(self, stock_data_dict, return_indicators=False):
         """
         运行所有策略
         :param stock_data_dict: {code: (name, df)} 格式的股票数据
-        :return: {strategy_name: [signals]} 格式的结果
+        :param return_indicators: 是否返回计算了指标的数据
+        :return: {strategy_name: [signals]} 格式的结果，或 (results, indicators_dict)
         """
         results = {}
+        indicators_dict = {}  # 存储计算了指标的数据
         total_stocks = len(stock_data_dict)
         
         for strategy_name, strategy in self.strategies.items():
@@ -137,9 +139,21 @@ class StrategyRegistry:
             processed = 0
             
             for code, (name, df) in stock_data_dict.items():
-                result = strategy.analyze_stock(code, name, df)
-                if result:
-                    signals.append(result)
+                # 计算指标并保存
+                if return_indicators:
+                    df_with_indicators = strategy.calculate_indicators(df)
+                    indicators_dict[code] = df_with_indicators
+                    result = strategy.select_stocks(df_with_indicators, name)
+                    if result:
+                        signals.append({
+                            'code': code,
+                            'name': name,
+                            'signals': result
+                        })
+                else:
+                    result = strategy.analyze_stock(code, name, df)
+                    if result:
+                        signals.append(result)
                 
                 processed += 1
                 # 每100只股票显示一次进度
@@ -149,6 +163,8 @@ class StrategyRegistry:
             results[strategy_name] = signals
             print(f"  ✓ 选股完成: 共 {len(signals)} 只股票符合策略")
         
+        if return_indicators:
+            return results, indicators_dict
         return results
 
 

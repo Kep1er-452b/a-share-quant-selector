@@ -1,6 +1,7 @@
 """
 钉钉群通知模块
 """
+import os
 import requests
 import json
 import time
@@ -9,6 +10,21 @@ import hashlib
 import base64
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
+
+# 导入K线图模块
+try:
+    # 优先使用快速版
+    from utils.kline_chart_fast import generate_kline_chart_fast as generate_kline_chart
+    KLINE_CHART_AVAILABLE = True
+    print("✓ 使用快速K线图生成")
+except ImportError:
+    try:
+        from utils.kline_chart import generate_kline_chart
+        KLINE_CHART_AVAILABLE = True
+    except ImportError:
+        KLINE_CHART_AVAILABLE = False
+        print("警告: K线图模块未安装，图片功能不可用")
 
 
 class DingTalkNotifier:
@@ -22,7 +38,7 @@ class DingTalkNotifier:
         """生成钉钉签名"""
         if not self.secret:
             return "", ""
-        
+
         timestamp = str(round(time.time() * 1000))
         secret_enc = self.secret.encode('utf-8')
         string_to_sign = f'{timestamp}\n{self.secret}'
@@ -30,6 +46,38 @@ class DingTalkNotifier:
         hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
         sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
         return timestamp, sign
+
+    def _send_request(self, data: dict) -> bool:
+        """发送HTTP请求到钉钉"""
+        timestamp, sign = self._generate_sign()
+
+        if self.secret:
+            webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
+        else:
+            webhook_url = self.webhook_url
+
+        try:
+            response = requests.post(
+                webhook_url,
+                json=data,
+                headers={'Content-Type': 'application/json'},
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    return True
+                else:
+                    print(f"✗ 钉钉返回错误: {result}")
+                    return False
+            else:
+                print(f"✗ HTTP错误: {response.status_code}")
+                return False
+
+        except Exception as e:
+            print(f"✗ 请求异常: {e}")
+            return False
     
     def _send_single_markdown(self, title, content, part_info=""):
         """
@@ -512,6 +560,304 @@ class DingTalkNotifier:
         
         print(f"✓ 钉钉通知发送完成 ({total_sent}条成功, {total_failed}条失败)")
         return total_failed == 0
+
+    def send_image(self, image_path: str, title: str = "K线图") -> bool:
+        """
+        发送图片到钉钉（使用markdown格式嵌入图片URL）
+        注：Webhook机器人不支持直接base64图片，需要先上传图片获取URL
+        临时方案：将图片转为base64 data URL（部分钉钉客户端支持）
+
+        Args:
+            image_path: 图片文件路径
+            title: 消息标题
+
+        Returns:
+            bool: 发送是否成功
+        """
+        if not self.webhook_url:
+            print("警告: 未配置钉钉 webhook")
+            return False
+
+        if not Path(image_path).exists():
+            print(f"✗ 图片文件不存在: {image_path}")
+            return False
+
+        try:
+            # 读取图片
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+
+            # 转为base64
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+
+            # 检查大小（钉钉限制约2MB）
+            if len(image_data) > 2 * 1024 * 1024:
+                print(f"⚠️ 图片超过2MB，可能发送失败")
+
+            # 构建data URL（markdown格式）
+            # 使用png格式（K线图保存为png）
+            data_url = f"data:image/png;base64,{image_base64}"
+
+            # 使用markdown格式发送图片
+            # 钉钉markdown支持data URL图片
+            markdown_text = f"### {title}\n\n![K线图]({data_url})"
+
+            data = {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": title,
+                    "text": markdown_text
+                }
+            }
+
+            # 发送
+            success = self._send_request(data)
+
+            # 发送成功后删除本地图片
+            if success:
+                import os
+                os.remove(image_path)
+                print(f"✓ 已删除本地图片: {image_path}")
+
+            return success
+
+        except Exception as e:
+            print(f"✗ 图片发送失败: {e}")
+            return False
+
+    def _format_stock_info_message(self, stock_code, stock_name, category, params, signal):
+        """
+        格式化股票信息文字消息
+        
+        Returns:
+            str: 格式化的Markdown消息
+        """
+        category_names = {
+            'bowl_center': '🥣 回落碗中',
+            'near_duokong': '📊 靠近多空线',
+            'near_short_trend': '📈 靠近短期趋势线'
+        }
+        category_name = category_names.get(category, category)
+        
+        # 格式化参数
+        cap = params.get('CAP', 4000000000)
+        cap_display = f"{cap/1e8:.0f}亿" if cap >= 1e8 else f"{cap/1e4:.0f}万"
+        
+        # 获取信号数据
+        close = signal.get('close', '-')
+        j_val = signal.get('J', '-')
+        key_date = signal.get('key_candle_date', '-')
+        if hasattr(key_date, 'strftime'):
+            key_date = key_date.strftime("%m-%d")
+        reasons = ' '.join(signal.get('reasons', []))
+        
+        message = f"""### 📊 {stock_code} {stock_name}
+
+**分类**: {category_name}
+**价格**: {close} | **J值**: {j_val}
+**关键K线日期**: {key_date}
+**入选理由**: {reasons}
+
+**K线图**:
+"""
+        return message
+
+    def send_stock_selection_with_charts(
+        self, 
+        results, 
+        stock_names=None, 
+        category_filter='all',
+        stock_data_dict=None,
+        params=None,
+        send_text_first: bool = True
+    ):
+        """
+        发送选股结果（带K线图）到钉钉
+        
+        Args:
+            results: 选股结果 {strategy_name: [signals]}
+            stock_names: 股票名称字典 {code: name}
+            category_filter: 分类筛选
+            stock_data_dict: 股票数据字典 {code: DataFrame}，用于生成K线图
+            params: 策略参数
+            send_text_first: 是否先发送文字再发送图片（默认True，文字图片分离）
+            
+        Returns:
+            bool: 发送是否成功
+        """
+        if not KLINE_CHART_AVAILABLE:
+            print("⚠️ K线图模块不可用，发送普通文本消息")
+            return self.send_stock_selection(results, stock_names, category_filter)
+        
+        if stock_names is None:
+            stock_names = {}
+        
+        if params is None:
+            params = {
+                'N': 4,
+                'M': 15,
+                'CAP': 4000000000,
+                'J_VAL': 30,
+                'duokong_pct': 3,
+                'short_pct': 2
+            }
+        
+        # 先发送汇总消息
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        category_names = {
+            'bowl_center': '🥣 回落碗中',
+            'near_duokong': '📊 靠近多空线',
+            'near_short_trend': '📈 靠近短期趋势线'
+        }
+        
+        total_sent = 0
+        total_failed = 0
+        
+        # 统计各分类数量
+        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
+        chart_count = 0
+
+        for strategy_name, signals in results.items():
+            for signal in signals:
+                for s in signal['signals']:
+                    cat = s.get('category', 'unknown')
+                    if category_filter == 'all' or cat == category_filter:
+                        category_count[cat] = category_count.get(cat, 0) + 1
+        
+        # 发送汇总消息
+        summary = f"🎯 BowlReboundStrategy:\n"
+        summary += f"N: {params.get('N', 4)} (成交量倍数)\n"
+        summary += f"M: {params.get('M', 15)} (回溯天数)\n"
+        summary += f"CAP: {params.get('CAP', 4000000000)} (40亿市值门槛)\n"
+        summary += f"J_VAL: {params.get('J_VAL', 30)} (J值上限)\n"
+        summary += f"duokong_pct: {params.get('duokong_pct', 3)}\n"
+        summary += f"short_pct: {params.get('short_pct', 2)}\n"
+        summary += f"M1: {params.get('M1', 14)} (MA周期)\n"
+        summary += f"M2: {params.get('M2', 28)} (MA周期)\n"
+        summary += f"M3: {params.get('M3', 57)} (MA周期)\n"
+        summary += f"M4: {params.get('M4', 114)} (MA周期)\n\n"
+        
+        summary += f"⏰ {now}\n"
+        if category_filter != 'all':
+            summary += f"🔍 筛选: {category_names.get(category_filter, category_filter)}\n"
+        summary += "━" * 20 + "\n\n"
+        summary += f"🥣 回落碗中: {category_count.get('bowl_center', 0)} 只\n"
+        summary += f"📊 靠近多空线: {category_count.get('near_duokong', 0)} 只\n"
+        summary += f"📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只\n"
+        total = sum(category_count.values())
+        summary += f"📈 共选出: {total} 只\n\n"
+        
+        if stock_data_dict:
+            summary += "📈 正在为每只股票生成K线图...\n"
+            if send_text_first:
+                summary += "（文字说明与图片分离发送，节省流量）\n"
+        else:
+            summary += "详细列表见下方消息 👇"
+        
+        if self.send_text(summary):
+            total_sent += 1
+        else:
+            total_failed += 1
+        
+        time.sleep(1)
+        
+        # 如果提供了股票数据，生成并发送K线图
+        if stock_data_dict:
+            print(f"📊 准备发送 {len(stock_data_dict)} 只股票的K线图...")
+            for strategy_name, signals in results.items():
+                print(f"  处理策略: {strategy_name}, {len(signals)} 只信号")
+                for signal in signals:
+                    code = signal['code']
+                    name = signal.get('name', stock_names.get(code, '未知'))
+                    
+                    for s in signal['signals']:
+                        cat = s.get('category', 'unknown')
+                        if category_filter != 'all' and cat != category_filter:
+                            continue
+                        
+                        # 获取股票数据
+                        if code not in stock_data_dict:
+                            print(f"  ⚠️ {code} 不在stock_data_dict中")
+                            continue
+                        
+                        df = stock_data_dict[code]
+                        if df.empty:
+                            print(f"  ⚠️ {code} 数据为空")
+                            continue
+                        
+                        try:
+                            print(f"  📈 处理 {code} {name}...")
+                            # 准备关键K线日期
+                            key_date = s.get('key_candle_date')
+                            key_dates = [key_date] if key_date else []
+                            
+                            if send_text_first:
+                                # 先发送文字说明
+                                info_message = self._format_stock_info_message(
+                                    code, name, cat, params, s
+                                )
+                                cat_name = category_names.get(cat, cat)
+                                title = f"{code} {name}"
+                                print(f"    发送文字...")
+                                self.send_markdown(title, info_message)
+                                time.sleep(0.05)  # 减少延迟
+                                
+                                print(f"    生成K线图...")
+                                t0 = time.time()
+                                # 再生成无文字版本K线图
+                                chart_path = generate_kline_chart(
+                                    stock_code=code,
+                                    stock_name=name,
+                                    df=df,
+                                    category=cat,
+                                    params=params,
+                                    key_candle_dates=key_dates,
+                                    output_dir='/tmp/kline_charts',
+                                    show_text=False,  # 无文字版本
+                                    show_legend=True
+                                )
+                                t1 = time.time()
+                                print(f"    生成K线图耗时: {t1-t0:.2f}秒")
+                                
+                                print(f"    发送图片...")
+                                t0 = time.time()
+                                # 发送图片（标题简化）
+                                if self.send_image(chart_path, f"{code} K线图"):
+                                    chart_count += 1
+                                t1 = time.time()
+                                print(f"    发送图片耗时: {t1-t0:.2f}秒")
+                            else:
+                                # 旧方式：生成带文字的K线图
+                                chart_path = generate_kline_chart(
+                                    stock_code=code,
+                                    stock_name=name,
+                                    df=df,
+                                    category=cat,
+                                    params=params,
+                                    key_candle_dates=key_dates,
+                                    output_dir='/tmp/kline_charts',
+                                    show_text=True,
+                                    show_legend=True
+                                )
+                                
+                                # 发送图片信息
+                                cat_name = category_names.get(cat, cat)
+                                title = f"{code} {name} - {cat_name}"
+                                if self.send_image(chart_path, title):
+                                    chart_count += 1
+
+                            time.sleep(0.1)  # 避免发送过快，减少延迟
+                            
+                        except Exception as e:
+                            print(f"✗ 生成 {code} 的K线图失败: {e}")
+                            continue
+        
+        # 发送普通文本详情（作为备份）
+        text_result = self.send_stock_selection(results, stock_names, category_filter)
+
+        print(f"\n✓ 已发送 {chart_count} 张K线图到钉钉")
+
+        return text_result
 
 
 # 为了处理 pandas 导入
