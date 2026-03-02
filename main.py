@@ -12,6 +12,7 @@ A股量化选股系统 - 主程序
 import sys
 import os
 import argparse
+import platform
 from pathlib import Path
 from datetime import datetime, time as dt_time
 import time
@@ -19,6 +20,9 @@ import time
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+
+# 版本信息
+__version__ = "1.0.0"
 
 from utils.akshare_fetcher import AKShareFetcher
 from utils.csv_manager import CSVManager
@@ -225,6 +229,18 @@ class QuantSystem:
             time.sleep(60)
 
 
+def print_version():
+    """打印版本信息"""
+    import akshare
+    import pandas
+    
+    print(f"A-Share Quant v{__version__}")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"akshare: {akshare.__version__}")
+    print(f"pandas: {pandas.__version__}")
+    print(f"System: {platform.system()}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='A股量化选股系统',
@@ -237,12 +253,20 @@ def main():
   python main.py run           # 完整流程（更新+选股+通知）
   python main.py schedule      # 启动定时调度（每天15:05）
   python main.py web           # 启动Web界面
+  python main.py --version     # 显示版本信息
         """
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='store_true',
+        help='显示版本信息并退出'
     )
     
     parser.add_argument(
         'command',
         choices=['init', 'update', 'select', 'run', 'schedule', 'web'],
+        nargs='?',
         help='要执行的命令'
     )
     
@@ -273,6 +297,16 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # 处理 --version 参数
+    if args.version:
+        print_version()
+        sys.exit(0)
+    
+    # 检查命令是否提供
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
     
     # 切换工作目录
     os.chdir(project_root)

@@ -90,7 +90,7 @@ class DingTalkNotifier:
         如果消息超过20000字节，自动分段发送
         """
         # 钉钉限制：消息体大小不超过20000字节
-        MAX_SIZE = 19000  # 留一些余量
+        MAX_SIZE = 18000  # 留足够余量（预留 ~2000 字节给 part_info 和 JSON 包装）
         
         # 计算内容字节数
         content_bytes = content.encode('utf-8')
@@ -116,6 +116,18 @@ class DingTalkNotifier:
             line_bytes = line.encode('utf-8')
             line_size = len(line_bytes) + 1  # +1 for newline
             
+            # 处理超长行：如果单行超过限制，强制截断
+            if line_size > MAX_SIZE:
+                chunk_size = 15000
+                for j in range(0, len(line_bytes), chunk_size):
+                    chunk = line_bytes[j:j+chunk_size].decode('utf-8', errors='ignore')
+                    if current_part:
+                        parts.append('\n'.join(current_part))
+                        current_part = []
+                        current_size = 0
+                    parts.append(chunk)
+                continue
+            
             if current_size + line_size > MAX_SIZE and current_part:
                 # 当前部分已满，保存并开始新部分
                 parts.append('\n'.join(current_part))
@@ -129,15 +141,24 @@ class DingTalkNotifier:
         if current_part:
             parts.append('\n'.join(current_part))
         
-        # 分段发送
+        # 分段发送（带重试）
         total_parts = len(parts)
         success_count = 0
+        max_retries = 3
         
         for i, part in enumerate(parts, 1):
             part_info = f"📨 消息分段 ({i}/{total_parts})"
-            if self._send_single_markdown(title, part, part_info):
-                success_count += 1
-            time.sleep(0.5)  # 避免发送过快
+            
+            # 重试机制
+            for attempt in range(max_retries):
+                if self._send_single_markdown(title, part, part_info):
+                    success_count += 1
+                    break
+                else:
+                    print(f"  第 {i}/{total_parts} 段发送失败，重试 {attempt + 1}/{max_retries}...")
+                    time.sleep(1 + attempt)
+            
+            time.sleep(1)  # 段间延迟增加到 1 秒
         
         if success_count == total_parts:
             print(f"✓ 钉钉通知分段发送成功 ({total_parts}条)")
@@ -254,7 +275,7 @@ class DingTalkNotifier:
         如果消息超过20000字节，自动分段发送
         """
         # 钉钉限制：消息体大小不超过20000字节
-        MAX_SIZE = 19000  # 留一些余量
+        MAX_SIZE = 18000  # 留足够余量（预留 ~2000 字节给 part_info 和 JSON 包装）
         
         # 计算内容字节数
         content_bytes = content.encode('utf-8')
@@ -280,6 +301,19 @@ class DingTalkNotifier:
             line_bytes = line.encode('utf-8')
             line_size = len(line_bytes) + 1  # +1 for newline
             
+            # 处理超长行：如果单行超过限制，强制截断
+            if line_size > MAX_SIZE:
+                # 将超长行分段（每段约 15000 字符）
+                chunk_size = 15000
+                for j in range(0, len(line_bytes), chunk_size):
+                    chunk = line_bytes[j:j+chunk_size].decode('utf-8', errors='ignore')
+                    if current_part:
+                        parts.append('\n'.join(current_part))
+                        current_part = []
+                        current_size = 0
+                    parts.append(chunk)  # 单独作为一段
+                continue
+            
             if current_size + line_size > MAX_SIZE and current_part:
                 # 当前部分已满，保存并开始新部分
                 parts.append('\n'.join(current_part))
@@ -293,15 +327,24 @@ class DingTalkNotifier:
         if current_part:
             parts.append('\n'.join(current_part))
         
-        # 分段发送
+        # 分段发送（带重试）
         total_parts = len(parts)
         success_count = 0
+        max_retries = 3
         
         for i, part in enumerate(parts, 1):
             part_info = f"📨 消息分段 ({i}/{total_parts})"
-            if self._send_single_text(part, part_info):
-                success_count += 1
-            time.sleep(0.5)  # 避免发送过快
+            
+            # 重试机制
+            for attempt in range(max_retries):
+                if self._send_single_text(part, part_info):
+                    success_count += 1
+                    break
+                else:
+                    print(f"  第 {i}/{total_parts} 段发送失败，重试 {attempt + 1}/{max_retries}...")
+                    time.sleep(1 + attempt)  # 递增延迟
+            
+            time.sleep(1)  # 段间延迟增加到 1 秒，避免限流
         
         if success_count == total_parts:
             print(f"✓ 钉钉通知分段发送成功 ({total_parts}条)")

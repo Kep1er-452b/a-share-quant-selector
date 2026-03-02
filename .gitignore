@@ -42,6 +42,7 @@ data/
 # Config with sensitive info (user should create their own)
 config/config.yaml
 config/config_local.yaml
+config/github.yaml
 
 # OS
 .DS_Store

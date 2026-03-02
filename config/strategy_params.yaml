@@ -18,7 +18,7 @@ BowlReboundStrategy:
   # N: 成交量倍数
   # 关键K线的成交量需 >= 前一日成交量 * N
   # 建议值: 3-5
-  N: 1.8
+  N: 2.4
   
   # M: 回溯天数
   # 在M天内是否存在关键K线
@@ -35,7 +35,7 @@ BowlReboundStrategy:
   # KDJ指标的J值需 <= J_VAL 才符合买入条件
   # 建议值: 20-30 (低位买入)
   # 注意: J值越小表示越超卖，但可能错过一些反弹机会
-  J_VAL: 20
+  J_VAL: 0
   
   # M1-M4: 知行多空线计算用的MA周期
   # 知行多空线 = MA(CLOSE,M1)+MA(CLOSE,M2)+MA(CLOSE,M3)+MA(CLOSE,M4))/4

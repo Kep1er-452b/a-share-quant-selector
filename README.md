@@ -84,6 +84,7 @@ python3 main.py web
 | `python3 main.py select` | 执行选股策略 |
 | `python3 main.py run` | 完整流程（更新+选股+通知） |
 | `python3 main.py web` | 启动Web界面 (默认端口5000) |
+| `python3 main.py --version` | 显示版本信息 |
 
 或使用快捷脚本：
 ```bash

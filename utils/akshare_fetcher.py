@@ -656,6 +656,7 @@ class AKShareFetcher:
         """
         每日增量更新 - 只获取实际需要的天数
         优化：使用快速缓存机制，避免重复读取已更新的股票
+        修复：盘中执行时不会将盘中数据误存为收盘数据
         """
         from datetime import datetime
         
@@ -678,6 +679,19 @@ class AKShareFetcher:
         
         today = datetime.now().date()
         today_str = today.strftime('%Y-%m-%d')
+        current_time = datetime.now().time()
+        
+        # 判断是否在收盘后（15:00 之后）
+        # A股收盘时间：工作日 15:00
+        market_close_time = datetime.strptime("15:00", "%H:%M").time()
+        is_after_market_close = current_time >= market_close_time
+        
+        if not is_after_market_close and not max_stocks:
+            print(f"⚠️ 当前时间 {current_time.strftime('%H:%M')}，尚未收盘 (15:00)")
+            print("  盘中数据不是收盘价，建议收盘后再执行 update")
+            print("  如需强制更新，请使用 --max-stocks 参数")
+            print("=" * 60)
+            return
         
         # 快速缓存：检查上次更新记录
         update_cache_file = self.full_data_dir / '.update_cache.json'
@@ -689,10 +703,10 @@ class AKShareFetcher:
             except:
                 update_cache = {}
         
-        # 如果今天已经更新过，直接跳过
+        # 如果今天已经更新过（且已收盘），直接跳过
         cache_date = update_cache.get('last_update_date')
         if cache_date == today_str and not max_stocks:
-            print(f"✓ 数据已于 {cache_date} 更新过，无需重复更新")
+            print(f"✓ 数据已于 {cache_date} 收盘后更新过，无需重复更新")
             print("=" * 60)
             return
         
@@ -720,6 +734,13 @@ class AKShareFetcher:
                 if days_needed > 0:
                     days_to_fetch = min(days_needed + 2, 60)
                     stocks_to_update.append((code, days_to_fetch))
+                elif days_needed == 0:
+                    # 最新日期是今天
+                    # 如果是收盘后，或者强制更新模式(max_stocks)，都需要重新获取
+                    if is_after_market_close or max_stocks:
+                        stocks_to_update.append((code, 2))
+                    else:
+                        skipped += 1
                 else:
                     skipped += 1
             except Exception:
@@ -729,10 +750,11 @@ class AKShareFetcher:
         print(f"  需要更新: {need_update} 只, 已最新: {skipped} 只")
         
         if need_update == 0:
-            # 更新缓存记录
-            update_cache['last_update_date'] = today_str
-            with open(update_cache_file, 'w', encoding='utf-8') as f:
-                json.dump(update_cache, f)
+            # 只有在完整更新（非max_stocks模式）且收盘后才记录缓存
+            if not max_stocks and is_after_market_close:
+                update_cache['last_update_date'] = today_str
+                with open(update_cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(update_cache, f)
             print("✓ 所有数据已是最新")
             print("=" * 60)
             return
