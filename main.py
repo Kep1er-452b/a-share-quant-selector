@@ -14,10 +14,8 @@ import os
 import argparse
 import platform
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time as dt_time
 import time
-
-import pandas as pd
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
@@ -94,6 +92,9 @@ class QuantSystem:
     
     def _smart_update(self, max_stocks=None, check_latest=True):
         """智能更新：3点前不更新，检查每只股票是否有当天数据"""
+        from datetime import datetime
+        import pandas as pd
+        
         today = datetime.now().date()
         current_time = datetime.now().time()
         market_close_time = datetime.strptime("15:00", "%H:%M").time()
@@ -201,69 +202,35 @@ class QuantSystem:
         # 先获取股票名称
         stock_names = self._load_stock_names({})
         
-        # 流式处理：不预存所有数据，逐只读取处理
-        print("\n执行选股（流式处理，降低内存占用）...")
-        
-        import gc
-        results = {}
-        indicators_dict = {}  # 只保存入选股票的数据
-        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
-        
-        # 限制处理数量
-        process_codes = stock_codes[:max_stocks] if max_stocks else stock_codes
-        
-        for strategy_name, strategy in self.registry.strategies.items():
-            print(f"\n执行策略: {strategy_name}")
-            signals = []
-            valid_count = 0
-            invalid_count = 0
-            
-            for i, code in enumerate(process_codes, 1):
-                # 读取单只股票
-                df = self.csv_manager.read_stock(code)
-                name = stock_names.get(code, '未知')
-                
-                # 过滤
-                invalid_keywords = ['退', '未知', '退市', '已退']
-                if any(kw in name for kw in invalid_keywords):
-                    invalid_count += 1
-                    continue
-                if df.empty or len(df) < 60:
-                    continue
-                
+        # 构建数据字典
+        print("\n过滤有效股票数据...")
+        stock_data = {}
+        valid_count = 0
+        invalid_count = 0
+        for i, code in enumerate(stock_codes, 1):
+            df = self.csv_manager.read_stock(code)
+            name = stock_names.get(code, '未知')
+            # 过滤退市/异常股票名称
+            invalid_keywords = ['退', '未知', '退市', '已退']
+            if any(kw in name for kw in invalid_keywords):
+                invalid_count += 1
+                continue
+            if not df.empty and len(df) >= 60:
+                stock_data[code] = (name, df)
                 valid_count += 1
-                
-                # 计算指标
-                df_with_indicators = strategy.calculate_indicators(df)
-                
-                # 选股
-                signal_list = strategy.select_stocks(df_with_indicators, name)
-                
-                if signal_list:
-                    for s in signal_list:
-                        cat = s.get('category', 'unknown')
-                        category_count[cat] = category_count.get(cat, 0) + 1
-                        
-                        if category == 'all' or cat == category:
-                            signals.append({
-                                'code': code,
-                                'name': name,
-                                'signals': [s]
-                            })
-                            # 只保存入选股票的数据
-                            if return_data:
-                                indicators_dict[code] = df_with_indicators
-                
-                # 释放内存
-                del df, df_with_indicators
-                
-                # 每500只显示进度并GC
-                if i % 500 == 0 or i == len(process_codes):
-                    gc.collect()
-                    print(f"  进度: [{i}/{len(process_codes)}] 有效 {valid_count} 只，选出 {len(signals)} 只...")
-            
-            results[strategy_name] = signals
-            print(f"  ✓ 选股完成: 共 {len(signals)} 只 (过滤 {invalid_count} 只)")
+            # 每500只显示一次进度
+            if i % 500 == 0 or i == len(stock_codes):
+                print(f"  进度: [{i}/{len(stock_codes)}] 有效 {valid_count} 只，过滤 {invalid_count} 只...")
+        
+        # 快速测试模式：限制处理数量
+        if max_stocks and len(stock_data) > max_stocks:
+            stock_data = dict(list(stock_data.items())[:max_stocks])
+            print(f"\n✓ 有效数据: {len(stock_data)} 只 (快速测试模式，已限制数量)")
+        else:
+            print(f"\n✓ 有效数据: {len(stock_data)} 只 (过滤 {invalid_count} 只异常股票)")
+        
+        # 执行选股（运行所有策略，同时返回计算了指标的数据）
+        results, indicators_dict = self.registry.run_all(stock_data, return_indicators=True)
         
         # 分类统计
         category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
@@ -274,11 +241,21 @@ class QuantSystem:
         print("=" * 60)
         
         for strategy_name, signals in results.items():
-            print(f"\n{strategy_name}: {len(signals)} 只")
+            # 按分类筛选
+            filtered_signals = []
             for signal in signals:
+                for s in signal['signals']:
+                    cat = s.get('category', 'unknown')
+                    category_count[cat] = category_count.get(cat, 0) + 1
+                    if category == 'all' or cat == category:
+                        filtered_signals.append(signal)
+            
+            print(f"\n{strategy_name}: {len(filtered_signals)} 只")
+            for signal in filtered_signals:
                 code = signal['code']
                 name = signal.get('name', stock_names.get(code, '未知'))
                 for s in signal['signals']:
+                    # 显示最新一天的数据（策略基于最新一天筛选）
                     cat_emoji = {'bowl_center': '🥣', 'near_duokong': '📊', 'near_short_trend': '📈'}.get(s.get('category'), '❓')
                     print(f"  {cat_emoji} {code} {name}: 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
         
