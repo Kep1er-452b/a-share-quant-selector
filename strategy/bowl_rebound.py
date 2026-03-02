@@ -12,26 +12,23 @@
 3. 趋势线在上 = 知行短期趋势线 > 知行多空线
    - 短期趋势在多空线上方，表示上升趋势
 
-4. 回落碗中 = CLOSE >= 知行多空线 AND CLOSE <= 知行短期趋势线
-   - 价格回落至碗中（多空线和短期趋势线之间）
-
-5. 回落短期趋势 = CLOSE >= 知行短期趋势线*0.98 AND CLOSE <= 知行短期趋势线*1.02
-   - 价格在短期趋势线附近±2%范围内
-
-6. KDJ计算(9,3,3): RSV->K->D->J
-   - RSV = (CLOSE - LLV(LOW,9)) / (HHV(HIGH,9) - LLV(LOW,9)) * 100
-   - K = SMA(RSV,3,1)
-   - D = SMA(K,3,1)
-   - J = 3*K - 2*D
-
-7. 关键K线 = V>=REF(V,1)*N AND C>O AND 流通市值>CAP
+4. 异动放量阳线 = V>=REF(V,1)*N AND C>O AND 流通市值>CAP
    - 成交量是前一天的N倍以上 AND 阳线 AND 流通市值达标
 
-8. 异动 = EXIST(关键K线, M)
+5. 异动 = EXIST(关键K线, M)
    - 在M天内存在关键K线
 
-9. 选股信号 = 异动 AND 趋势线在上 AND (回落碗中 OR 回落短期趋势) AND J<=J_VAL
-   - 同时满足以上所有条件
+6. KDJ计算(9,3,3): RSV->K->D->J
+   - J = 3*K - 2*D
+
+7. J值低位 = J <= J_VAL
+
+8. 分类标记（满足条件的按优先级标记）：
+   - 回落碗中：价格位于知行短期趋势线和知行多空线之间（优先级最高）
+   - 靠近多空线：价格距离知行多空线 ±duokong_pct% 范围内
+   - 靠近短期趋势线：价格距离知行短期趋势线 ±short_pct% 范围内
+
+9. 选股信号 = 异动 AND 趋势线在上 AND J值低位 AND (回落碗中 OR 靠近多空线 OR 靠近短期趋势线)
 """
 import pandas as pd
 import sys
@@ -46,7 +43,7 @@ from utils.technical import (
 
 
 class BowlReboundStrategy(BaseStrategy):
-    """碗口反弹策略"""
+    """碗口反弹策略 - 分类标记版"""
     
     def __init__(self, params=None):
         # 默认参数
@@ -55,6 +52,8 @@ class BowlReboundStrategy(BaseStrategy):
             'M': 15,             # 回溯天数
             'CAP': 4000000000,   # 流通市值>40亿
             'J_VAL': 30,         # J值上限
+            'duokong_pct': 3,    # 距离多空线百分比(默认3%)
+            'short_pct': 2,      # 距离短期趋势线百分比(默认2%)
             'M1': 14,            # MA周期1 (多空线)
             'M2': 28,            # MA周期2 (多空线)
             'M3': 57,            # MA周期3 (多空线)
@@ -73,7 +72,7 @@ class BowlReboundStrategy(BaseStrategy):
         """
         result = df.copy()
         
-        # 1. 知行趋势线 (使用可配置的MA周期参数)
+        # 1. 知行趋势线
         trend_df = calculate_zhixing_trend(
             result, 
             m1=self.params['M1'],
@@ -84,34 +83,45 @@ class BowlReboundStrategy(BaseStrategy):
         result['short_term_trend'] = trend_df['short_term_trend']
         result['bull_bear_line'] = trend_df['bull_bear_line']
         
-        # 2. 趋势线在上
+        # 2. 上升趋势
         result['trend_above'] = result['short_term_trend'] > result['bull_bear_line']
         
-        # 3. 回落碗中
-        result['fall_in_bowl'] = ((result['close'] >= result['bull_bear_line']) & 
-                                   (result['close'] <= result['short_term_trend']))
-        
-        # 4. 回落短期趋势 (在趋势线附近±2%)
-        result['near_short_trend'] = (
-            (result['close'] >= result['short_term_trend'] * 0.98) & 
-            (result['close'] <= result['short_term_trend'] * 1.02)
+        # 3. 分类条件计算
+        # 回落碗中：价格位于多空线和短期趋势线之间（优先级最高）
+        result['fall_in_bowl'] = (
+            (result['close'] >= result['bull_bear_line']) & 
+            (result['close'] <= result['short_term_trend'])
         )
         
-        # 5. KDJ指标
+        # 靠近多空线：价格距离多空线 ±duokong_pct% 范围内
+        duokong_pct = self.params['duokong_pct'] / 100
+        result['near_duokong'] = (
+            (result['close'] >= result['bull_bear_line'] * (1 - duokong_pct)) & 
+            (result['close'] <= result['bull_bear_line'] * (1 + duokong_pct))
+        )
+        
+        # 靠近短期趋势线：价格距离短期趋势线 ±short_pct% 范围内
+        short_pct = self.params['short_pct'] / 100
+        result['near_short_trend'] = (
+            (result['close'] >= result['short_term_trend'] * (1 - short_pct)) & 
+            (result['close'] <= result['short_term_trend'] * (1 + short_pct))
+        )
+        
+        # 4. KDJ指标
         kdj_df = KDJ(result, n=9, m1=3, m2=3)
         result['K'] = kdj_df['K']
         result['D'] = kdj_df['D']
         result['J'] = kdj_df['J']
         
-        # 6. 关键K线条件
-        # V >= REF(V,1) * N (成交量是前一天的N倍)
+        # 5. 放量阳线条件
+        # 成交量 >= 前一日 * N
         result['vol_ratio'] = result['volume'] / REF(result['volume'], 1)
         result['vol_surge'] = result['vol_ratio'] >= self.params['N']
         
-        # C > O (收盘价>开盘价，阳线)
+        # 阳线：收盘价 > 开盘价
         result['positive_candle'] = result['close'] > result['open']
         
-        # 流通市值 > CAP
+        # 流通市值达标
         result['market_cap_ok'] = result['market_cap'] > self.params['CAP']
         
         # 关键K线 = 放量 AND 阳线 AND 市值达标
@@ -121,26 +131,18 @@ class BowlReboundStrategy(BaseStrategy):
             result['market_cap_ok']
         )
         
-        # 7. 异动 = EXIST(关键K线, M)
+        # 6. 异动 = EXIST(关键K线, M)
         result['abnormal'] = EXIST(result['key_candle'], self.params['M'])
         
-        # 8. J值条件
+        # 7. J值低位
         result['j_low'] = result['J'] <= self.params['J_VAL']
-        
-        # 9. 选股信号
-        result['signal'] = (
-            result['abnormal'] & 
-            result['trend_above'] & 
-            (result['fall_in_bowl'] | result['near_short_trend']) & 
-            result['j_low']
-        )
         
         return result
     
     def select_stocks(self, df, stock_name='') -> list:
         """
         选股逻辑 - 基于最新一天的数据进行筛选
-        只有最新一天满足所有条件时，才返回选股信号
+        选股后按类型分类标记（优先级：回落碗中 > 靠近多空线 > 靠近短期趋势线）
         """
         if df.empty:
             return []
@@ -159,60 +161,67 @@ class BowlReboundStrategy(BaseStrategy):
         if latest['volume'] <= 0 or pd.isna(latest['close']):
             return []
         
-        # 过滤数据异常的股票（J值极端异常，可能是退市股票）
+        # 过滤数据异常的股票
         recent_df = df.head(30)
         if recent_df['J'].abs().mean() > 80:
             return []
         
-        # ========== 核心条件检查：最新一天必须满足所有选股条件 ==========
+        # ========== 核心条件检查 ==========
         
-        # 1. 趋势线在上
+        # 1. 上升趋势
         if not latest['trend_above']:
             return []
         
-        # 2. 回落碗中 或 回落短期趋势
-        if not (latest['fall_in_bowl'] or latest['near_short_trend']):
-            return []
-        
-        # 3. J值条件
+        # 2. J值条件
         if not latest['j_low']:
             return []
         
-        # 4. 异动条件：在M天内存在关键K线（以最新一天为基准向前回溯）
-        # 在回溯期(M天内)查找关键K线
+        # 3. 异动条件：在M天内存在放量阳线
         lookback_df = df.head(self.params['M'])
         key_candles = lookback_df[
             (lookback_df['key_candle'] == True) & 
-            (lookback_df['close'] > lookback_df['open'])  # 确保是阳线
+            (lookback_df['close'] > lookback_df['open'])
         ]
         
         if key_candles.empty:
             return []
         
-        # ========== 所有条件满足，构建选股信号 ==========
+        # ========== 分类标记（按优先级） ==========
         
-        signals = []
-        
-        # 买入理由
         reasons = []
+        category = None
+        
+        # 优先级1：回落碗中（价格位于多空线和短期趋势线之间）
         if latest['fall_in_bowl']:
             reasons.append('回落碗中')
-        if latest['near_short_trend']:
-            reasons.append('回落短期趋势线')
+            category = 'bowl_center'
+        # 优先级2：靠近多空线
+        elif latest['near_duokong']:
+            reasons.append(f'靠近多空线(±{self.params["duokong_pct"]}%)')
+            category = 'near_duokong'
+        # 优先级3：靠近短期趋势线
+        elif latest['near_short_trend']:
+            reasons.append(f'靠近短期趋势线(±{self.params["short_pct"]}%)')
+            category = 'near_short_trend'
+        else:
+            # 不满足任何位置条件
+            return []
         
-        # 最近的关键K线
+        # ========== 构建选股信号 ==========
+        
         latest_key = key_candles.iloc[0]
         
         signal_info = {
-            'date': latest_date,                    # 当前日期（最新）
-            'close': round(latest['close'], 2),     # 当前最新价格
-            'J': round(latest['J'], 2),             # 当前J值
+            'date': latest_date,
+            'close': round(latest['close'], 2),
+            'J': round(latest['J'], 2),
             'volume_ratio': round(latest['vol_ratio'], 2) if not pd.isna(latest['vol_ratio']) else 1.0,
             'market_cap': round(latest['market_cap'] / 1e8, 2),
+            'short_term_trend': round(latest['short_term_trend'], 2),
+            'bull_bear_line': round(latest['bull_bear_line'], 2),
             'reasons': reasons,
-            'key_candle_date': latest_key['date'],  # 最近的关键K线日期
+            'category': category,  # 分类标记
+            'key_candle_date': latest_key['date'],
         }
         
-        signals.append(signal_info)
-        
-        return signals
+        return [signal_info]

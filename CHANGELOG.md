@@ -4,8 +4,37 @@
 
 ## [Unreleased]
 
+### 重构
+- **策略重构**: 将多个独立策略合并为「碗口反弹策略（分类标记版）」
+  - 原来：4个独立策略（BowlReboundStrategy + 3个新策略）
+  - 现在：1个策略，选股后按三种类型分类标记
+  - 分类优先级：回落碗中 > 靠近多空线 > 靠近短期趋势线
+
 ### 新增功能
 - 添加 `--version` 参数支持，可查看系统版本、Python版本、依赖库版本等信息
+- 添加 `--category` 命令行参数，支持按分类筛选股票:
+  - `bowl_center` - 只显示回落碗中的股票
+  - `near_duokong` - 只显示靠近多空线的股票
+  - `near_short_trend` - 只显示靠近短期趋势线的股票
+  - `all` - 显示全部（默认）
+
+### 策略逻辑改进
+- **放量必须是阳线**: 关键K线判定增加 `close > open` 条件
+- **新增分类参数**:
+  - `duokong_pct`: 靠近多空线百分比阈值（默认3%）
+  - `short_pct`: 靠近短期趋势线百分比阈值（默认2%）
+
+### 修改文件
+- `strategy/bowl_rebound.py` - 重构为分类标记版，增加分类逻辑
+- `strategy/__init__.py` - 只保留 BowlReboundStrategy
+- `main.py` - 添加 `--category` 参数支持，简化策略调用
+- `config/strategy_params.yaml` - 添加 `duokong_pct` 和 `short_pct` 参数
+- `README.md` - 更新策略说明和命令说明
+
+### 删除文件
+- `strategy/near_duokong.py` - 合并到 bowl_rebound.py
+- `strategy/near_short_trend.py` - 合并到 bowl_rebound.py
+- `strategy/bowl_center.py` - 合并到 bowl_rebound.py
 
 ## [2024-02-10]
 

@@ -33,14 +33,26 @@ python3 main.py run
 python3 main.py web
 ```
 
-## 📊 碗口反弹策略
+## 📊 策略说明
 
-策略基于以下逻辑选股：
+### 碗口反弹策略 (BowlReboundStrategy) - 分类标记版
 
+策略基于以下逻辑选股，并将选出的股票按三种类型分类标记：
+
+#### 选股条件
 1. **上升趋势** - 知行短期趋势线 > 知行多空线
-2. **价格回落** - 价格回落至碗中或短期趋势线附近(±2%)
-3. **异动检测** - 近期(M天内)存在放量阳线(成交量>=前日*N倍)
-4. **KDJ低位** - J值 <= 阈值（默认30），处于超卖区域
+2. **异动放量阳线** - 近期(M天内)存在放量阳线（成交量>=前日*N倍，且收盘价>开盘价）
+3. **KDJ低位** - J值 <= 阈值，处于超卖区域
+
+#### 分类标记（优先级从高到低）
+
+| 分类 | 图标 | 条件 | 参数 |
+|------|------|------|------|
+| **回落碗中** | 🥣 | 价格位于知行短期趋势线和知行多空线之间 | - |
+| **靠近多空线** | 📊 | 价格距离知行多空线 ±duokong_pct% | `duokong_pct`: 默认3% |
+| **靠近短期趋势线** | 📈 | 价格距离知行短期趋势线 ±short_pct% | `short_pct`: 默认2% |
+
+> **注意**：回落碗中优先级最高。当股票同时满足多个条件时，优先标记为"回落碗中"。
 
 ## 🛠️ 技术栈
 
@@ -57,9 +69,9 @@ python3 main.py web
 ├── web_server.py        # Web服务器
 ├── quant.sh             # 快捷命令脚本
 ├── strategy/            # 策略模块
+│   ├── __init__.py      # 策略自动注册
 │   ├── base_strategy.py # 策略基类
-│   ├── bowl_rebound.py  # 碗口反弹策略
-│   └── strategy_registry.py
+│   └── bowl_rebound.py  # 碗口反弹策略（分类标记版）
 ├── utils/               # 工具模块
 │   ├── akshare_fetcher.py
 │   ├── csv_manager.py
@@ -81,8 +93,12 @@ python3 main.py web
 |------|------|
 | `python3 main.py init` | 首次全量抓取6年历史数据 |
 | `python3 main.py update` | 每日增量更新 |
-| `python3 main.py select` | 执行选股策略 |
+| `python3 main.py select` | 执行选股策略（全部分类） |
+| `python3 main.py select --category bowl_center` | 只选回落碗中的股票 |
+| `python3 main.py select --category near_duokong` | 只选靠近多空线的股票 |
+| `python3 main.py select --category near_short_trend` | 只选靠近短期趋势线的股票 |
 | `python3 main.py run` | 完整流程（更新+选股+通知） |
+| `python3 main.py run --category near_duokong` | 完整流程，只选靠近多空线的股票 |
 | `python3 main.py web` | 启动Web界面 (默认端口5000) |
 | `python3 main.py --version` | 显示版本信息 |
 
@@ -98,11 +114,18 @@ python3 main.py web
 编辑 `config/strategy_params.yaml` 调整参数：
 
 ```yaml
+# 碗口反弹策略（分类标记版）
 BowlReboundStrategy:
-  N: 4              # 成交量倍数
-  M: 15             # 回溯天数
+  N: 2.4            # 成交量倍数
+  M: 20             # 回溯天数
   CAP: 4000000000   # 流通市值门槛（40亿）
-  J_VAL: 30         # J值上限
+  J_VAL: 0          # J值上限
+  M1: 14            # MA周期1
+  M2: 28            # MA周期2
+  M3: 57            # MA周期3
+  M4: 114           # MA周期4
+  duokong_pct: 3    # 距离多空线百分比（分类用）
+  short_pct: 2      # 距离短期趋势线百分比（分类用）
 ```
 
 ## 🌐 Web界面

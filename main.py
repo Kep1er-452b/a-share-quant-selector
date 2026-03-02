@@ -97,8 +97,10 @@ class QuantSystem:
         self.fetcher.daily_update(max_stocks=max_stocks)
         print("\n✓ 数据更新完成")
     
-    def select_stocks(self):
-        """执行选股"""
+    def select_stocks(self, category='all'):
+        """执行选股
+        :param category: 股票分类筛选，'all'表示全部，其他值按分类筛选
+        """
         print("=" * 60)
         print("🎯 执行选股策略")
         print("=" * 60)
@@ -109,15 +111,15 @@ class QuantSystem:
         
         if not self.registry.list_strategies():
             print("✗ 没有找到可用策略")
-            return {}
+            return {}, {}
         
         print(f"已加载 {len(self.registry.list_strategies())} 个策略")
         
         # 输出当前策略参数
         print("\n当前策略参数:")
-        for strategy_name, strategy in self.registry.strategies.items():
+        for strategy_name, strategy_obj in self.registry.strategies.items():
             print(f"\n  🎯 {strategy_name}:")
-            for param_name, param_value in strategy.params.items():
+            for param_name, param_value in strategy_obj.params.items():
                 # 对特定参数添加说明
                 note = ""
                 if param_name == 'N':
@@ -138,7 +140,7 @@ class QuantSystem:
         
         if not stock_codes:
             print("✗ 没有股票数据，请先执行 init 或 update")
-            return {}
+            return {}, {}
         
         print(f"共 {len(stock_codes)} 只股票")
         
@@ -167,8 +169,11 @@ class QuantSystem:
         
         print(f"\n✓ 有效数据: {len(stock_data)} 只 (过滤 {invalid_count} 只异常股票)")
         
-        # 执行选股
+        # 执行选股（运行所有策略）
         results = self.registry.run_all(stock_data)
+        
+        # 分类统计
+        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
         
         # 显示结果
         print("\n" + "=" * 60)
@@ -176,18 +181,38 @@ class QuantSystem:
         print("=" * 60)
         
         for strategy_name, signals in results.items():
-            print(f"\n{strategy_name}: {len(signals)} 只")
+            # 按分类筛选
+            filtered_signals = []
             for signal in signals:
+                for s in signal['signals']:
+                    cat = s.get('category', 'unknown')
+                    category_count[cat] = category_count.get(cat, 0) + 1
+                    if category == 'all' or cat == category:
+                        filtered_signals.append(signal)
+            
+            print(f"\n{strategy_name}: {len(filtered_signals)} 只")
+            for signal in filtered_signals:
                 code = signal['code']
                 name = signal.get('name', stock_names.get(code, '未知'))
                 for s in signal['signals']:
                     # 显示最新一天的数据（策略基于最新一天筛选）
-                    print(f"  - {code} {name}: 日期={s['date']}, 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
+                    cat_emoji = {'bowl_center': '🥣', 'near_duokong': '📊', 'near_short_trend': '📈'}.get(s.get('category'), '❓')
+                    print(f"  {cat_emoji} {code} {name}: 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
+        
+        # 显示分类统计
+        print("\n" + "-" * 60)
+        print("分类统计:")
+        print(f"  🥣 回落碗中: {category_count.get('bowl_center', 0)} 只")
+        print(f"  📊 靠近多空线: {category_count.get('near_duokong', 0)} 只")
+        print(f"  📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只")
+        print("-" * 60)
         
         return results, stock_names
     
-    def run_full(self):
-        """完整流程：更新 + 选股 + 通知"""
+    def run_full(self, category='all'):
+        """完整流程：更新 + 选股 + 通知
+        :param category: 股票分类筛选
+        """
         print("=" * 60)
         print("🚀 执行完整流程")
         print("=" * 60)
@@ -196,7 +221,7 @@ class QuantSystem:
         self.update_data()
         
         # 2. 选股
-        results, stock_names = self.select_stocks()
+        results, stock_names = self.select_stocks(category=category)
         
         # 3. 发送通知
         if results:
@@ -247,48 +272,55 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python main.py init          # 首次抓取6年历史数据
-  python main.py update        # 每日增量更新
-  python main.py select        # 执行选股
-  python main.py run           # 完整流程（更新+选股+通知）
-  python main.py schedule      # 启动定时调度（每天15:05）
-  python main.py web           # 启动Web界面
-  python main.py --version     # 显示版本信息
+  python main.py init                          # 首次抓取6年历史数据
+  python main.py update                        # 每日增量更新
+  python main.py select                        # 执行选股（全部）
+  python main.py select --category bowl_center               # 只选回落碗中的股票
+  python main.py run                           # 完整流程（更新+选股+通知）
+  python main.py run --category near_duokong                 # 只选靠近多空线的股票
+  python main.py web                           # 启动Web界面
+  python main.py --version                     # 显示版本信息
+
+分类说明:
+  all              - 全部（回落碗中 + 靠近多空线 + 靠近短期趋势线）
+  bowl_center      - 回落碗中（优先级最高）
+  near_duokong     - 靠近多空线（±duokong_pct%，默认3%）
+  near_short_trend - 靠近短期趋势线（±short_pct%，默认2%）
         """
     )
-    
+
     parser.add_argument(
         '--version',
         action='store_true',
         help='显示版本信息并退出'
     )
-    
+
     parser.add_argument(
         'command',
         choices=['init', 'update', 'select', 'run', 'schedule', 'web'],
         nargs='?',
         help='要执行的命令'
     )
-    
+
     parser.add_argument(
         '--max-stocks',
         type=int,
         default=None,
         help='限制处理的股票数量（用于测试）'
     )
-    
+
     parser.add_argument(
         '--config',
         default='config/config.yaml',
         help='配置文件路径'
     )
-    
+
     parser.add_argument(
         '--host',
         default='0.0.0.0',
         help='Web服务器监听地址 (默认: 0.0.0.0)'
     )
-    
+
     parser.add_argument(
         '--port',
         type=int,
@@ -296,13 +328,21 @@ def main():
         help='Web服务器端口 (默认: 5000)'
     )
     
+    parser.add_argument(
+        '--category',
+        type=str,
+        choices=['all', 'bowl_center', 'near_duokong', 'near_short_trend'],
+        default='all',
+        help='筛选股票分类: all(全部), bowl_center(回落碗中), near_duokong(靠近多空线), near_short_trend(靠近短期趋势线)'
+    )
+
     args = parser.parse_args()
-    
+
     # 处理 --version 参数
     if args.version:
         print_version()
         sys.exit(0)
-    
+
     # 检查命令是否提供
     if not args.command:
         parser.print_help()
@@ -322,13 +362,16 @@ def main():
         quant.update_data(max_stocks=args.max_stocks)
     
     elif args.command == 'select':
-        quant.select_stocks()
-    
+        quant.select_stocks(category=args.category)
+
     elif args.command == 'run':
-        quant.run_full()
+        quant.run_full(category=args.category)
     
     elif args.command == 'schedule':
-        quant.run_schedule()
+        # 定时任务暂时禁用，避免开发冲突
+        print("⚠️  定时任务功能暂时禁用（开发中）")
+        print("   请使用 'python3 main.py run' 手动执行选股")
+        # quant.run_schedule()
     
     elif args.command == 'web':
         # 启动Web服务器

@@ -90,6 +90,37 @@ class StrategyRegistry:
             except Exception as e:
                 print(f"  ✗ 加载 {module_name} 失败: {e}")
     
+    def run_strategy(self, strategy_name, stock_data_dict):
+        """
+        运行单个策略
+        :param strategy_name: 策略名称
+        :param stock_data_dict: {code: (name, df)} 格式的股票数据
+        :return: {strategy_name: [signals]} 格式的结果
+        """
+        if strategy_name not in self.strategies:
+            return {}
+        
+        strategy = self.strategies[strategy_name]
+        total_stocks = len(stock_data_dict)
+        
+        print(f"\n执行策略: {strategy_name}")
+        print(f"  共 {total_stocks} 只股票待分析...")
+        signals = []
+        processed = 0
+        
+        for code, (name, df) in stock_data_dict.items():
+            result = strategy.analyze_stock(code, name, df)
+            if result:
+                signals.append(result)
+            
+            processed += 1
+            # 每100只股票显示一次进度
+            if processed % 100 == 0 or processed == total_stocks:
+                print(f"  进度: [{processed}/{total_stocks}] 已分析 {processed} 只，选出 {len(signals)} 只...")
+        
+        print(f"  ✓ 选股完成: 共 {len(signals)} 只股票符合策略")
+        return {strategy_name: signals}
+    
     def run_all(self, stock_data_dict):
         """
         运行所有策略
