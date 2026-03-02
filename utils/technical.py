@@ -7,19 +7,12 @@ import numpy as np
 
 def MA(series, n):
     """
-    简单移动平均 - 正确处理倒序排列的数据（最新日期在前）
+    简单移动平均 - 针对倒序排列数据优化
     
-    对于倒序数据，MA(n)应该取当前及之后n-1个数据的平均值
-    实现方式：反转数据 -> 计算rolling -> 反转回来
+    数据是倒序（最新日期在前），rolling默认向后看n个值
+    正好是取当前及历史n-1个数据，符合MA定义
     """
-    # 反转数据，使数据按时间正序排列
-    reversed_series = series.iloc[::-1]
-    
-    # 在正序数据上计算MA（向前看n个值）
-    ma_reversed = reversed_series.rolling(window=n, min_periods=1).mean()
-    
-    # 反转回来，恢复倒序
-    return ma_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
+    return series.rolling(window=n, min_periods=1).mean()
 
 
 def EMA(series, n):
@@ -33,20 +26,16 @@ def EMA(series, n):
 
 def LLV(series, n):
     """
-    N周期最低值 - 正确处理倒序排列的数据
+    N周期最低值 - 针对倒序排列数据优化
     """
-    reversed_series = series.iloc[::-1]
-    llv_reversed = reversed_series.rolling(window=n, min_periods=1).min()
-    return llv_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
+    return series.rolling(window=n, min_periods=1).min()
 
 
 def HHV(series, n):
     """
-    N周期最高值 - 正确处理倒序排列的数据
+    N周期最高值 - 针对倒序排列数据优化
     """
-    reversed_series = series.iloc[::-1]
-    hhv_reversed = reversed_series.rolling(window=n, min_periods=1).max()
-    return hhv_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
+    return series.rolling(window=n, min_periods=1).max()
 
 
 def SMA(X, n, m):

@@ -72,7 +72,8 @@ class BowlReboundStrategy(BaseStrategy):
         """
         result = df.copy()
         
-        # 1. 知行趋势线
+        # 1. 知行趋势线（使用technical模块，正确处理倒序数据）
+        from utils.technical import calculate_zhixing_trend
         trend_df = calculate_zhixing_trend(
             result, 
             m1=self.params['M1'],
@@ -108,6 +109,7 @@ class BowlReboundStrategy(BaseStrategy):
         )
         
         # 4. KDJ指标
+        from utils.technical import KDJ
         kdj_df = KDJ(result, n=9, m1=3, m2=3)
         result['K'] = kdj_df['K']
         result['D'] = kdj_df['D']
@@ -115,6 +117,7 @@ class BowlReboundStrategy(BaseStrategy):
         
         # 5. 放量阳线条件
         # 成交量 >= 前一日 * N
+        from utils.technical import REF
         result['vol_ratio'] = result['volume'] / REF(result['volume'], 1)
         result['vol_surge'] = result['vol_ratio'] >= self.params['N']
         
@@ -132,6 +135,7 @@ class BowlReboundStrategy(BaseStrategy):
         )
         
         # 6. 异动 = EXIST(关键K线, M)
+        from utils.technical import EXIST
         result['abnormal'] = EXIST(result['key_candle'], self.params['M'])
         
         # 7. J值低位
