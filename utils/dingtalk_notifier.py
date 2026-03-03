@@ -27,6 +27,73 @@ except ImportError:
         print("警告: K线图模块未安装，图片功能不可用")
 
 
+class RateLimiter:
+    """限流器 - 控制每分钟发送数量"""
+    
+    def __init__(self, max_per_minute=20, min_interval=2.0):
+        """
+        Args:
+            max_per_minute: 每分钟最大发送次数（钉钉默认限制约20条/分钟）
+            min_interval: 每次发送最小间隔（秒）
+        """
+        self.max_per_minute = max_per_minute
+        self.min_interval = min_interval
+        self.send_times = []  # 记录每次发送的时间戳
+        self._lock_time = 0   # 锁定时间（遇到限速错误时延长）"
+    
+    def acquire(self):
+        """
+        获取发送许可，必要时阻塞等待
+        Returns: 实际等待的秒数
+        """
+        now = time.time()
+        
+        # 清理1分钟前的记录
+        self.send_times = [t for t in self.send_times if now - t < 60]
+        
+        # 检查是否处于锁定状态（遇到过限速错误）
+        if now < self._lock_time:
+            wait = self._lock_time - now
+            time.sleep(wait)
+            now = time.time()
+        
+        # 检查每分钟限制
+        if len(self.send_times) >= self.max_per_minute:
+            # 需要等到最早一条记录超过1分钟
+            oldest = self.send_times[0]
+            wait = 60 - (now - oldest) + 0.1  # 多等0.1秒确保
+            if wait > 0:
+                print(f"    ⏱️ 限流: 已达到每分钟{self.max_per_minute}条限制，等待{wait:.1f}秒...")
+                time.sleep(wait)
+                now = time.time()
+                # 重新清理
+                self.send_times = [t for t in self.send_times if now - t < 60]
+        
+        # 检查最小间隔
+        if self.send_times:
+            last_send = self.send_times[-1]
+            elapsed = now - last_send
+            if elapsed < self.min_interval:
+                wait = self.min_interval - elapsed
+                time.sleep(wait)
+                now = time.time()
+        
+        # 记录本次发送时间
+        self.send_times.append(now)
+        return now
+    
+    def on_rate_limit_error(self, retry_count=0):
+        """
+        遇到限速错误时的处理 - 指数退避
+        Args:
+            retry_count: 当前重试次数
+        """
+        backoff = min(2 ** retry_count, 30)  # 最大等待30秒
+        self._lock_time = time.time() + backoff
+        print(f"    ⏱️ 遇到限速，退避等待{backoff}秒...")
+        time.sleep(backoff)
+
+
 class DingTalkNotifier:
     """钉钉通知器"""
     
@@ -34,7 +101,8 @@ class DingTalkNotifier:
         self.webhook_url = webhook_url
         self.secret = secret
         self._last_send_time = 0
-        self._min_interval = 1.0  # 最小发送间隔1秒，避免触发限速（660026错误）
+        self._min_interval = 2.0  # 最小发送间隔2秒
+        self._rate_limiter = RateLimiter(max_per_minute=20, min_interval=2.0)  # 限流器
     
     def _generate_sign(self):
         """生成钉钉签名"""
@@ -49,112 +117,145 @@ class DingTalkNotifier:
         sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
         return timestamp, sign
 
-    def _send_request(self, data: dict) -> bool:
-        """发送HTTP请求到钉钉（带速率限制）"""
-        # 速率限制：确保最小间隔
-        elapsed = time.time() - self._last_send_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
+    def _send_request(self, data: dict, max_retries=3) -> bool:
+        """发送HTTP请求到钉钉（带速率限制和重试）
         
-        timestamp, sign = self._generate_sign()
-
-        if self.secret:
-            webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
-        else:
-            webhook_url = self.webhook_url
-
-        try:
-            response = requests.post(
-                webhook_url,
-                json=data,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
-            )
-            
-            # 更新最后发送时间
-            self._last_send_time = time.time()
-
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('errcode') == 0:
-                    return True
-                else:
-                    print(f"✗ 钉钉返回错误: {result}")
-                    # 如果是限速错误，等待更长时间
-                    if result.get('errcode') == 660026:
-                        time.sleep(2)
-                    return False
-            else:
-                print(f"✗ HTTP错误: {response.status_code}")
-                return False
-
-        except Exception as e:
-            print(f"✗ 请求异常: {e}")
-            return False
-    
-    def _send_single_markdown(self, title, content, part_info=""):
+        Args:
+            data: 要发送的数据
+            max_retries: 最大重试次数
         """
-        发送单条 Markdown 格式消息（带速率限制）
+        for attempt in range(max_retries + 1):
+            # 使用限流器获取发送许可
+            self._rate_limiter.acquire()
+            
+            timestamp, sign = self._generate_sign()
+
+            if self.secret:
+                webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
+            else:
+                webhook_url = self.webhook_url
+
+            try:
+                response = requests.post(
+                    webhook_url,
+                    json=data,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=30
+                )
+                
+                # 更新最后发送时间
+                self._last_send_time = time.time()
+
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('errcode') == 0:
+                        return True
+                    else:
+                        # 如果是限速错误，使用退避策略重试
+                        if result.get('errcode') == 660026:
+                            if attempt < max_retries:
+                                print(f"    ⚠️ 触发钉钉限速(660026)，第{attempt+1}次重试...")
+                                self._rate_limiter.on_rate_limit_error(attempt)
+                                continue
+                            else:
+                                print(f"    ✗ 重试{max_retries}次后仍触发限速，跳过此消息")
+                                return False
+                        else:
+                            print(f"    ✗ 钉钉返回错误: {result}")
+                            return False
+                else:
+                    print(f"    ✗ HTTP错误: {response.status_code}")
+                    if attempt < max_retries:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return False
+
+            except Exception as e:
+                print(f"    ✗ 请求异常: {e}")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return False
+        
+        return False
+    
+    def _send_single_markdown(self, title, content, part_info="", max_retries=3):
+        """
+        发送单条 Markdown 格式消息（带速率限制和重试）
         """
         if not self.webhook_url:
             print("警告: 未配置钉钉 webhook")
             return False
         
-        # 速率限制：确保最小间隔
-        elapsed = time.time() - self._last_send_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        
-        # 生成签名
-        timestamp, sign = self._generate_sign()
-        
-        # 构建带签名的URL
-        if self.secret:
-            webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
-        else:
-            webhook_url = self.webhook_url
-        
-        # 添加分段信息到内容
-        text = content
-        if part_info:
-            text = f"> {part_info}\n\n{text}"
-        
-        data = {
-            "msgtype": "markdown",
-            "markdown": {
-                "title": title,
-                "text": text
-            }
-        }
-        
-        try:
-            response = requests.post(
-                webhook_url,
-                json=data,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
+        for attempt in range(max_retries + 1):
+            # 使用限流器获取发送许可
+            self._rate_limiter.acquire()
             
-            # 更新最后发送时间
-            self._last_send_time = time.time()
+            # 生成签名
+            timestamp, sign = self._generate_sign()
             
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('errcode') == 0:
-                    return True
-                else:
-                    print(f"✗ 钉钉发送失败: {result}")
-                    # 如果是限速错误，等待更长时间
-                    if result.get('errcode') == 660026:
-                        time.sleep(2)
-                    return False
+            # 构建带签名的URL
+            if self.secret:
+                webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
             else:
-                print(f"✗ HTTP错误: {response.status_code}")
-                return False
+                webhook_url = self.webhook_url
+            
+            # 添加分段信息到内容
+            text = content
+            if part_info:
+                text = f"> {part_info}\n\n{text}"
+            
+            data = {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": title,
+                    "text": text
+                }
+            }
+            
+            try:
+                response = requests.post(
+                    webhook_url,
+                    json=data,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
                 
-        except Exception as e:
-            print(f"✗ 发送异常: {e}")
-            return False
+                # 更新最后发送时间
+                self._last_send_time = time.time()
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('errcode') == 0:
+                        return True
+                    else:
+                        # 如果是限速错误，使用退避策略重试
+                        if result.get('errcode') == 660026:
+                            if attempt < max_retries:
+                                print(f"    ⚠️ 触发限速，第{attempt+1}次重试...")
+                                self._rate_limiter.on_rate_limit_error(attempt)
+                                continue
+                            else:
+                                print(f"    ✗ 重试{max_retries}次后仍触发限速")
+                                return False
+                        else:
+                            print(f"    ✗ 钉钉发送失败: {result}")
+                            return False
+                else:
+                    print(f"    ✗ HTTP错误: {response.status_code}")
+                    if attempt < max_retries:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return False
+                    
+            except Exception as e:
+                print(f"    ✗ 发送异常: {e}")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return False
+        
+        return False
 
     def send_markdown(self, title, content):
         """
@@ -335,56 +436,81 @@ class DingTalkNotifier:
         
         return content
     
-    def _send_single_text(self, content, part_info=""):
+    def _send_single_text(self, content, part_info="", max_retries=3):
         """
-        发送单条纯文本消息
+        发送单条纯文本消息（带速率限制和重试）
         """
         if not self.webhook_url:
             print("警告: 未配置钉钉 webhook")
             return False
         
-        # 生成签名
-        timestamp, sign = self._generate_sign()
-        
-        # 构建带签名的URL
-        if self.secret:
-            webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
-        else:
-            webhook_url = self.webhook_url
-        
-        # 添加分段信息
-        if part_info:
-            content = f"{part_info}\n{content}"
-        
-        data = {
-            "msgtype": "text",
-            "text": {
-                "content": content
-            }
-        }
-        
-        try:
-            response = requests.post(
-                webhook_url,
-                json=data,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
+        for attempt in range(max_retries + 1):
+            # 使用限流器获取发送许可
+            self._rate_limiter.acquire()
             
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('errcode') == 0:
-                    return True
-                else:
-                    print(f"✗ 钉钉发送失败: {result}")
-                    return False
+            # 生成签名
+            timestamp, sign = self._generate_sign()
+            
+            # 构建带签名的URL
+            if self.secret:
+                webhook_url = f"{self.webhook_url}&timestamp={timestamp}&sign={sign}"
             else:
-                print(f"✗ HTTP错误: {response.status_code}")
-                return False
+                webhook_url = self.webhook_url
+            
+            # 添加分段信息
+            if part_info:
+                content = f"{part_info}\n{content}"
+            
+            data = {
+                "msgtype": "text",
+                "text": {
+                    "content": content
+                }
+            }
+            
+            try:
+                response = requests.post(
+                    webhook_url,
+                    json=data,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
                 
-        except Exception as e:
-            print(f"✗ 发送异常: {e}")
-            return False
+                # 更新最后发送时间
+                self._last_send_time = time.time()
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('errcode') == 0:
+                        return True
+                    else:
+                        # 如果是限速错误，使用退避策略重试
+                        if result.get('errcode') == 660026:
+                            if attempt < max_retries:
+                                print(f"    ⚠️ 触发限速，第{attempt+1}次重试...")
+                                self._rate_limiter.on_rate_limit_error(attempt)
+                                continue
+                            else:
+                                print(f"    ✗ 重试{max_retries}次后仍触发限速")
+                                return False
+                        else:
+                            print(f"    ✗ 钉钉发送失败: {result}")
+                            return False
+                else:
+                    print(f"    ✗ HTTP错误: {response.status_code}")
+                    if attempt < max_retries:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return False
+                    
+            except Exception as e:
+                print(f"    ✗ 发送异常: {e}")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return False
+        
+        return False
     
     def send_text(self, content):
         """
@@ -824,7 +950,7 @@ class DingTalkNotifier:
                                 title = f"{code} {name}"
                                 print(f"    发送文字...")
                                 self.send_markdown(title, info_message)
-                                time.sleep(0.05)  # 减少延迟
+                                # 限流器会自动控制间隔，无需手动sleep
                                 
                                 print(f"    生成K线图...")
                                 t0 = time.time()
@@ -870,7 +996,7 @@ class DingTalkNotifier:
                                 if self.send_image(chart_path, title):
                                     chart_count += 1
 
-                            time.sleep(0.1)  # 避免发送过快，减少延迟
+                            # 限流器会自动控制间隔，无需手动sleep
                             
                         except Exception as e:
                             print(f"✗ 生成 {code} 的K线图失败: {e}")
