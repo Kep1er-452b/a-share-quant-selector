@@ -328,6 +328,182 @@ class QuantSystem:
 
         return results
     
+    def select_with_b1_match(self, category='all', max_stocks=None, min_similarity=60.0, lookback_days=25):
+        """
+        执行选股 + B1完美图形匹配排序
+        
+        Args:
+            category: 股票分类筛选，'all'表示全部
+            max_stocks: 限制处理的股票数量
+            min_similarity: 最小相似度阈值，低于此值不显示
+            lookback_days: 回看天数，默认25天
+            
+        Returns:
+            dict: 包含选股结果和匹配结果
+        """
+        print("=" * 60)
+        print("🎯 执行选股 + B1完美图形匹配")
+        if max_stocks:
+            print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
+        print(f"   相似度阈值: {min_similarity}%")
+        print("=" * 60)
+        
+        # 1. 先执行原有选股逻辑
+        print("\n[1/3] 执行策略选股...")
+        results, stock_names, stock_data_dict = self.select_stocks(
+            category=category, 
+            max_stocks=max_stocks, 
+            return_data=True
+        )
+        
+        # 统计选股总数
+        total_selected = sum(len(signals) for signals in results.values())
+        if total_selected == 0:
+            print("\n✗ 策略未选出任何股票，跳过匹配")
+            return {'results': results, 'stock_names': stock_names, 'matched': []}
+        
+        print(f"\n✓ 策略选出 {total_selected} 只股票")
+        
+        # 2. 初始化B1完美图形库
+        print("\n[2/3] 初始化B1完美图形库...")
+        try:
+            from strategy.pattern_library import B1PatternLibrary
+            from strategy.pattern_config import MIN_SIMILARITY_SCORE
+            
+            library = B1PatternLibrary(self.csv_manager)
+            
+            if not library.cases:
+                print("⚠️ 警告: 案例库为空，可能数据不足")
+                return {'results': results, 'stock_names': stock_names, 'matched': []}
+            
+            print(f"✓ 案例库加载完成: {len(library.cases)} 个案例")
+            
+        except Exception as e:
+            print(f"✗ 初始化案例库失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'results': results, 'stock_names': stock_names, 'matched': []}
+        
+        # 3. 对每只候选股进行匹配
+        print("\n[3/3] 执行B1完美图形匹配...")
+        matched_results = []
+        
+        for strategy_name, signals in results.items():
+            for signal in signals:
+                code = signal['code']
+                name = signal.get('name', stock_names.get(code, '未知'))
+                
+                # 获取该股票的完整数据
+                if code not in stock_data_dict:
+                    continue
+                
+                df = stock_data_dict[code]
+                if df.empty:
+                    continue
+                
+                try:
+                    # 匹配最佳案例（使用指定回看天数）
+                    match_result = library.find_best_match(code, df, lookback_days=lookback_days)
+                    
+                    if match_result.get('best_match'):
+                        best = match_result['best_match']
+                        score = best.get('similarity_score', 0)
+                        
+                        # 只保留超过阈值的股票
+                        if score >= min_similarity:
+                            # 获取第一个信号的信息
+                            s = signal['signals'][0] if signal.get('signals') else {}
+                            
+                            matched_results.append({
+                                'stock_code': code,
+                                'stock_name': name,
+                                'strategy': strategy_name,
+                                'category': s.get('category', 'unknown'),
+                                'close': s.get('close', '-'),
+                                'J': s.get('J', '-'),
+                                'similarity_score': score,
+                                'matched_case': best.get('case_name', ''),
+                                'matched_date': best.get('case_date', ''),
+                                'matched_code': best.get('case_code', ''),
+                                'breakdown': best.get('breakdown', {}),
+                                'tags': best.get('tags', []),
+                                'all_matches': best.get('all_matches', []),
+                            })
+                            
+                except Exception as e:
+                    print(f"  ⚠️ 匹配 {code} 失败: {e}")
+                    continue
+        
+        # 按相似度排序
+        matched_results.sort(key=lambda x: x['similarity_score'], reverse=True)
+        
+        print(f"\n✓ 匹配完成: {len(matched_results)} 只股票超过阈值")
+        
+        # 显示Top10结果
+        if matched_results:
+            print("\n" + "=" * 60)
+            print("📊 Top 10 B1完美图形匹配结果")
+            print("=" * 60)
+            for i, r in enumerate(matched_results[:10], 1):
+                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                print(f"{emoji} {r['stock_code']} {r['stock_name']}")
+                print(f"   相似度: {r['similarity_score']}% | 匹配: {r['matched_case']}")
+                bd = r.get('breakdown', {})
+                print(f"   趋势:{bd.get('trend_structure', 0)}% "
+                      f"KDJ:{bd.get('kdj_state', 0)}% "
+                      f"量能:{bd.get('volume_pattern', 0)}% "
+                      f"形态:{bd.get('price_shape', 0)}%")
+        
+        return {
+            'results': results,
+            'stock_names': stock_names,
+            'matched': matched_results,
+            'total_selected': total_selected,
+        }
+    
+    def run_with_b1_match(self, category='all', max_stocks=None, min_similarity=60.0, lookback_days=25):
+        """
+        完整流程：更新 + 选股 + B1完美图形匹配 + 通知
+        
+        Args:
+            category: 股票分类筛选
+            max_stocks: 限制处理的股票数量
+            min_similarity: 最小相似度阈值
+            lookback_days: 回看天数，默认25天
+        """
+        from datetime import datetime
+        
+        print("=" * 60)
+        print("🚀 执行完整流程（含B1完美图形匹配）")
+        if max_stocks:
+            print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
+        print(f"   回看天数: {lookback_days}天")
+        print("=" * 60)
+        
+        # 1. 更新数据
+        self._smart_update(max_stocks=max_stocks)
+        
+        # 2. 选股 + B1完美图形匹配
+        match_result = self.select_with_b1_match(
+            category=category,
+            max_stocks=max_stocks,
+            min_similarity=min_similarity,
+            lookback_days=lookback_days
+        )
+        
+        # 3. 发送通知
+        if match_result.get('matched'):
+            print("\n📤 发送钉钉通知...")
+            self.notifier.send_b1_match_results(
+                match_result['matched'],
+                match_result.get('total_selected', 0)
+            )
+            print("✓ 通知发送完成")
+        else:
+            print("\n⚠️ 没有匹配结果，跳过通知")
+        
+        return match_result
+    
     def run_schedule(self):
         """启动定时调度"""
         try:
@@ -363,6 +539,7 @@ def print_version():
     print(f"akshare: {akshare.__version__}")
     print(f"pandas: {pandas.__version__}")
     print(f"System: {platform.system()}")
+    print(f"B1 Pattern Match: 支持（基于双线+量比+形态三维匹配，10个历史案例）")
 
 
 def main():
@@ -373,10 +550,10 @@ def main():
 示例:
   python main.py init                          # 首次抓取6年历史数据
   python main.py update                        # 每日增量更新
-  python main.py select                        # 执行选股（全部）
-  python main.py select --category bowl_center               # 只选回落碗中的股票
   python main.py run                           # 完整流程（更新+选股+通知）
-  python main.py run --category near_duokong                 # 只选靠近多空线的股票
+  python main.py run --b1-match                # 完整流程+B1完美图形匹配排序
+  python main.py run --b1-match --min-similarity 70  # 匹配+提高相似度阈值到70%
+  python main.py run --b1-match --lookback-days 30   # 使用30天回看期
   python main.py web                           # 启动Web界面
   python main.py --version                     # 显示版本信息
 
@@ -385,6 +562,11 @@ def main():
   bowl_center      - 回落碗中（优先级最高）
   near_duokong     - 靠近多空线（±duokong_pct%，默认3%）
   near_short_trend - 靠近短期趋势线（±short_pct%，默认2%）
+
+B1完美图形匹配:
+  基于10个历史成功案例（双线+量比+形态三维相似度匹配）
+  使用 --b1-match 参数启用，--lookback-days 调整回看天数（默认25天）
+  使用 --min-similarity 调整匹配阈值（默认60%，范围0-100）
         """
     )
 
@@ -434,6 +616,26 @@ def main():
         default='all',
         help='筛选股票分类: all(全部), bowl_center(回落碗中), near_duokong(靠近多空线), near_short_trend(靠近短期趋势线)'
     )
+    
+    parser.add_argument(
+        '--min-similarity',
+        type=float,
+        default=60.0,
+        help='B1完美图形匹配的最小相似度阈值 (默认: 60.0)'
+    )
+    
+    parser.add_argument(
+        '--b1-match',
+        action='store_true',
+        help='启用B1完美图形匹配排序（在run命令中使用）'
+    )
+    
+    parser.add_argument(
+        '--lookback-days',
+        type=int,
+        default=25,
+        help='B1完美图形匹配的回看天数 (默认: 25)'
+    )
 
     args = parser.parse_args()
 
@@ -461,7 +663,18 @@ def main():
         quant.update_data(max_stocks=args.max_stocks)
     
     elif args.command == 'run':
-        quant.run_full(category=args.category, max_stocks=args.max_stocks)
+        # 原有选股流程（支持B1完美图形匹配）
+        if args.b1_match:
+            # 启用B1完美图形匹配
+            quant.run_with_b1_match(
+                category=args.category,
+                max_stocks=args.max_stocks,
+                min_similarity=args.min_similarity,
+                lookback_days=args.lookback_days
+            )
+        else:
+            # 原有选股流程（不带B1匹配）
+            quant.run_full(category=args.category, max_stocks=args.max_stocks)
     
     elif args.command == 'web':
         # 启动Web服务器

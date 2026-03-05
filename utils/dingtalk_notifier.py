@@ -1010,5 +1010,86 @@ class DingTalkNotifier:
         return text_result
 
 
+    def send_b1_match_results(self, results: list, total_selected: int):
+        """
+        发送带B1完美图形匹配的选股结果
+        
+        Args:
+            results: 按相似度排序的股票列表
+            total_selected: 策略筛选出的总数
+        """
+        if not results:
+            return
+        
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        
+        # 分类名称映射
+        category_names = {
+            'bowl_center': '🥣 回落碗中',
+            'near_duokong': '📊 靠近多空线',
+            'near_short_trend': '📈 靠近短期趋势线'
+        }
+        
+        # 构建Markdown消息
+        lines = [
+            f"## 📊 选股结果（按B1完美图形相似度排序）\n",
+            f"⏰ 时间: {now}\n",
+            f"📈 策略筛选: {total_selected} 只 | 📊 B1 Top匹配: {len(results)} 只\n",
+            "━" * 30 + "\n\n",
+        ]
+        
+        # 只显示前15个
+        for i, r in enumerate(results[:15], 1):
+            emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            
+            stock_code = r.get('stock_code', '')
+            stock_name = r.get('stock_name', '')
+            score = r.get('similarity_score', 0)
+            matched_case = r.get('matched_case', '')
+            matched_date = r.get('matched_date', '')
+            category = r.get('category', '')
+            close = r.get('close', '-')
+            j_val = r.get('J', '-')
+            breakdown = r.get('breakdown', {})
+            
+            lines.append(
+                f"{emoji} **{stock_code}** {stock_name}  "
+                f"**相似度: {score}%**\n"
+            )
+            lines.append(
+                f"   📈 匹配案例: {matched_case} ({matched_date})\n"
+            )
+            
+            # 分项得分
+            trend_score = breakdown.get('trend_structure', 0)
+            kdj_score = breakdown.get('kdj_state', 0)
+            vol_score = breakdown.get('volume_pattern', 0)
+            shape_score = breakdown.get('price_shape', 0)
+            
+            lines.append(
+                f"   📊 分项: 趋势{trend_score}% | "
+                f"KDJ{kdj_score}% | "
+                f"量能{vol_score}% | "
+                f"形态{shape_score}%\n"
+            )
+            
+            cat_name = category_names.get(category, category)
+            lines.append(
+                f"   💰 策略: {cat_name} | "
+                f"价格: {close} | J值: {j_val}\n\n"
+            )
+        
+        # 添加图例说明
+        lines.append("---\n")
+        lines.append("**B1匹配逻辑**: 基于双线+量比+形态三维相似度\n")
+        lines.append("**案例来源**: 10个历史成功案例（华纳药厂、宁波韵升等）\n")
+        
+        content = "".join(lines)
+        
+        # 发送markdown消息
+        self.send_markdown("完美图形匹配选股结果", content)
+
+
 # 为了处理 pandas 导入
 import pandas as pd
