@@ -60,6 +60,8 @@ python3 main.py web
 
 B1完美图形匹配功能基于10个历史成功案例，对选股结果进行三维相似度匹配排序，帮助识别具有相似突破特征的股票。
 
+📖 **[查看详细匹配逻辑 →](B1_PATTERN_MATCH.md)**
+
 #### 案例库（10个历史成功案例）
 
 | 案例 | 股票名称 | 代码 | 突破日期 | 特征描述 |
@@ -118,16 +120,17 @@ EMA(EMA(CLOSE, 10), 10)
 ## 📁 项目结构
 
 ```
-├── main.py              # 主程序入口
-├── web_server.py        # Web服务器
-├── strategy/            # 策略模块
+├── main.py                   # 主程序入口
+├── web_server.py             # Web服务器
+├── B1_PATTERN_MATCH.md       # B1完美图形匹配详细文档
+├── strategy/                 # 策略模块
 │   ├── __init__.py
-│   ├── base_strategy.py # 策略基类
-│   ├── bowl_rebound.py  # 碗口反弹策略
-│   ├── strategy_registry.py # 策略注册器
-│   ├── pattern_config.py # B1完美图形案例配置
-│   ├── pattern_library.py # B1完美图形库管理
-│   ├── pattern_matcher.py # 相似度计算引擎
+│   ├── base_strategy.py      # 策略基类
+│   ├── bowl_rebound.py       # 碗口反弹策略
+│   ├── strategy_registry.py  # 策略注册器
+│   ├── pattern_config.py     # B1完美图形案例配置
+│   ├── pattern_library.py    # B1完美图形库管理
+│   ├── pattern_matcher.py    # 相似度计算引擎
 │   └── pattern_feature_extractor.py # 特征提取模块
 ├── utils/               # 工具模块
 │   ├── akshare_fetcher.py  # 数据获取
