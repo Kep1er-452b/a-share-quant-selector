@@ -328,7 +328,7 @@ class QuantSystem:
 
         return results
     
-    def select_with_b1_match(self, category='all', max_stocks=None, min_similarity=60.0, lookback_days=25):
+    def select_with_b1_match(self, category='all', max_stocks=None, min_similarity=None, lookback_days=None):
         """
         执行选股 + B1完美图形匹配排序
         
@@ -341,11 +341,19 @@ class QuantSystem:
         Returns:
             dict: 包含选股结果和匹配结果
         """
+        # 从配置读取默认值
+        from strategy.pattern_config import MIN_SIMILARITY_SCORE, DEFAULT_LOOKBACK_DAYS
+        if min_similarity is None:
+            min_similarity = MIN_SIMILARITY_SCORE
+        if lookback_days is None:
+            lookback_days = DEFAULT_LOOKBACK_DAYS
+        
         print("=" * 60)
         print("🎯 执行选股 + B1完美图形匹配")
         if max_stocks:
             print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
         print(f"   相似度阈值: {min_similarity}%")
+        print(f"   回看天数: {lookback_days}天")
         print("=" * 60)
         
         # 1. 先执行原有选股逻辑
@@ -617,11 +625,20 @@ B1完美图形匹配:
         help='筛选股票分类: all(全部), bowl_center(回落碗中), near_duokong(靠近多空线), near_short_trend(靠近短期趋势线)'
     )
     
+    # 从配置读取B1PatternMatch默认值
+    try:
+        from strategy.pattern_config import MIN_SIMILARITY_SCORE, DEFAULT_LOOKBACK_DAYS
+        default_min_similarity = MIN_SIMILARITY_SCORE
+        default_lookback_days = DEFAULT_LOOKBACK_DAYS
+    except:
+        default_min_similarity = 60.0
+        default_lookback_days = 25
+    
     parser.add_argument(
         '--min-similarity',
         type=float,
-        default=60.0,
-        help='B1完美图形匹配的最小相似度阈值 (默认: 60.0)'
+        default=None,
+        help=f'B1完美图形匹配的最小相似度阈值 (默认: {default_min_similarity})'
     )
     
     parser.add_argument(
@@ -633,8 +650,8 @@ B1完美图形匹配:
     parser.add_argument(
         '--lookback-days',
         type=int,
-        default=25,
-        help='B1完美图形匹配的回看天数 (默认: 25)'
+        default=None,
+        help=f'B1完美图形匹配的回看天数 (默认: {default_lookback_days})'
     )
 
     args = parser.parse_args()
@@ -666,11 +683,14 @@ B1完美图形匹配:
         # 原有选股流程（支持B1完美图形匹配）
         if args.b1_match:
             # 启用B1完美图形匹配
+            # 如果命令行未指定，使用配置文件中的默认值
+            min_sim = args.min_similarity if args.min_similarity is not None else default_min_similarity
+            lookback = args.lookback_days if args.lookback_days is not None else default_lookback_days
             quant.run_with_b1_match(
                 category=args.category,
                 max_stocks=args.max_stocks,
-                min_similarity=args.min_similarity,
-                lookback_days=args.lookback_days
+                min_similarity=min_sim,
+                lookback_days=lookback
             )
         else:
             # 原有选股流程（不带B1匹配）

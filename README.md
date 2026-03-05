@@ -174,9 +174,17 @@ EMA(EMA(CLOSE, 10), 10)
 
 **B1完美图形匹配参数说明：**
 - `--b1-match` - 启用B1完美图形匹配功能
-- `--lookback-days` - 回看天数，默认25天，范围10-60
-- `--min-similarity` - 最小相似度阈值，默认60%，范围0-100
+- `--lookback-days` - 回看天数，范围10-60（默认从配置文件读取）
+- `--min-similarity` - 最小相似度阈值，范围0-100（默认从配置文件读取）
 - `--category` - 股票分类筛选：`all`(全部)、`bowl_center`(回落碗中)、`near_duokong`(靠近多空线)、`near_short_trend`(靠近短期趋势线)
+
+**配置文件参数：**
+
+编辑 `config/strategy_params.yaml` 中的 `B1PatternMatch` 部分可调整：
+- `min_similarity` - 默认最小相似度阈值（默认60）
+- `lookback_days` - 默认回看天数（默认25）
+- `weights` - 四维相似度权重分配
+- `tolerances` - 各项特征的匹配容差
 
 ### 智能更新逻辑
 
@@ -204,6 +212,22 @@ BowlReboundStrategy:
   M4: 114           # MA周期4（多空线计算）
   duokong_pct: 3    # 距离多空线百分比（分类用）
   short_pct: 2      # 距离短期趋势线百分比（分类用）
+
+# B1完美图形匹配
+B1PatternMatch:
+  min_similarity: 60      # 最小相似度阈值（只显示>=此值的股票）
+  lookback_days: 25       # 回看天数（匹配时使用的数据天数）
+  weights:                # 四维相似度权重
+    trend_structure: 0.30 # 双线结构
+    kdj_state: 0.20       # KDJ状态
+    volume_pattern: 0.25  # 量能特征
+    price_shape: 0.25     # 价格形态
+  tolerances:             # 匹配容差参数
+    trend_ratio: 0.10     # 趋势比值容差（±10%）
+    price_bias: 10        # 价格偏离容差（±10%）
+    trend_spread: 10      # 趋势发散容差（±10%）
+    j_value: 30           # J值差异容差（±30）
+    drawdown: 15          # 回撤幅度容差（±15%）
 ```
 
 ## ⏱️ 钉钉限流保护

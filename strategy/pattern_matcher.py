@@ -15,11 +15,12 @@ except ImportError:
 
 
 class PatternMatcher:
-    """完美图形匹配器"""
+    """完美图形匹配器 - 支持从配置文件读取参数"""
     
-    def __init__(self, weights=None):
-        from strategy.pattern_config import SIMILARITY_WEIGHTS
+    def __init__(self, weights=None, tolerances=None):
+        from strategy.pattern_config import SIMILARITY_WEIGHTS, MATCH_TOLERANCES
         self.weights = weights or SIMILARITY_WEIGHTS
+        self.tolerances = tolerances or MATCH_TOLERANCES
     
     def match(self, candidate_features: dict, case_features: dict) -> dict:
         """
@@ -81,22 +82,24 @@ class PatternMatcher:
         """知行趋势线相似度 - 基于相对百分比偏离"""
         similarities = []
         
-        # 1. short_vs_bullbear 比值相似（允许±10%误差）
+        # 从配置读取容差参数
+        trend_ratio_tol = self.tolerances.get("trend_ratio", 0.10)
+        price_bias_tol = self.tolerances.get("price_bias", 10)
+        trend_spread_tol = self.tolerances.get("trend_spread", 10)
+        
+        # 1. short_vs_bullbear 比值相似
         if "short_vs_bullbear" in cand and "short_vs_bullbear" in case:
             ratio_diff = abs(cand["short_vs_bullbear"] - case["short_vs_bullbear"])
-            # 比值差异1%对应相似度降低10%
-            sim = max(0, 1 - ratio_diff / 0.10)
+            sim = max(0, 1 - ratio_diff / trend_ratio_tol)
             similarities.append(sim)
         
         # 2. 斜率方向一致性（最重要）
         if "short_slope" in cand and "short_slope" in case:
             short_slope_same = (cand["short_slope"] > 0) == (case["short_slope"] > 0)
             if short_slope_same:
-                # 同向时，斜率越接近越相似
                 slope_diff = abs(cand["short_slope"] - case["short_slope"])
-                sim = max(0.7, 1 - slope_diff / 10)  # 同向至少0.7
+                sim = max(0.7, 1 - slope_diff / 10)
             else:
-                # 反向时，相似度大幅降低
                 sim = max(0, 0.3 - abs(cand["short_slope"] - case["short_slope"]) / 20)
             similarities.append(sim)
         
@@ -105,29 +108,26 @@ class PatternMatcher:
             if cand["is_in_bowl"] == case["is_in_bowl"]:
                 similarities.append(1.0)
             else:
-                similarities.append(0.2)  # 位置不同惩罚更重
+                similarities.append(0.2)
         
-        # 4. 价格相对于短期趋势的偏离（百分比）- 核心指标
-        # 使用 price_vs_short_pct（百分比偏离）而非 price_vs_short（比值）
+        # 4. 价格相对于短期趋势的偏离（百分比）
         cand_price_bias = cand.get("price_vs_short_pct", cand.get("price_vs_short", 0) * 100 - 100)
         case_price_bias = case.get("price_vs_short_pct", case.get("price_vs_short", 0) * 100 - 100)
         price_bias_diff = abs(cand_price_bias - case_price_bias)
-        # 偏离差异5%以内认为高度相似
-        sim = max(0, 1 - price_bias_diff / 10)
+        sim = max(0, 1 - price_bias_diff / price_bias_tol)
         similarities.append(sim)
         
         # 5. 趋势发散程度相似（百分比）
         cand_spread = cand.get("trend_spread_pct", cand.get("trend_spread", 0))
         case_spread = case.get("trend_spread_pct", case.get("trend_spread", 0))
         spread_diff = abs(cand_spread - case_spread)
-        # 发散程度差异5%以内认为相似
-        sim = max(0, 1 - spread_diff / 10)
+        sim = max(0, 1 - spread_diff / trend_spread_tol)
         similarities.append(sim)
         
         # 6. 双线乖离率相似
         if "price_bias_pct" in cand and "price_bias_pct" in case:
             bias_diff = abs(cand["price_bias_pct"] - case["price_bias_pct"])
-            sim = max(0, 1 - bias_diff / 10)
+            sim = max(0, 1 - bias_diff / price_bias_tol)
             similarities.append(sim)
         
         return np.mean(similarities) if similarities else 0.5
@@ -135,6 +135,9 @@ class PatternMatcher:
     def _calc_kdj_similarity(self, cand: dict, case: dict) -> float:
         """KDJ状态相似度"""
         similarities = []
+        
+        # 从配置读取J值容差
+        j_value_tol = self.tolerances.get("j_value", 30)
         
         # J值位置一致性（低位vs中位vs高位）
         if "j_position" in cand and "j_position" in case:
@@ -146,10 +149,10 @@ class PatternMatcher:
             else:
                 similarities.append(0.4)
         
-        # J值具体数值相似（允许±15误差）
+        # J值具体数值相似（使用配置的容差）
         if "j_value" in cand and "j_value" in case:
             j_diff = abs(cand["j_value"] - case["j_value"])
-            sim = max(0, 1 - j_diff / 30)
+            sim = max(0, 1 - j_diff / j_value_tol)
             similarities.append(sim)
         
         # 金叉状态一致性
@@ -210,13 +213,15 @@ class PatternMatcher:
         """价格形态相似度 - 使用DTW"""
         similarities = []
         
+        # 从配置读取回撤容差
+        drawdown_tol = self.tolerances.get("drawdown", 15)
+        
         # 使用DTW计算曲线相似度
         if "normalized_curve" in cand and "normalized_curve" in case:
             cand_curve = np.array(cand["normalized_curve"])
             case_curve = np.array(case["normalized_curve"])
             
             if len(cand_curve) > 0 and len(case_curve) > 0:
-                # 使用FastDTW或简化版DTW
                 if HAS_FASTDTW:
                     try:
                         distance, _ = fastdtw(cand_curve, case_curve, dist=euclidean)
@@ -229,10 +234,10 @@ class PatternMatcher:
                 
                 similarities.append(curve_sim)
         
-        # 回撤幅度相似
+        # 回撤幅度相似（使用配置容差）
         if "max_drawdown" in cand and "max_drawdown" in case:
             drawdown_diff = abs(cand["max_drawdown"] - case["max_drawdown"])
-            sim = max(0, 1 - drawdown_diff / 15)
+            sim = max(0, 1 - drawdown_diff / drawdown_tol)
             similarities.append(sim)
         
         # 突破力度相似
@@ -280,7 +285,7 @@ class PatternMatcher:
         
         # 计算欧氏距离
         distance = np.sqrt(np.sum((seq1 - seq2) ** 2))
-        max_dist = np.sqrt(len(seq1))  # 理论最大距离
+        max_dist = np.sqrt(len(seq1))
         
         similarity = max(0, 1 - distance / max_dist) if max_dist > 0 else 0
         return similarity
