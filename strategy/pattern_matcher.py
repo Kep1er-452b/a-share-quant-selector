@@ -78,38 +78,56 @@ class PatternMatcher:
         }
     
     def _calc_trend_similarity(self, cand: dict, case: dict) -> float:
-        """知行趋势线相似度"""
+        """知行趋势线相似度 - 基于相对百分比偏离"""
         similarities = []
         
-        # short_vs_bullbear 比值相似（允许±5%误差）
+        # 1. short_vs_bullbear 比值相似（允许±10%误差）
         if "short_vs_bullbear" in cand and "short_vs_bullbear" in case:
             ratio_diff = abs(cand["short_vs_bullbear"] - case["short_vs_bullbear"])
-            sim = max(0, 1 - ratio_diff / 0.05)
+            # 比值差异1%对应相似度降低10%
+            sim = max(0, 1 - ratio_diff / 0.10)
             similarities.append(sim)
         
-        # 斜率方向一致性（同向加分）
+        # 2. 斜率方向一致性（最重要）
         if "short_slope" in cand and "short_slope" in case:
             short_slope_same = (cand["short_slope"] > 0) == (case["short_slope"] > 0)
-            sim = 1.0 if short_slope_same else max(0, 1 - abs(cand["short_slope"] - case["short_slope"]) / 5)
+            if short_slope_same:
+                # 同向时，斜率越接近越相似
+                slope_diff = abs(cand["short_slope"] - case["short_slope"])
+                sim = max(0.7, 1 - slope_diff / 10)  # 同向至少0.7
+            else:
+                # 反向时，相似度大幅降低
+                sim = max(0, 0.3 - abs(cand["short_slope"] - case["short_slope"]) / 20)
             similarities.append(sim)
         
-        # 是否在碗中
+        # 3. 是否在碗中（形态位置）
         if "is_in_bowl" in cand and "is_in_bowl" in case:
             if cand["is_in_bowl"] == case["is_in_bowl"]:
                 similarities.append(1.0)
             else:
-                similarities.append(0.3)
+                similarities.append(0.2)  # 位置不同惩罚更重
         
-        # 价格位置相似度（相对于短期趋势）
-        if "price_vs_short" in cand and "price_vs_short" in case:
-            price_pos_diff = abs(cand["price_vs_short"] - case["price_vs_short"])
-            sim = max(0, 1 - price_pos_diff / 0.05)
-            similarities.append(sim)
+        # 4. 价格相对于短期趋势的偏离（百分比）- 核心指标
+        # 使用 price_vs_short_pct（百分比偏离）而非 price_vs_short（比值）
+        cand_price_bias = cand.get("price_vs_short_pct", cand.get("price_vs_short", 0) * 100 - 100)
+        case_price_bias = case.get("price_vs_short_pct", case.get("price_vs_short", 0) * 100 - 100)
+        price_bias_diff = abs(cand_price_bias - case_price_bias)
+        # 偏离差异5%以内认为高度相似
+        sim = max(0, 1 - price_bias_diff / 10)
+        similarities.append(sim)
         
-        # 趋势发散程度相似
-        if "trend_spread" in cand and "trend_spread" in case:
-            spread_diff = abs(cand["trend_spread"] - case["trend_spread"])
-            sim = max(0, 1 - spread_diff / 3)
+        # 5. 趋势发散程度相似（百分比）
+        cand_spread = cand.get("trend_spread_pct", cand.get("trend_spread", 0))
+        case_spread = case.get("trend_spread_pct", case.get("trend_spread", 0))
+        spread_diff = abs(cand_spread - case_spread)
+        # 发散程度差异5%以内认为相似
+        sim = max(0, 1 - spread_diff / 10)
+        similarities.append(sim)
+        
+        # 6. 双线乖离率相似
+        if "price_bias_pct" in cand and "price_bias_pct" in case:
+            bias_diff = abs(cand["price_bias_pct"] - case["price_bias_pct"])
+            sim = max(0, 1 - bias_diff / 10)
             similarities.append(sim)
         
         return np.mean(similarities) if similarities else 0.5

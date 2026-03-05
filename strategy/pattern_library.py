@@ -75,7 +75,7 @@ class B1PatternLibrary:
             print("⚠️ 警告: 没有成功加载任何案例")
     
     def _extract_window(self, df: pd.DataFrame, breakout_date: str, lookback_days: int):
-        """提取突破日期前lookback天的数据"""
+        """提取突破日期前lookback天的数据（不包含突破当天）"""
         df = df.copy()
         
         # 确保date列是datetime
@@ -84,12 +84,12 @@ class B1PatternLibrary:
         
         breakout_dt = pd.to_datetime(breakout_date)
         
-        # 找到突破日期的位置（数据是倒序的，最新在前）
-        # 取突破日期及之前的数据
-        mask = df['date'] <= breakout_dt
+        # 取突破日期之前的数据（不包含突破当天）
+        # 这样才能捕捉到"突破前"的整理形态
+        mask = df['date'] < breakout_dt
         filtered = df[mask]
         
-        # 取breakout_date及之前lookback_days天
+        # 取breakout_date之前lookback_days天
         return filtered.head(lookback_days)
     
     def find_best_match(self, stock_code: str, stock_df: pd.DataFrame, lookback_days: int = 25) -> dict:
