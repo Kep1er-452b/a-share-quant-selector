@@ -33,6 +33,7 @@ def _load_yaml_config():
 _yaml_config = _load_yaml_config()
 
 # B1完美图形案例配置（10个历史成功案例）
+# 注：日期为"选股系统选出的买入日期"，不是突破日
 B1_PERFECT_CASES = [
     {
         "id": "case_001",
@@ -41,7 +42,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-05-12",
         "lookback_days": 25,
         "tags": ["科创板", "医药"],
-        "description": "杯型整理+缩量突破",
+        "description": "杯型整理+缩量+J值低位",
     },
     {
         "id": "case_002",
@@ -50,7 +51,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-08-06",
         "lookback_days": 25,
         "tags": ["主板", "稀土永磁"],
-        "description": "回落碗中+放量启动",
+        "description": "回落短期趋势线+量能平稳+J值中位",
     },
     {
         "id": "case_003",
@@ -59,7 +60,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-06-20",
         "lookback_days": 25,
         "tags": ["科创板", "医药"],
-        "description": "平台整理+知行金叉",
+        "description": "平台整理+缩量后放量+J值低位",
     },
     {
         "id": "case_004",
@@ -68,7 +69,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-07-23",
         "lookback_days": 25,
         "tags": ["主板", "科技"],
-        "description": "V型反转+多空线支撑",
+        "description": "靠近多空线+量能平稳+J值中位",
     },
     {
         "id": "case_005",
@@ -77,7 +78,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-07-15",
         "lookback_days": 25,
         "tags": ["创业板", "芯片"],
-        "description": "碗底缩量+倍量突破",
+        "description": "持续缩量+价格震荡+J值低位",
     },
     {
         "id": "case_006",
@@ -86,7 +87,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-08-04",
         "lookback_days": 25,
         "tags": ["中小板", "新能源"],
-        "description": "趋势线上+缩量回踩",
+        "description": "靠近短期趋势线+量能平稳+J值低位",
     },
     {
         "id": "case_007",
@@ -95,7 +96,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-08-01",
         "lookback_days": 25,
         "tags": ["主板", "电池"],
-        "description": "旗形整理+知行发散",
+        "description": "持续缩量+J值深度低位+趋势下行",
     },
     {
         "id": "case_008",
@@ -104,7 +105,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-07-10",
         "lookback_days": 25,
         "tags": ["主板", "军工"],
-        "description": "双底形态+J值低位",
+        "description": "缩量后放量+J值低位+趋势上行",
     },
     {
         "id": "case_009",
@@ -113,7 +114,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-08-01",
         "lookback_days": 25,
         "tags": ["创业板", "化工"],
-        "description": "杯柄形态+趋势线上",
+        "description": "缩量后放量+价格接近短期趋势线+J值中位",
     },
     {
         "id": "case_010",
@@ -122,7 +123,7 @@ B1_PERFECT_CASES = [
         "breakout_date": "2025-07-11",
         "lookback_days": 25,
         "tags": ["中小板", "医药"],
-        "description": "多空线粘合+放量突破",
+        "description": "价格接近短期趋势线+缩量+顶部未放量",
     },
 ]
 
@@ -141,8 +142,8 @@ MIN_SIMILARITY_SCORE = _yaml_config.get('min_similarity', 60.0)
 # 回看天数（默认25天）
 DEFAULT_LOOKBACK_DAYS = _yaml_config.get('lookback_days', 25)
 
-# Top N 结果展示
-TOP_N_RESULTS = 15
+# Top N 结果展示（优先从YAML读取）
+TOP_N_RESULTS = _yaml_config.get('top_n_results', 15)
 
 # 匹配容差参数（优先从YAML读取）
 _default_tolerances = {

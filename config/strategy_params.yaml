@@ -48,7 +48,7 @@ BowlReboundStrategy:
   # duokong_pct: 靠近多空线百分比
   # 价格距离知行多空线 ±duokong_pct% 范围内判定为"靠近多空线"
   # 建议值: 2-5
-  duokong_pct: 3
+  duokong_pct: 1.7
   
   # short_pct: 靠近短期趋势线百分比
   # 价格距离知行短期趋势线 ±short_pct% 范围内判定为"靠近短期趋势线"
@@ -84,10 +84,10 @@ B1PatternMatch:
   # weights: 四维相似度权重
   # 四个维度的权重分配，总和应为1.0
   weights:
-    trend_structure: 0.30   # 双线结构：短期/多空趋势线相对位置
-    kdj_state: 0.20         # KDJ状态：J值位置、金叉状态
-    volume_pattern: 0.25    # 量能特征：成交量变化模式
-    price_shape: 0.25       # 价格形态：归一化曲线DTW匹配
+    trend_structure: 0.20   # 双线结构：短期/多空趋势线相对位置
+    kdj_state: 0.10         # KDJ状态：J值位置、金叉状态
+    volume_pattern: 0.35    # 量能特征：成交量变化模式
+    price_shape: 0.35       # 价格形态：归一化曲线DTW匹配
   
   # tolerances: 匹配容差参数
   # 各项特征的容忍差异范围，越小越严格
@@ -97,6 +97,8 @@ B1PatternMatch:
     trend_spread: 10        # 趋势发散容差（±10%）
     j_value: 30             # J值差异容差（±30）
     drawdown: 15            # 回撤幅度容差（±15%）
+  
+  top_n_results: 15         # 展示Top N个匹配结果（钉钉通知中显示的数量）
 
 # ============================================
 # 新增策略配置示例

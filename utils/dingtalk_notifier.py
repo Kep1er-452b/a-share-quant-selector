@@ -1022,6 +1022,7 @@ class DingTalkNotifier:
             return
         
         from datetime import datetime
+        from strategy.pattern_config import TOP_N_RESULTS
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         
         # 分类名称映射
@@ -1039,8 +1040,8 @@ class DingTalkNotifier:
             "━" * 30 + "\n\n",
         ]
         
-        # 只显示前15个
-        for i, r in enumerate(results[:15], 1):
+        # 只显示前N个（从配置读取）
+        for i, r in enumerate(results[:TOP_N_RESULTS], 1):
             emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
             
             stock_code = r.get('stock_code', '')
