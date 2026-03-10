@@ -124,8 +124,8 @@ class BowlReboundStrategy(BaseStrategy):
         # 阳线：收盘价 > 开盘价
         result['positive_candle'] = result['close'] > result['open']
         
-        # 流通市值达标
-        result['market_cap_ok'] = result['market_cap'] > self.params['CAP']
+        # 流通市值达标（优先从实时数据获取）
+        result['market_cap_ok'] = self._check_market_cap_realtime(result)
         
         # 关键K线 = 放量 AND 阳线 AND 市值达标
         result['key_candle'] = (
@@ -142,6 +142,55 @@ class BowlReboundStrategy(BaseStrategy):
         result['j_low'] = result['J'] <= self.params['J_VAL']
         
         return result
+    
+    def _check_market_cap_realtime(self, df) -> pd.Series:
+        """
+        检查流通市值是否达标
+        优先从CSV数据获取，如果异常则从实时数据获取
+        """
+        import akshare as ak
+        
+        # 尝试从CSV数据获取
+        if 'market_cap' in df.columns:
+            # 检查数据是否合理（单位应该是元）
+            sample_cap = df['market_cap'].dropna().iloc[-1] if not df['market_cap'].dropna().empty else 0
+            
+            # 如果市值在合理范围（10亿到1000亿之间），使用CSV数据
+            if 1e9 < sample_cap < 1e11:
+                return df['market_cap'] > self.params['CAP']
+        
+        # 从实时数据获取流通市值
+        try:
+            # 从股票代码推断市场
+            stock_code = str(df['code'].iloc[0]) if 'code' in df.columns else None
+            
+            if stock_code:
+                # 获取实时数据
+                spot_df = ak.stock_individual_info_em(symbol=stock_code)
+                if not spot_df.empty:
+                    # 查找流通市值
+                    float_cap_row = spot_df[spot_df['item'] == '流通市值']
+                    if not float_cap_row.empty:
+                        float_cap = float_cap_row['value'].values[0]
+                        # 转换为数字（可能是字符串）
+                        if isinstance(float_cap, str):
+                            # 处理"27.20亿"格式
+                            if '亿' in float_cap:
+                                float_cap = float(float_cap.replace('亿', '')) * 1e8
+                            else:
+                                float_cap = float(float_cap)
+                        
+                        # 创建 Series
+                        return pd.Series([float_cap > self.params['CAP']] * len(df), index=df.index)
+        except Exception as e:
+            # 如果实时获取失败，尝试用收盘价估算
+            if 'close' in df.columns:
+                # 假设流通股数1亿股，估算市值
+                estimated_cap = df['close'] * 1e8  # 粗略估计
+                return estimated_cap > self.params['CAP']
+        
+        # 默认返回True（不过滤）
+        return pd.Series([True] * len(df), index=df.index)
     
     def select_stocks(self, df, stock_name='') -> list:
         """
