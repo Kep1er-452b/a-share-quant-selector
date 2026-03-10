@@ -822,6 +822,27 @@ class AKShareFetcher:
             print("=" * 60)
             return
         
+        # 批量获取最新市值数据（和价格数据一起更新）
+        print("\n正在批量获取最新市值数据...")
+        try:
+            import akshare as ak
+            spot_df = ak.stock_zh_a_spot_em()
+            market_cap_map = {}
+            for _, row in spot_df.iterrows():
+                code = str(row['代码']).zfill(6)
+                cap = row['总市值']
+                if pd.notna(cap) and cap > 0:
+                    # 统一转为元
+                    if cap < 1e10:
+                        cap = int(cap * 1e8)
+                    else:
+                        cap = int(cap)
+                    market_cap_map[code] = cap
+            print(f"  成功获取 {len(market_cap_map)} 只股票市值")
+        except Exception as e:
+            print(f"  获取市值数据失败: {e}")
+            market_cap_map = {}
+        
         print(f"\n开始更新 {need_update} 只股票...")
         print("=" * 60)
         
@@ -835,6 +856,9 @@ class AKShareFetcher:
             df = self.fetch_stock_update(code, days=days_to_fetch)
             
             if df is not None and not df.empty:
+                # 更新市值数据（和价格数据一起更新）
+                if code in market_cap_map:
+                    df['market_cap'] = market_cap_map[code]
                 self.csv_manager.update_stock(code, df)
                 new_df = self.csv_manager.read_stock(code)
                 new_count = len(new_df)
