@@ -86,7 +86,7 @@ def EXIST(cond, n):
 def FINANCE(df, field_code):
     """
     财务数据获取
-    39: 流通市值
+    39: 总市值（注意：原通达信39是流通市值，本项目使用总市值）
     """
     if field_code == 39:
         return df.get('market_cap', pd.Series([0] * len(df), index=df.index))

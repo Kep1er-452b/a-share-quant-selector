@@ -12,8 +12,8 @@
 3. 趋势线在上 = 知行短期趋势线 > 知行多空线
    - 短期趋势在多空线上方，表示上升趋势
 
-4. 异动放量阳线 = V>=REF(V,1)*N AND C>O AND 流通市值>CAP
-   - 成交量是前一天的N倍以上 AND 阳线 AND 流通市值达标
+4. 异动放量阳线 = V>=REF(V,1)*N AND C>O AND 总市值>CAP
+   - 成交量是前一天的N倍以上 AND 阳线 AND 总市值达标
 
 5. 异动 = EXIST(关键K线, M)
    - 在M天内存在关键K线
@@ -50,7 +50,7 @@ class BowlReboundStrategy(BaseStrategy):
         default_params = {
             'N': 4,              # 成交量倍数
             'M': 15,             # 回溯天数
-            'CAP': 4000000000,   # 流通市值>40亿
+            'CAP': 4000000000,   # 总市值>40亿
             'J_VAL': 30,         # J值上限
             'duokong_pct': 3,    # 距离多空线百分比(默认3%)
             'short_pct': 2,      # 距离短期趋势线百分比(默认2%)
@@ -124,7 +124,7 @@ class BowlReboundStrategy(BaseStrategy):
         # 阳线：收盘价 > 开盘价
         result['positive_candle'] = result['close'] > result['open']
         
-        # 流通市值达标（优先从实时数据获取）
+        # 总市值达标（优先从实时数据获取）
         result['market_cap_ok'] = self._check_market_cap_realtime(result)
         
         # 关键K线 = 放量 AND 阳线 AND 市值达标
@@ -145,7 +145,7 @@ class BowlReboundStrategy(BaseStrategy):
     
     def _check_market_cap_realtime(self, df) -> pd.Series:
         """
-        检查流通市值是否达标
+        检查总市值是否达标
         优先从CSV数据获取，如果异常则从实时数据获取
         """
         import akshare as ak
@@ -159,7 +159,7 @@ class BowlReboundStrategy(BaseStrategy):
             if 1e9 < sample_cap < 1e11:
                 return df['market_cap'] > self.params['CAP']
         
-        # 从实时数据获取流通市值
+        # 从实时数据获取总市值
         try:
             # 从股票代码推断市场
             stock_code = str(df['code'].iloc[0]) if 'code' in df.columns else None
@@ -168,25 +168,25 @@ class BowlReboundStrategy(BaseStrategy):
                 # 获取实时数据
                 spot_df = ak.stock_individual_info_em(symbol=stock_code)
                 if not spot_df.empty:
-                    # 查找流通市值
-                    float_cap_row = spot_df[spot_df['item'] == '流通市值']
-                    if not float_cap_row.empty:
-                        float_cap = float_cap_row['value'].values[0]
+                    # 查找总市值
+                    total_cap_row = spot_df[spot_df['item'] == '总市值']
+                    if not total_cap_row.empty:
+                        total_cap = total_cap_row['value'].values[0]
                         # 转换为数字（可能是字符串）
-                        if isinstance(float_cap, str):
-                            # 处理"27.20亿"格式
-                            if '亿' in float_cap:
-                                float_cap = float(float_cap.replace('亿', '')) * 1e8
+                        if isinstance(total_cap, str):
+                            # 处理"33.19亿"格式
+                            if '亿' in total_cap:
+                                total_cap = float(total_cap.replace('亿', '')) * 1e8
                             else:
-                                float_cap = float(float_cap)
+                                total_cap = float(total_cap)
                         
                         # 创建 Series
-                        return pd.Series([float_cap > self.params['CAP']] * len(df), index=df.index)
+                        return pd.Series([total_cap > self.params['CAP']] * len(df), index=df.index)
         except Exception as e:
             # 如果实时获取失败，尝试用收盘价估算
             if 'close' in df.columns:
-                # 假设流通股数1亿股，估算市值
-                estimated_cap = df['close'] * 1e8  # 粗略估计
+                # 假设总股本2亿股，估算市值
+                estimated_cap = df['close'] * 2e8  # 粗略估计
                 return estimated_cap > self.params['CAP']
         
         # 默认返回True（不过滤）

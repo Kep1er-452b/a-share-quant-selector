@@ -64,7 +64,7 @@ def get_stocks():
                     'name': stock_names.get(code, '未知'),
                     'latest_price': round(latest['close'], 2),
                     'latest_date': latest['date'].strftime('%Y-%m-%d'),
-                    'market_cap': round(latest.get('market_cap', 0) / 1e8, 2),  # 亿
+                    'market_cap': round(latest.get('market_cap', 0) / 1e8, 2),  # 总市值，单位：亿
                     'data_count': len(df)
                 })
         
@@ -104,7 +104,7 @@ def get_stock_detail(code):
                 'volume': int(row['volume']),
                 'amount': round(row['amount'] / 1e4, 2),  # 万元
                 'turnover': round(row.get('turnover', 0), 2),
-                'market_cap': round(row.get('market_cap', 0) / 1e8, 2),  # 亿
+                'market_cap': round(row.get('market_cap', 0) / 1e8, 2),  # 总市值，单位：亿
                 'K': round(kdj_df.iloc[i]['K'], 2),
                 'D': round(kdj_df.iloc[i]['D'], 2),
                 'J': round(kdj_df.iloc[i]['J'], 2)
