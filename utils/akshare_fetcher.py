@@ -615,6 +615,8 @@ class AKShareFetcher:
         :param max_stocks: 限制抓取数量（用于测试）
         :param skip_failed: 是否跳过之前失败的股票
         """
+        import akshare as ak
+        
         stock_dict = self.get_all_stock_codes()
         
         if not stock_dict:
@@ -638,6 +640,26 @@ class AKShareFetcher:
         
         if max_stocks:
             stock_codes = stock_codes[:max_stocks]
+        
+        # 批量获取市值数据
+        print("\n正在批量获取市值数据...")
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+            market_cap_map = {}
+            for _, row in spot_df.iterrows():
+                code = str(row['代码']).zfill(6)
+                cap = row['总市值']
+                if pd.notna(cap) and cap > 0:
+                    # 统一转为元
+                    if cap < 1e10:
+                        cap = int(cap * 1e8)
+                    else:
+                        cap = int(cap)
+                    market_cap_map[code] = cap
+            print(f"  成功获取 {len(market_cap_map)} 只股票市值")
+        except Exception as e:
+            print(f"  获取市值数据失败: {e}")
+            market_cap_map = {}
         
         total = len(stock_codes)
         success = 0
@@ -664,6 +686,9 @@ class AKShareFetcher:
                     valid_data = False
                     failed_list.append(code)
                 else:
+                    # 使用批量获取的市值数据
+                    if code in market_cap_map:
+                        df['market_cap'] = market_cap_map[code]
                     self.csv_manager.write_stock(code, df)
                     print(f"✓ ({len(df)}条)")
                     success += 1
