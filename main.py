@@ -227,6 +227,11 @@ class QuantSystem:
                 if any(kw in name for kw in invalid_keywords):
                     invalid_count += 1
                     continue
+                
+                # 过滤 ST/*ST 股票
+                if name.startswith('ST') or name.startswith('*ST'):
+                    invalid_count += 1
+                    continue
                 if df.empty or len(df) < 60:
                     continue
                 

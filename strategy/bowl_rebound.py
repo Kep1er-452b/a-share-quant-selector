@@ -205,6 +205,10 @@ class BowlReboundStrategy(BaseStrategy):
             invalid_keywords = ['退', '未知', '退市', '已退']
             if any(kw in stock_name for kw in invalid_keywords):
                 return []
+            
+            # 过滤 ST/*ST 股票
+            if stock_name.startswith('ST') or stock_name.startswith('*ST'):
+                return []
         
         # 获取最新一天的数据
         latest = df.iloc[0]
