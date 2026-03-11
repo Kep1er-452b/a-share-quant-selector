@@ -116,6 +116,15 @@ B1_PERFECT_CASES = [
         "tags": ["中小板", "医药"],
         "description": "价格接近短期趋势线+缩量+顶部未放量",
     },
+    {
+        "id": "case_011",
+        "name": "航天发展",
+        "code": "000547",
+        "breakout_date": "2025-11-12",
+        "lookback_days": 25,
+        "tags": ["主板", "军工"],
+        "description": "航天军工+量能异动+趋势突破",
+    },
 ]
 
 # 相似度权重配置（优先从YAML读取，否则使用默认值）
