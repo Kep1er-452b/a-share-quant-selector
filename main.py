@@ -4,7 +4,7 @@ A股量化选股系统 - 主程序
 
 使用方法:
     python main.py init      # 首次全量抓取
-    python main.py update    # 每日增量更新
+    python main.py update    # 每日增量更新（内部使用）
     python main.py select    # 执行选股
     python main.py run       # 完整流程（更新+选股+通知）
     python main.py schedule  # 启动定时调度
@@ -89,34 +89,34 @@ class QuantSystem:
         print("=" * 60)
         self.fetcher.init_full_data(max_stocks=max_stocks)
         print("\n✓ 数据初始化完成")
-    
+
     def _smart_update(self, max_stocks=None, check_latest=True):
         """智能更新：3点前不更新，检查每只股票是否有当天数据"""
         from datetime import datetime
         import pandas as pd
-        
+
         today = datetime.now().date()
         current_time = datetime.now().time()
         market_close_time = datetime.strptime("15:00", "%H:%M").time()
-        
+
         # 3点前：不更新，使用旧数据
         if current_time < market_close_time:
             print("\n⏰ 当前时间尚未收盘 (15:00)")
             print("  使用本地已有数据，跳过网络更新")
             return
-        
+
         # 检查每只股票是否有当天数据
         if check_latest:
             print("\n🔍 检查数据更新状态...")
             stock_codes = self.csv_manager.list_all_stocks()
             if max_stocks:
                 stock_codes = stock_codes[:max_stocks]
-            
+
             total = len(stock_codes)
             has_today = 0
             no_today = 0
             check_limit = min(100, total)  # 抽样检查100只
-            
+
             for code in stock_codes[:check_limit]:
                 df = self.csv_manager.read_stock(code)
                 if not df.empty:
@@ -125,7 +125,7 @@ class QuantSystem:
                         has_today += 1
                     else:
                         no_today += 1
-            
+
             # 如果100%股票都有今天数据，跳过更新
             if check_limit > 0 and has_today == check_limit:
                 print(f"  ✓ 已检查 {check_limit} 只股票，全部已有今天数据")
@@ -133,12 +133,12 @@ class QuantSystem:
                 return
             else:
                 print(f"  已检查 {check_limit} 只，{has_today} 只有今天数据，{no_today} 只需要更新")
-        
+
         # 执行更新
         print("\n🔄 执行数据更新...")
         self.fetcher.daily_update(max_stocks=max_stocks)
         print("\n✓ 数据更新完成")
-    
+
     def update_data(self, max_stocks=None):
         """每日增量更新"""
         print("=" * 60)
@@ -146,7 +146,7 @@ class QuantSystem:
         print("=" * 60)
         self.fetcher.daily_update(max_stocks=max_stocks)
         print("\n✓ 数据更新完成")
-    
+
     def select_stocks(self, category='all', max_stocks=None, return_data=False):
         """执行选股
         :param category: 股票分类筛选，'all'表示全部，其他值按分类筛选
@@ -305,7 +305,7 @@ class QuantSystem:
         from datetime import datetime
         import json
         from pathlib import Path
-        
+
         print("=" * 60)
         print("🚀 执行完整流程")
         if max_stocks:
@@ -478,7 +478,7 @@ class QuantSystem:
     def run_with_b1_match(self, category='all', max_stocks=None, min_similarity=60.0, lookback_days=25):
         """
         完整流程：更新 + 选股 + B1完美图形匹配 + 通知
-        
+
         Args:
             category: 股票分类筛选
             max_stocks: 限制处理的股票数量
@@ -486,17 +486,17 @@ class QuantSystem:
             lookback_days: 回看天数，默认25天
         """
         from datetime import datetime
-        
+
         print("=" * 60)
         print("🚀 执行完整流程（含B1完美图形匹配）")
         if max_stocks:
             print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
         print(f"   回看天数: {lookback_days}天")
         print("=" * 60)
-        
+
         # 1. 更新数据
         self._smart_update(max_stocks=max_stocks)
-        
+
         # 2. 选股 + B1完美图形匹配
         match_result = self.select_with_b1_match(
             category=category,
@@ -563,7 +563,6 @@ def main():
         epilog="""
 示例:
   python main.py init                          # 首次抓取6年历史数据
-  python main.py update                        # 每日增量更新
   python main.py run                           # 完整流程（更新+选股+通知）
   python main.py run --b1-match                # 完整流程+B1完美图形匹配排序
   python main.py run --b1-match --min-similarity 70  # 匹配+提高相似度阈值到70%
@@ -592,9 +591,9 @@ B1完美图形匹配:
 
     parser.add_argument(
         'command',
-        choices=['init', 'update', 'run', 'web'],
+        choices=['init', 'run', 'web'],
         nargs='?',
-        help='要执行的命令: init(初始化数据), update(更新数据), run(执行选股), web(启动Web服务器)'
+        help='要执行的命令: init(初始化数据), run(执行选股), web(启动Web服务器)'
     )
 
     parser.add_argument(
@@ -681,9 +680,6 @@ B1完美图形匹配:
     # 执行命令
     if args.command == 'init':
         quant.init_data(max_stocks=args.max_stocks)
-    
-    elif args.command == 'update':
-        quant.update_data(max_stocks=args.max_stocks)
     
     elif args.command == 'run':
         # 原有选股流程（支持B1完美图形匹配）

@@ -437,17 +437,17 @@ class AKShareFetcher:
             if klines:
                 records = []
                 for item in klines:
-                    # 腾讯格式: [日期, 开盘, 收盘, 最低, 最高, 成交量, ...]
+                    # 腾讯格式: [日期, 开盘, 收盘, 最高, 最低, 成交量, ...]
                     # 注意: item[6] 可能是分红信息(dict)而不是成交额
                     if len(item) >= 6 and isinstance(item, list):
                         # 跳过分红信息，只取前6个字段
-                        # 注意：腾讯接口返回的是 [日期, 开盘, 收盘, 最低, 最高, 成交量]
+                        # 注意：腾讯接口返回的是 [日期, 开盘, 收盘, 最高, 最低, 成交量]
                         records.append({
                             'date': str(item[0]),
                             'open': float(item[1]),
                             'close': float(item[2]),
-                            'low': float(item[3]),   # 最低 (item[3])
-                            'high': float(item[4]),  # 最高 (item[4])
+                            'high': float(item[3]),  # 最高 (item[3])
+                            'low': float(item[4]),   # 最低 (item[4])
                             'volume': int(float(item[5])),
                             'amount': 0,  # 腾讯接口不直接提供成交额
                             'turnover': 0,  # 腾讯接口没有换手率
