@@ -9,22 +9,29 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+import multiprocessing
 from datetime import datetime
 from pathlib import Path
+
+
+def _should_print_import_message():
+    return multiprocessing.current_process().name == "MainProcess"
 
 # 导入K线图模块
 try:
     # 优先使用快速版
     from utils.kline_chart_fast import generate_kline_chart_fast as generate_kline_chart
     KLINE_CHART_AVAILABLE = True
-    print("✓ 使用快速K线图生成")
+    if _should_print_import_message():
+        print("✓ 使用快速K线图生成")
 except ImportError:
     try:
         from utils.kline_chart import generate_kline_chart
         KLINE_CHART_AVAILABLE = True
     except ImportError:
         KLINE_CHART_AVAILABLE = False
-        print("警告: K线图模块未安装，图片功能不可用")
+        if _should_print_import_message():
+            print("警告: K线图模块未安装，图片功能不可用")
 
 
 class RateLimiter:

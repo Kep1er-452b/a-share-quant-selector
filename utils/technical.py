@@ -63,7 +63,7 @@ def SMA(X, n, m):
     result_reversed = pd.Series(index=reversed_series.index, dtype=float)
     result_reversed.iloc[0] = reversed_series.iloc[0]
     for i in range(1, len(reversed_series)):
-        result_reversed.iloc[i] = (reversed_series.iloc[i] * m + result_reversed.iloc[i-1] * (n - m)) / n
+        result_reversed.iloc[i] = (reversed_series.iloc[i] * m + result_reversed.iloc[i - 1] * (n - m)) / n
 
     return result_reversed.iloc[::-1].reset_index(drop=True).set_axis(X.index)
 
@@ -130,56 +130,85 @@ def KDJ(df, n=9, m1=3, m2=3):
     """
     # 检测数据顺序
     is_descending = df['date'].iloc[0] > df['date'].iloc[-1]
-    
+
     # 统一转换为正序计算（从早到晚）
     if is_descending:
         df_calc = df.iloc[::-1].copy().reset_index(drop=True)
     else:
         df_calc = df.copy().reset_index(drop=True)
-    
+
     # 计算RSV
     low_min = df_calc['low'].rolling(window=n, min_periods=1).min()
     high_max = df_calc['high'].rolling(window=n, min_periods=1).max()
-    
+
     range_val = high_max - low_min
     rsv = pd.Series(index=df_calc.index, dtype=float)
-    
+
     # RSV计算，前n-1个周期不足时用50填充
     for i in range(len(df_calc)):
         if i < n - 1 or range_val.iloc[i] == 0:
             rsv.iloc[i] = 50.0
         else:
             rsv.iloc[i] = (df_calc['close'].iloc[i] - low_min.iloc[i]) / range_val.iloc[i] * 100
-    
+
     # SMA计算 - 通达信风格
     # K = SMA(RSV, M1, 1): K = (RSV*1 + K'*(M1-1)) / M1
     k = pd.Series(index=df_calc.index, dtype=float)
     d = pd.Series(index=df_calc.index, dtype=float)
-    
+
     # 初始化第一日K、D值为50
     k.iloc[0] = 50.0
     d.iloc[0] = 50.0
-    
+
     # 递归计算
     for i in range(1, len(df_calc)):
-        k.iloc[i] = (rsv.iloc[i] * 1 + k.iloc[i-1] * (m1 - 1)) / m1
-        d.iloc[i] = (k.iloc[i] * 1 + d.iloc[i-1] * (m2 - 1)) / m2
-    
+        k.iloc[i] = (rsv.iloc[i] * 1 + k.iloc[i - 1] * (m1 - 1)) / m1
+        d.iloc[i] = (k.iloc[i] * 1 + d.iloc[i - 1] * (m2 - 1)) / m2
+
     # 计算J值
     j = 3 * k - 2 * d
-    
+
     # 构建结果
     result = pd.DataFrame({
         'K': k,
         'D': d,
         'J': j
     })
-    
-    # 恢复原始顺序
+
     if is_descending:
         result = result.iloc[::-1].reset_index(drop=True)
-    
+
     result.index = df.index
+    return result
+
+
+def prepare_selection_features(df, include_standard_trend=True):
+    """
+    预计算多策略共享的中间列，避免单只股票重复计算。
+    """
+    result = df.copy()
+
+    if 'ref_close_1' not in result.columns:
+        result['ref_close_1'] = REF(result['close'], 1)
+    if 'ref_vol_1' not in result.columns:
+        result['ref_vol_1'] = REF(result['volume'], 1)
+
+    if 'REAL_YANG' not in result.columns:
+        result['REAL_YANG'] = (result['close'] > result['open']) & ~(result['close'] < result['ref_close_1'])
+    if 'REAL_YIN' not in result.columns:
+        result['REAL_YIN'] = (result['close'] < result['open']) & ~(result['close'] > result['ref_close_1'])
+
+    if not {'K', 'D', 'J'}.issubset(result.columns):
+        kdj_df = KDJ(result, n=9, m1=3, m2=3)
+        result['K'] = kdj_df['K']
+        result['D'] = kdj_df['D']
+        result['J'] = kdj_df['J']
+
+    if include_standard_trend and not {'short_term_trend', 'bull_bear_line'}.issubset(result.columns):
+        trend_df = calculate_zhixing_trend(result, m1=14, m2=28, m3=57, m4=114)
+        result['short_term_trend'] = trend_df['short_term_trend']
+        result['bull_bear_line'] = trend_df['bull_bear_line']
+
     return result
 
 

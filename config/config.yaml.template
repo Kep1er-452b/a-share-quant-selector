@@ -41,4 +41,6 @@ update:
 # 选股执行配置
 selection:
   mode: parallel      # parallel / sequential
-  max_workers: 16     # 并行选股线程数；机器性能足够时可适当调大
+  backend: process    # process / thread / sequential
+  max_workers: 12     # 激进提速模式默认优先进程并行
+  chunk_size: 50      # 每个工作单元处理的股票数

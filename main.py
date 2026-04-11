@@ -12,7 +12,7 @@ import sys
 import os
 import argparse
 import platform
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, time as dt_time
 import time
@@ -31,6 +31,7 @@ from strategy.strategy_registry import get_registry
 from utils.kline_chart import generate_kline_chart
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.progress import ProgressTracker
+from utils.selection_worker import build_worker_context, process_selection_chunk, initialize_selection_worker
 import yaml
 
 
@@ -251,7 +252,10 @@ class QuantSystem:
         raw_mode = str(get_config_value(self.config, 'selection', 'mode', default='parallel')).strip().lower()
         mode = raw_mode if raw_mode in {'parallel', 'sequential'} else 'parallel'
 
-        default_workers = min(max((os.cpu_count() or 4) * 2, 8), 24)
+        raw_backend = str(get_config_value(self.config, 'selection', 'backend', default='process')).strip().lower()
+        backend = raw_backend if raw_backend in {'process', 'thread', 'sequential'} else 'process'
+
+        default_workers = min(max(os.cpu_count() or 4, 1), 12)
         raw_workers = get_config_value(self.config, 'selection', 'max_workers', default=default_workers)
         try:
             max_workers = int(raw_workers)
@@ -259,9 +263,18 @@ class QuantSystem:
             max_workers = default_workers
         max_workers = max(1, min(max_workers, 32))
 
+        raw_chunk_size = get_config_value(self.config, 'selection', 'chunk_size', default=50)
+        try:
+            chunk_size = int(raw_chunk_size)
+        except (TypeError, ValueError):
+            chunk_size = 50
+        chunk_size = max(1, min(chunk_size, 500))
+
         return {
             'mode': mode,
+            'backend': backend,
             'max_workers': max_workers,
+            'chunk_size': chunk_size,
         }
 
     @staticmethod
@@ -283,6 +296,28 @@ class QuantSystem:
                 if column not in merged.columns:
                     merged[column] = frame[column].values
         return merged
+
+    @staticmethod
+    def _chunk_candidates(candidates, chunk_size):
+        return [candidates[i:i + chunk_size] for i in range(0, len(candidates), chunk_size)]
+
+    def _resolve_selection_backend(self, candidate_count, settings):
+        """根据股票池规模与策略支持情况决定最终执行后端。"""
+        if settings['mode'] != 'parallel' or candidate_count <= 1:
+            return 'sequential'
+
+        requested_backend = settings['backend']
+        if requested_backend == 'sequential':
+            return 'sequential'
+
+        if requested_backend == 'process':
+            if candidate_count < max(settings['chunk_size'] * 4, 200):
+                return 'thread'
+            return 'process'
+
+        if candidate_count < max(settings['chunk_size'], 40):
+            return 'sequential'
+        return 'thread'
 
     def _analyze_single_stock(self, code, name, selected_strategies, category='all', return_data=False):
         """单只股票的多策略分析入口。"""
@@ -384,13 +419,21 @@ class QuantSystem:
             return {}, {}
 
         selection_settings = self._get_selection_settings()
-        execution_mode = selection_settings['mode']
+        selected_strategy_names = [strategy_name for strategy_name, _ in selected_strategies]
+        execution_backend = self._resolve_selection_backend(
+            len(stock_codes),
+            selection_settings,
+        )
         worker_count = selection_settings['max_workers']
+        chunk_size = selection_settings['chunk_size']
 
-        print(f"\n执行选股（{'并行批处理' if execution_mode == 'parallel' else '顺序处理'}，优先提升吞吐）...")
+        backend_labels = {
+            'process': '进程批处理',
+            'thread': '线程批处理',
+            'sequential': '顺序处理',
+        }
+        print(f"\n执行选股（{backend_labels.get(execution_backend, execution_backend)}，优先提升吞吐）...")
         print(f"目标股票池共 {len(stock_codes)} 只股票")
-        if execution_mode == 'parallel':
-            print(f"工作线程数: {worker_count}")
 
         # 先获取股票名称
         stock_names = self._load_stock_names({})
@@ -413,73 +456,92 @@ class QuantSystem:
         strategy_valid_counts = {strategy_name: 0 for strategy_name, _ in selected_strategies}
         strategy_error_counts = {strategy_name: 0 for strategy_name, _ in selected_strategies}
         skipped_data_count = 0
+        valid_total_count = 0
         completed = 0
-        progress_step = 50 if len(candidates) <= 1000 else 200
         tracker = ProgressTracker(len(candidates) or 1, label="选股进度")
 
-        def consume_analysis(analysis):
-            nonlocal skipped_data_count, completed
-            completed += 1
-            if analysis['status'] != 'ok':
-                skipped_data_count += 1
-            else:
-                for strategy_name in strategy_valid_counts:
-                    strategy_valid_counts[strategy_name] += 1
+        def consume_chunk(chunk_result):
+            nonlocal skipped_data_count, completed, valid_total_count
+            completed += chunk_result['processed_count']
+            skipped_data_count += chunk_result['skipped_count']
+            valid_total_count += chunk_result['valid_count']
 
-            for error_text in analysis.get('errors', []):
-                strategy_name = error_text.split(':', 1)[0]
-                if strategy_name in strategy_error_counts:
-                    strategy_error_counts[strategy_name] += 1
+            for strategy_name in strategy_valid_counts:
+                strategy_valid_counts[strategy_name] += chunk_result['valid_count']
+                strategy_error_counts[strategy_name] += chunk_result['error_counts'].get(strategy_name, 0)
+                results[strategy_name].extend(chunk_result['results_by_strategy'].get(strategy_name, []))
 
-            for strategy_name, signal_list in analysis.get('signals_by_strategy', {}).items():
-                for signal in signal_list:
-                    category_key = signal.get('category', 'unknown')
-                    category_count[category_key] = category_count.get(category_key, 0) + 1
+            if return_data:
+                indicators_dict.update(chunk_result['indicators_dict'])
 
-                results[strategy_name].append({
-                    'code': analysis['code'],
-                    'name': analysis['name'],
-                    'signals': signal_list,
-                })
+            for category_key, count in chunk_result['category_count'].items():
+                category_count[category_key] = category_count.get(category_key, 0) + count
 
-                if return_data and analysis.get('indicator_df') is not None:
-                    indicators_dict[analysis['code']] = analysis['indicator_df']
+            selected_total = sum(len(items) for items in results.values())
+            print("  " + tracker.line(
+                completed,
+                extra=(
+                    f"有效 {valid_total_count} 只 | "
+                    f"已选出 {selected_total} 只"
+                )
+            ))
 
-            if completed % progress_step == 0 or completed == len(candidates):
-                selected_total = sum(len(items) for items in results.values())
-                print("  " + tracker.line(
-                    completed,
-                    extra=(
-                        f"有效 {completed - skipped_data_count} 只 | "
-                        f"已选出 {selected_total} 只"
-                    )
-                ))
+        candidate_chunks = self._chunk_candidates(candidates, chunk_size)
+        effective_workers = min(worker_count, max(len(candidate_chunks), 1))
 
-        if execution_mode == 'parallel' and len(candidates) > 1:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        if execution_backend != 'sequential':
+            print(f"工作单元数: {effective_workers}")
+            print(f"批次大小: {chunk_size}")
+
+        if execution_backend == 'process':
+            with ProcessPoolExecutor(
+                max_workers=effective_workers,
+                initializer=initialize_selection_worker,
+                initargs=(self.data_dir, selected_strategy_names, str(self.registry.params_file)),
+            ) as executor:
                 futures = [
                     executor.submit(
-                        self._analyze_single_stock,
-                        code,
-                        name,
-                        selected_strategies,
+                        process_selection_chunk,
+                        chunk,
                         category,
                         return_data,
                     )
-                    for code, name in candidates
+                    for chunk in candidate_chunks
                 ]
                 for future in as_completed(futures):
-                    consume_analysis(future.result())
+                    consume_chunk(future.result())
+        elif execution_backend == 'thread':
+            worker_context = build_worker_context(
+                self.data_dir,
+                selected_strategy_names,
+                str(self.registry.params_file),
+            )
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = [
+                    executor.submit(
+                        process_selection_chunk,
+                        chunk,
+                        category,
+                        return_data,
+                        worker_context,
+                    )
+                    for chunk in candidate_chunks
+                ]
+                for future in as_completed(futures):
+                    consume_chunk(future.result())
         else:
-            for code, name in candidates:
-                analysis = self._analyze_single_stock(
-                    code,
-                    name,
-                    selected_strategies,
+            worker_context = build_worker_context(
+                self.data_dir,
+                selected_strategy_names,
+                str(self.registry.params_file),
+            )
+            for chunk in candidate_chunks:
+                consume_chunk(process_selection_chunk(
+                    chunk,
                     category,
                     return_data,
-                )
-                consume_analysis(analysis)
+                    worker_context,
+                ))
 
         for strategy_name in results:
             results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
@@ -505,7 +567,13 @@ class QuantSystem:
                 code = signal['code']
                 name = signal.get('name', stock_names.get(code, '未知'))
                 for s in signal['signals']:
-                    cat_emoji = {'bowl_center': '🥣', 'near_duokong': '📊', 'near_short_trend': '📈'}.get(s.get('category'), '❓')
+                    cat_emoji = {
+                        'bowl_center': '🥣',
+                        'near_duokong': '📊',
+                        'near_short_trend': '📈',
+                        'b1_v242b': '🎯',
+                        'b2_beta': '🚀',
+                    }.get(s.get('category'), '❓')
                     print(f"  {cat_emoji} {code} {name}: 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
         
         # 显示分类统计
@@ -516,6 +584,7 @@ class QuantSystem:
             'near_duokong': '📊 靠近多空线',
             'near_short_trend': '📈 靠近短期趋势线',
             'b1_v242b': '🎯 B1(V2.42B)',
+            'b2_beta': '🚀 B2选股Beta版',
         }
         if category_count:
             for key, count in sorted(category_count.items()):

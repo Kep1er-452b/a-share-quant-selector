@@ -76,15 +76,17 @@ python3 main.py select --strategy BowlReboundStrategy --force-select
 python3 main.py web
 ```
 
-默认情况下，选股会使用“并行批处理”模式，一次读取单只股票数据后复用给多个策略，适合 32G 内存机器跑几千只股票。若你想切回更保守的顺序模式，可在 `config/config.yaml` 中加入：
+默认情况下，选股会使用“激进提速”模式：优先进程批处理，一次读取单只股票数据后复用给多个策略，适合 32G 内存机器跑几千只股票。若你想手动调整后端，可在 `config/config.yaml` 中加入：
 
 ```yaml
 selection:
   mode: parallel
-  max_workers: 16
+  backend: process
+  max_workers: 12
+  chunk_size: 50
 ```
 
-将 `mode` 改为 `sequential` 即可关闭并行。
+将 `backend` 改为 `thread` 或将 `mode` 改为 `sequential` 即可回退到更保守的执行方式。
 
 抓取和选股过程中，终端现在会显示百分比进度条与“已耗时”，方便你观察当前跑到哪一步。
 
@@ -229,11 +231,13 @@ EMA(EMA(CLOSE, 10), 10)
 | `python3 main.py init --board chinext` | 同步创业板股票池 |
 | `python3 main.py init --board star` | 同步科创板股票池 |
 | `python3 main.py select --strategy B1V242BStrategy` | 只使用指定策略筛选本地数据 |
+| `python3 main.py select --strategy B2BetaStrategy` | 只使用 B2 Beta 策略筛选本地数据 |
 | `python3 main.py select --strategy BowlReboundStrategy --force-select` | 即使本地数据不是最新，也强制使用现有数据筛选 |
 | `python3 main.py run` | 完整流程：更新数据 → 选股 → 通知（默认跳过钉钉） |
 | `python3 main.py run --provider tushare` | 使用 `tushare` 数据源执行完整流程 |
 | `python3 main.py run --board main --max-stocks 500` | 先筛主板，再处理前500只股票 |
 | `python3 main.py run --strategy B1V242BStrategy` | 先更新，再只执行指定策略 |
+| `python3 main.py run --strategy B2BetaStrategy` | 先更新，再只执行 B2 Beta 策略 |
 | `python3 main.py run --category bowl_center` | 只筛选回落碗中的股票 |
 | `python3 main.py web` | 启动Web界面（默认 `127.0.0.1:5080`，端口冲突时自动顺延） |
 | `python3 main.py --version` | 显示版本信息 |
@@ -281,6 +285,7 @@ EMA(EMA(CLOSE, 10), 10)
 - `all`：执行全部策略
 - `BowlReboundStrategy`
 - `B1V242BStrategy`
+- `B2BetaStrategy`
 
 系统支持板块股票池参数：
 
