@@ -69,6 +69,25 @@ B1V242BStrategy:
   B1_TREND_TOLERANCE: 0.985
 
 # ============================================
+# B2 选股 Beta 版策略
+# ============================================
+B2BetaStrategy:
+  J_MAX: 80
+  J13_THRESHOLD: 13
+  J13_LOOKBACK: 2
+  MIN_GAIN_RATIO: 1.04
+  VOLUP_RATIO: 1.01
+  YANGYIN_RATIO_14: 1.2
+  MV_MIN_BILLION: 50
+  TOP_RANGE_WINDOW: 28
+  TOP_RANGE_RATIO: 0.95
+  FD15_VOL_RATIO: 1.15
+  GOOD28_MAX_COUNT: 2
+  PLRY_VOL_RATIO: 1.8
+  PLRY_WINDOW: 28
+  PLRY_MIN_COUNT: 2
+
+# ============================================
 # B1完美图形匹配 (B1PatternMatch)
 # ============================================
 # 功能说明：

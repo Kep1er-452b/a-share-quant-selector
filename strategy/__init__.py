@@ -12,15 +12,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # 导入策略
 from strategy.bowl_rebound import BowlReboundStrategy
 from strategy.b1_v242b import B1V242BStrategy
+from strategy.b2_beta import B2BetaStrategy
 
 # 策略类映射
 STRATEGIES = {
     'BowlReboundStrategy': BowlReboundStrategy,
     'B1V242BStrategy': B1V242BStrategy,
+    'B2BetaStrategy': B2BetaStrategy,
 }
 
 __all__ = [
     'BowlReboundStrategy',
     'B1V242BStrategy',
+    'B2BetaStrategy',
     'STRATEGIES'
 ]

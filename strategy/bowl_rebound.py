@@ -36,10 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.base_strategy import BaseStrategy
-from utils.technical import (
-    MA, EMA, LLV, HHV, REF, EXIST,
-    KDJ, calculate_zhixing_trend
-)
+from utils.technical import EXIST, REF, KDJ, calculate_zhixing_trend
 
 
 class BowlReboundStrategy(BaseStrategy):
@@ -71,18 +68,25 @@ class BowlReboundStrategy(BaseStrategy):
         计算碗口反弹策略所需的所有指标
         """
         result = df.copy()
-        
-        # 1. 知行趋势线（使用technical模块，正确处理倒序数据）
-        from utils.technical import calculate_zhixing_trend
-        trend_df = calculate_zhixing_trend(
-            result, 
-            m1=self.params['M1'],
-            m2=self.params['M2'],
-            m3=self.params['M3'],
-            m4=self.params['M4']
+
+        default_periods = (14, 28, 57, 114)
+        current_periods = (
+            self.params['M1'],
+            self.params['M2'],
+            self.params['M3'],
+            self.params['M4'],
         )
-        result['short_term_trend'] = trend_df['short_term_trend']
-        result['bull_bear_line'] = trend_df['bull_bear_line']
+
+        if current_periods != default_periods or not {'short_term_trend', 'bull_bear_line'}.issubset(result.columns):
+            trend_df = calculate_zhixing_trend(
+                result,
+                m1=self.params['M1'],
+                m2=self.params['M2'],
+                m3=self.params['M3'],
+                m4=self.params['M4']
+            )
+            result['short_term_trend'] = trend_df['short_term_trend']
+            result['bull_bear_line'] = trend_df['bull_bear_line']
         
         # 2. 上升趋势
         result['trend_above'] = result['short_term_trend'] > result['bull_bear_line']
@@ -108,17 +112,16 @@ class BowlReboundStrategy(BaseStrategy):
             (result['close'] <= result['short_term_trend'] * (1 + short_pct))
         )
         
-        # 4. KDJ指标
-        from utils.technical import KDJ
-        kdj_df = KDJ(result, n=9, m1=3, m2=3)
-        result['K'] = kdj_df['K']
-        result['D'] = kdj_df['D']
-        result['J'] = kdj_df['J']
+        if not {'K', 'D', 'J'}.issubset(result.columns):
+            kdj_df = KDJ(result, n=9, m1=3, m2=3)
+            result['K'] = kdj_df['K']
+            result['D'] = kdj_df['D']
+            result['J'] = kdj_df['J']
         
         # 5. 放量阳线条件
         # 成交量 >= 前一日 * N
-        from utils.technical import REF
-        result['vol_ratio'] = result['volume'] / REF(result['volume'], 1)
+        ref_vol_1 = result['ref_vol_1'] if 'ref_vol_1' in result.columns else REF(result['volume'], 1)
+        result['vol_ratio'] = result['volume'] / ref_vol_1
         result['vol_surge'] = result['vol_ratio'] >= self.params['N']
         
         # 阳线：收盘价 > 开盘价

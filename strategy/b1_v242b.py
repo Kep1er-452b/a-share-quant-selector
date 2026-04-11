@@ -32,19 +32,22 @@ class B1V242BStrategy(BaseStrategy):
     def calculate_indicators(self, df) -> pd.DataFrame:
         result = df.copy()
 
-        ref_close_1 = REF(result["close"], 1)
-        ref_vol_1 = REF(result["volume"], 1)
+        ref_close_1 = result["ref_close_1"] if "ref_close_1" in result.columns else REF(result["close"], 1)
+        ref_vol_1 = result["ref_vol_1"] if "ref_vol_1" in result.columns else REF(result["volume"], 1)
 
         result["JYZY_T"] = (result["close"] > result["open"]) & (result["close"] < ref_close_1)
         result["JYZY2_T"] = (result["close"] < result["open"]) & (result["close"] > ref_close_1)
 
-        result["REAL_YANG"] = (result["close"] > result["open"]) & ~(result["close"] < ref_close_1)
-        result["REAL_YIN"] = (result["close"] < result["open"]) & ~(result["close"] > ref_close_1)
+        if "REAL_YANG" not in result.columns:
+            result["REAL_YANG"] = (result["close"] > result["open"]) & ~(result["close"] < ref_close_1)
+        if "REAL_YIN" not in result.columns:
+            result["REAL_YIN"] = (result["close"] < result["open"]) & ~(result["close"] > ref_close_1)
 
-        kdj_df = KDJ(result, n=9, m1=3, m2=3)
-        result["K"] = kdj_df["K"]
-        result["D"] = kdj_df["D"]
-        result["J"] = kdj_df["J"]
+        if not {"K", "D", "J"}.issubset(result.columns):
+            kdj_df = KDJ(result, n=9, m1=3, m2=3)
+            result["K"] = kdj_df["K"]
+            result["D"] = kdj_df["D"]
+            result["J"] = kdj_df["J"]
         result["J_OK"] = result["J"] <= self.params["J_MAX"]
 
         result["VOL_YANG1"] = SUM(result["volume"] * result["REAL_YANG"].astype(int), 57)
