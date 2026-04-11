@@ -14,6 +14,7 @@ import random
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.csv_manager import CSVManager
+from utils.data_provider import BaseDataProvider
 
 # 设置请求会话
 session = requests.Session()
@@ -81,10 +82,13 @@ DEFAULT_STOCK_LIST = {
 }
 
 
-class AKShareFetcher:
+class AKShareFetcher(BaseDataProvider):
     """AKShare 数据抓取器"""
+
+    provider_name = "akshare"
     
     def __init__(self, data_dir="data"):
+        super().__init__(data_dir)
         self.csv_manager = CSVManager(data_dir)
         self.full_data_dir = Path(data_dir)
         self.stock_names_file = Path(data_dir) / 'stock_names.json'
@@ -156,6 +160,30 @@ class AKShareFetcher:
             print(f"  腾讯接口获取市值失败: {e}")
         
         return market_cap_map
+
+    def get_market_caps(self, stock_codes):
+        """批量获取最新市值数据"""
+        market_cap_map = {}
+
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+            for _, row in spot_df.iterrows():
+                code = str(row['代码']).zfill(6)
+                if code not in stock_codes:
+                    continue
+                cap = row['总市值']
+                if pd.notna(cap) and cap > 0:
+                    if cap < 1e10:
+                        cap = int(cap * 1e8)
+                    else:
+                        cap = int(cap)
+                    market_cap_map[code] = cap
+            if market_cap_map:
+                return market_cap_map
+        except Exception as e:
+            print(f"  akshare接口失败: {e}")
+
+        return self._fetch_market_cap_tencent(stock_codes)
     
     def _fetch_stock_list_http(self):
         """使用腾讯接口获取股票列表 - 覆盖5000+只A股"""

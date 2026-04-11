@@ -8,11 +8,18 @@
 
 data_dir: data
 
+# 数据源配置
+data_source:
+  default_provider: "akshare"  # 可选: akshare / tushare
+  tushare:
+    token: ""  # 推荐优先使用环境变量 TUSHARE_TOKEN
+
 # 钉钉机器人配置
 # 1. 在钉钉群中添加自定义机器人
 # 2. 复制 webhook URL 和加签密钥
-# 3. 填入下方（去掉引号内的占位符）
+# 3. enabled=false 表示保留配置但默认不发送
 dingtalk:
+  enabled: false
   webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_HERE"
   secret: "YOUR_SECRET_HERE"
 
@@ -20,7 +27,18 @@ dingtalk:
 schedule:
   time: "17:00"  # 每日执行时间
 
+# Web 配置
+web:
+  host: "127.0.0.1"
+  port: 5080
+  auto_port: true
+
 # 数据更新配置
 update:
   lookback_days: 10
   skip_failed: true
+
+# 选股执行配置
+selection:
+  mode: parallel      # parallel / sequential
+  max_workers: 16     # 并行选股线程数；机器性能足够时可适当调大

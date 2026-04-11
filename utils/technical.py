@@ -55,11 +55,17 @@ def SMA(X, n, m):
     SMA(X,N,M): X的N日移动平均, M为权重
     公式: Y = (X*M + Y'*(N-M)) / N
     """
-    result = pd.Series(index=X.index, dtype=float)
-    result.iloc[0] = X.iloc[0]
-    for i in range(1, len(X)):
-        result.iloc[i] = (X.iloc[i] * m + result.iloc[i-1] * (n - m)) / n
-    return result
+    if len(X) == 0:
+        return pd.Series(index=X.index, dtype=float)
+
+    # 统一在正序数据上计算，避免倒序数据时权重方向错误
+    reversed_series = X.iloc[::-1].reset_index(drop=True)
+    result_reversed = pd.Series(index=reversed_series.index, dtype=float)
+    result_reversed.iloc[0] = reversed_series.iloc[0]
+    for i in range(1, len(reversed_series)):
+        result_reversed.iloc[i] = (reversed_series.iloc[i] * m + result_reversed.iloc[i-1] * (n - m)) / n
+
+    return result_reversed.iloc[::-1].reset_index(drop=True).set_axis(X.index)
 
 
 def REF(series, n):
@@ -81,6 +87,24 @@ def EXIST(cond, n):
     reversed_cond = cond.iloc[::-1]
     exist_reversed = reversed_cond.rolling(window=n, min_periods=1).max().astype(bool)
     return exist_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
+
+
+def COUNT(cond, n):
+    """
+    N周期内满足条件的次数 - 正确处理倒序排列的数据
+    """
+    reversed_cond = cond.astype(int).iloc[::-1]
+    count_reversed = reversed_cond.rolling(window=n, min_periods=1).sum()
+    return count_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
+
+
+def SUM(series, n):
+    """
+    N周期求和 - 正确处理倒序排列的数据
+    """
+    reversed_series = pd.to_numeric(series, errors='coerce').fillna(0).iloc[::-1]
+    sum_reversed = reversed_series.rolling(window=n, min_periods=1).sum()
+    return sum_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
 
 def FINANCE(df, field_code):
