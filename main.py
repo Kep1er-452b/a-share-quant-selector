@@ -4,18 +4,19 @@ A股量化选股系统 - 主程序
 
 使用方法:
     python main.py init      # 首次全量抓取
-    python main.py update    # 每日增量更新（内部使用）
-    python main.py select    # 执行选股
+    python main.py select    # 仅执行筛选
     python main.py run       # 完整流程（更新+选股+通知）
-    python main.py schedule  # 启动定时调度
+    python main.py web       # 启动 Web 界面
 """
 import sys
 import os
 import argparse
 import platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, time as dt_time
 import time
+import getpass
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
@@ -24,130 +25,315 @@ sys.path.insert(0, str(project_root))
 # 版本信息
 __version__ = "1.0.0"
 
-from utils.akshare_fetcher import AKShareFetcher
 from utils.csv_manager import CSVManager
 from utils.dingtalk_notifier import DingTalkNotifier
 from strategy.strategy_registry import get_registry
 from utils.kline_chart import generate_kline_chart
+from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
+from utils.progress import ProgressTracker
 import yaml
+
+
+def load_config_file(config_file="config/config.yaml"):
+    """加载配置文件"""
+    config_path = Path(config_file)
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def prompt_for_provider(default_provider="akshare"):
+    """交互式选择数据源"""
+    default_provider = (default_provider or "akshare").strip().lower()
+    default_choice = "1" if default_provider == "akshare" else "2"
+
+    print("\n请选择数据源：")
+    print("  1. akshare")
+    print("  2. tushare")
+
+    while True:
+        choice = input(f"输入 1 或 2 (默认: {default_choice}): ").strip() or default_choice
+        if choice == "1":
+            return "akshare"
+        if choice == "2":
+            return "tushare"
+        print("请输入 1 或 2。")
+
+
+def prompt_yes_no(message, default=True):
+    """终端 yes/no 提示"""
+    default_hint = "Y/n" if default else "y/N"
+    default_value = "y" if default else "n"
+    while True:
+        choice = input(f"{message} ({default_hint}): ").strip().lower() or default_value
+        if choice in {"y", "yes"}:
+            return True
+        if choice in {"n", "no"}:
+            return False
+        print("请输入 y 或 n。")
+
+
+def prompt_for_strategy(available_strategies, default_strategy="all"):
+    """交互式选择筛选策略"""
+    options = ["all"] + list(available_strategies)
+    default_index = options.index(default_strategy) + 1 if default_strategy in options else 1
+
+    print("\n请选择筛选策略：")
+    for index, strategy_name in enumerate(options, 1):
+        label = "全部策略" if strategy_name == "all" else strategy_name
+        print(f"  {index}. {label}")
+
+    while True:
+        choice = input(f"输入序号 (默认: {default_index}): ").strip() or str(default_index)
+        if choice.isdigit():
+            selected_index = int(choice) - 1
+            if 0 <= selected_index < len(options):
+                return options[selected_index]
+        print("请输入有效序号。")
+
+
+def resolve_provider_name(args, config):
+    """解析当前运行使用的数据源"""
+    configured_provider = get_config_value(config, "data_source", "default_provider", default="akshare")
+
+    if args.provider:
+        return args.provider
+
+    is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if is_interactive and args.command in {"init", "run", "web"}:
+        return prompt_for_provider(configured_provider)
+
+    return configured_provider
+
+
+def resolve_tushare_token(config, interactive_prompt=False):
+    """解析 Tushare Token，优先环境变量，其次本地配置，最后交互输入"""
+    token = os.getenv("TUSHARE_TOKEN")
+    if token:
+        return token.strip()
+
+    token = get_config_value(config, "data_source", "tushare", "token")
+    if token:
+        return str(token).strip()
+
+    if interactive_prompt:
+        token = getpass.getpass("请输入 Tushare Token: ").strip()
+        if token:
+            return token
+
+    return None
 
 
 class QuantSystem:
     """量化系统主类"""
     
-    def __init__(self, config_file="config/config.yaml"):
-        self.config = self._load_config(config_file)
+    def __init__(self, config_file="config/config.yaml", provider_name="akshare", provider_token=None):
+        self.config = load_config_file(config_file)
         self.data_dir = self.config.get('data_dir', 'data')
         self.csv_manager = CSVManager(self.data_dir)
-        self.fetcher = AKShareFetcher(self.data_dir)
+        self.provider_name = provider_name
+        self.fetcher = create_data_provider(
+            provider_name=provider_name,
+            data_dir=self.data_dir,
+            config=self.config,
+            token=provider_token,
+        )
         self.notifier = self._init_notifier()
         self.registry = get_registry("config/strategy_params.yaml")
-    
-    def _load_config(self, config_file):
-        """加载配置文件"""
-        config_path = Path(config_file)
-        if config_path.exists():
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
-        return {}
+        self._strategies_loaded = False
     
     def _init_notifier(self):
         """初始化通知器"""
         webhook = self.config.get('dingtalk', {}).get('webhook_url')
         secret = self.config.get('dingtalk', {}).get('secret')
         return DingTalkNotifier(webhook, secret)
+
+    def _notifications_enabled(self):
+        """是否启用钉钉通知。默认关闭，避免测试时阻塞主流程。"""
+        return bool(self.config.get('dingtalk', {}).get('enabled', False))
+
+    def _ensure_strategies_loaded(self):
+        """确保策略已动态注册"""
+        if self._strategies_loaded:
+            return
+        self.registry.auto_register_from_directory("strategy")
+        self._strategies_loaded = True
+
+    def get_available_strategy_names(self):
+        """获取当前可用策略名称列表"""
+        self._ensure_strategies_loaded()
+        return self.registry.list_strategies()
+
+    def _resolve_selected_strategies(self, strategy_filter='all'):
+        """按名称过滤要执行的策略"""
+        self._ensure_strategies_loaded()
+        available = self.registry.list_strategies()
+        if not available:
+            return []
+
+        if strategy_filter in (None, 'all'):
+            return [(name, self.registry.strategies[name]) for name in available]
+
+        if strategy_filter not in self.registry.strategies:
+            raise ValueError(f"未找到策略: {strategy_filter}。当前可用策略: {', '.join(available)}")
+
+        return [(strategy_filter, self.registry.strategies[strategy_filter])]
+
+    def _resolve_target_universe(self, board='all', max_stocks=None):
+        """根据 provider、板块和数量限制计算本次目标股票池"""
+        target_universe = self.fetcher.get_target_universe(board=board, max_stocks=max_stocks)
+        if not target_universe:
+            print(f"✗ 未找到可用股票池: {BOARD_LABELS.get(board, board)}")
+            return []
+
+        print("\n🎯 目标股票池")
+        print(f"  数据源: {self.provider_name}")
+        print(f"  板块: {BOARD_LABELS.get(board, board)}")
+        print(f"  股票数: {len(target_universe)} 只")
+        return target_universe
+
+    def _sync_target_universe(self, board='all', max_stocks=None, purpose='init'):
+        """按目标股票池执行智能续抓"""
+        target_universe = self._resolve_target_universe(board=board, max_stocks=max_stocks)
+        if not target_universe:
+            return []
+        self.fetcher.sync_target_data(
+            target_universe,
+            board=board,
+            max_stocks=max_stocks,
+            purpose=purpose,
+        )
+        return target_universe
     
     def _load_stock_names(self, stock_data):
         """加载股票名称（优先从CSV文件）"""
         names_file = Path(self.data_dir) / 'stock_names.json'
-        
-        # 尝试从网络获取
-        try:
-            stock_names = self.fetcher.get_all_stock_codes()
-            if stock_names:
-                # 保存到本地
-                import json
-                with open(names_file, 'w', encoding='utf-8') as f:
-                    json.dump(stock_names, f, ensure_ascii=False)
-                return stock_names
-        except:
-            pass
-        
-        # 从本地缓存读取
+
+        # 优先使用本地缓存，避免每次选股都额外请求远端接口
         if names_file.exists():
             import json
             with open(names_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
+
+        # 本地不存在时，再尝试从数据源获取
+        try:
+            stock_names = self.fetcher.get_all_stock_codes()
+            if stock_names:
+                import json
+                with open(names_file, 'w', encoding='utf-8') as f:
+                    json.dump(stock_names, f, ensure_ascii=False)
+                return stock_names
+        except Exception:
+            pass
         
         # 使用默认名称
         return {code: f"股票{code}" for code in stock_data.keys()}
     
-    def init_data(self, max_stocks=None):
+    def init_data(self, max_stocks=None, board='all'):
         """首次全量抓取"""
         print("=" * 60)
-        print("🚀 首次全量数据抓取")
+        print(f"🚀 首次全量数据抓取 [{self.provider_name}]")
         print("=" * 60)
-        self.fetcher.init_full_data(max_stocks=max_stocks)
+        self._sync_target_universe(board=board, max_stocks=max_stocks, purpose='init')
         print("\n✓ 数据初始化完成")
 
-    def _smart_update(self, max_stocks=None, check_latest=True):
-        """智能更新：3点前不更新，检查每只股票是否有当天数据"""
-        from datetime import datetime
-        import pandas as pd
-
-        today = datetime.now().date()
-        current_time = datetime.now().time()
-        market_close_time = datetime.strptime("15:00", "%H:%M").time()
-
-        # 3点前：不更新，使用旧数据
-        if current_time < market_close_time:
-            print("\n⏰ 当前时间尚未收盘 (15:00)")
-            print("  使用本地已有数据，跳过网络更新")
-            return
-
-        # 检查每只股票是否有当天数据
-        if check_latest:
-            print("\n🔍 检查数据更新状态...")
-            stock_codes = self.csv_manager.list_all_stocks()
-            if max_stocks:
-                stock_codes = stock_codes[:max_stocks]
-
-            total = len(stock_codes)
-            has_today = 0
-            no_today = 0
-            check_limit = min(100, total)  # 抽样检查100只
-
-            for code in stock_codes[:check_limit]:
-                df = self.csv_manager.read_stock(code)
-                if not df.empty:
-                    latest_date = pd.to_datetime(df.iloc[0]['date']).date()
-                    if latest_date == today:
-                        has_today += 1
-                    else:
-                        no_today += 1
-
-            # 如果100%股票都有今天数据，跳过更新
-            if check_limit > 0 and has_today == check_limit:
-                print(f"  ✓ 已检查 {check_limit} 只股票，全部已有今天数据")
-                print("  数据已是最新，跳过网络更新")
-                return
-            else:
-                print(f"  已检查 {check_limit} 只，{has_today} 只有今天数据，{no_today} 只需要更新")
-
-        # 执行更新
-        print("\n🔄 执行数据更新...")
-        self.fetcher.daily_update(max_stocks=max_stocks)
-        print("\n✓ 数据更新完成")
-
-    def update_data(self, max_stocks=None):
+    def update_data(self, max_stocks=None, board='all'):
         """每日增量更新"""
         print("=" * 60)
-        print("🔄 每日增量更新")
+        print(f"🔄 每日增量更新 [{self.provider_name}]")
         print("=" * 60)
-        self.fetcher.daily_update(max_stocks=max_stocks)
+        self._sync_target_universe(board=board, max_stocks=max_stocks, purpose='run')
         print("\n✓ 数据更新完成")
 
-    def select_stocks(self, category='all', max_stocks=None, return_data=False):
+    def _get_selection_settings(self):
+        """读取选股执行配置。默认开启并行模式，以提升大股票池筛选速度。"""
+        raw_mode = str(get_config_value(self.config, 'selection', 'mode', default='parallel')).strip().lower()
+        mode = raw_mode if raw_mode in {'parallel', 'sequential'} else 'parallel'
+
+        default_workers = min(max((os.cpu_count() or 4) * 2, 8), 24)
+        raw_workers = get_config_value(self.config, 'selection', 'max_workers', default=default_workers)
+        try:
+            max_workers = int(raw_workers)
+        except (TypeError, ValueError):
+            max_workers = default_workers
+        max_workers = max(1, min(max_workers, 32))
+
+        return {
+            'mode': mode,
+            'max_workers': max_workers,
+        }
+
+    @staticmethod
+    def _is_invalid_stock_name(name):
+        """统一处理退市/ST 股票过滤规则。"""
+        invalid_keywords = ['退', '未知', '退市', '已退']
+        if any(kw in name for kw in invalid_keywords):
+            return True
+        return name.startswith('ST') or name.startswith('*ST')
+
+    @staticmethod
+    def _merge_indicator_frames(base_df, frames):
+        """把多个策略算出的指标列合并到同一份 DataFrame，便于后续画图复用。"""
+        merged = base_df.copy()
+        for frame in frames:
+            if frame is None or frame.empty:
+                continue
+            for column in frame.columns:
+                if column not in merged.columns:
+                    merged[column] = frame[column].values
+        return merged
+
+    def _analyze_single_stock(self, code, name, selected_strategies, category='all', return_data=False):
+        """单只股票的多策略分析入口。"""
+        df = self.csv_manager.read_stock(code)
+        if df.empty or len(df) < 60:
+            return {
+                'code': code,
+                'name': name,
+                'status': 'skipped',
+                'signals_by_strategy': {},
+                'indicator_df': None,
+                'errors': [],
+            }
+
+        signals_by_strategy = {}
+        indicator_frames = []
+        errors = []
+
+        for strategy_name, strategy in selected_strategies:
+            try:
+                df_with_indicators = strategy.calculate_indicators(df)
+                signal_list = strategy.select_stocks(df_with_indicators, name)
+            except Exception as exc:
+                errors.append(f"{strategy_name}: {exc}")
+                continue
+
+            filtered_signals = []
+            for signal in signal_list or []:
+                signal_category = signal.get('category', 'unknown')
+                if category == 'all' or signal_category == category:
+                    filtered_signals.append(signal)
+
+            if filtered_signals:
+                signals_by_strategy[strategy_name] = filtered_signals
+                if return_data:
+                    indicator_frames.append(df_with_indicators)
+
+        indicator_df = None
+        if return_data and indicator_frames:
+            indicator_df = self._merge_indicator_frames(df, indicator_frames)
+
+        return {
+            'code': code,
+            'name': name,
+            'status': 'ok',
+            'signals_by_strategy': signals_by_strategy,
+            'indicator_df': indicator_df,
+            'errors': errors,
+        }
+
+    def select_stocks(self, category='all', max_stocks=None, return_data=False, board='all', target_universe=None, strategy_filter='all'):
         """执行选股
         :param category: 股票分类筛选，'all'表示全部，其他值按分类筛选
         :param max_stocks: 限制处理的股票数量（用于快速测试）
@@ -162,17 +348,17 @@ class QuantSystem:
         
         # 加载策略
         print("\n加载策略...")
-        self.registry.auto_register_from_directory("strategy")
-        
-        if not self.registry.list_strategies():
+        selected_strategies = self._resolve_selected_strategies(strategy_filter=strategy_filter)
+
+        if not selected_strategies:
             print("✗ 没有找到可用策略")
             return {}, {}
         
-        print(f"已加载 {len(self.registry.list_strategies())} 个策略")
+        print(f"已选中 {len(selected_strategies)} 个策略")
         
         # 输出当前策略参数
         print("\n当前策略参数:")
-        for strategy_name, strategy_obj in self.registry.strategies.items():
+        for strategy_name, strategy_obj in selected_strategies:
             print(f"\n  🎯 {strategy_name}:")
             for param_name, param_value in strategy_obj.params.items():
                 # 对特定参数添加说明
@@ -188,87 +374,126 @@ class QuantSystem:
                 elif param_name in ['M1', 'M2', 'M3', 'M4']:
                     note = " (MA周期)"
                 print(f"      {param_name}: {param_value}{note}")
-        
-        # 加载股票数据（流式处理，不预存全部数据）
-        print("\n执行选股（流式处理，降低内存占用）...")
-        stock_codes = self.csv_manager.list_all_stocks()
-        
+
+        if target_universe is None:
+            target_universe = self._resolve_target_universe(board=board, max_stocks=max_stocks)
+        stock_codes = [item['code'] for item in target_universe]
+
         if not stock_codes:
-            print("✗ 没有股票数据，请先执行 init 或 update")
+            print("✗ 目标股票池为空，请先执行 init")
             return {}, {}
-        
-        print(f"共 {len(stock_codes)} 只股票")
-        
+
+        selection_settings = self._get_selection_settings()
+        execution_mode = selection_settings['mode']
+        worker_count = selection_settings['max_workers']
+
+        print(f"\n执行选股（{'并行批处理' if execution_mode == 'parallel' else '顺序处理'}，优先提升吞吐）...")
+        print(f"目标股票池共 {len(stock_codes)} 只股票")
+        if execution_mode == 'parallel':
+            print(f"工作线程数: {worker_count}")
+
         # 先获取股票名称
         stock_names = self._load_stock_names({})
-        
-        # 流式选股处理
-        import gc
-        results = {}
+
+        # 先按名称做预过滤，避免无意义读取 CSV
+        candidates = []
+        invalid_name_count = 0
+        for code in stock_codes:
+            name = stock_names.get(code, '未知')
+            if self._is_invalid_stock_name(name):
+                invalid_name_count += 1
+                continue
+            candidates.append((code, name))
+
+        print(f"名称预过滤后剩余 {len(candidates)} 只股票，跳过 {invalid_name_count} 只风险/异常股票")
+
+        results = {strategy_name: [] for strategy_name, _ in selected_strategies}
         indicators_dict = {}  # 只保存入选股票的数据
-        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
-        
-        # 限制处理数量
-        process_codes = stock_codes[:max_stocks] if max_stocks else stock_codes
-        
-        for strategy_name, strategy in self.registry.strategies.items():
+        category_count = {}
+        strategy_valid_counts = {strategy_name: 0 for strategy_name, _ in selected_strategies}
+        strategy_error_counts = {strategy_name: 0 for strategy_name, _ in selected_strategies}
+        skipped_data_count = 0
+        completed = 0
+        progress_step = 50 if len(candidates) <= 1000 else 200
+        tracker = ProgressTracker(len(candidates) or 1, label="选股进度")
+
+        def consume_analysis(analysis):
+            nonlocal skipped_data_count, completed
+            completed += 1
+            if analysis['status'] != 'ok':
+                skipped_data_count += 1
+            else:
+                for strategy_name in strategy_valid_counts:
+                    strategy_valid_counts[strategy_name] += 1
+
+            for error_text in analysis.get('errors', []):
+                strategy_name = error_text.split(':', 1)[0]
+                if strategy_name in strategy_error_counts:
+                    strategy_error_counts[strategy_name] += 1
+
+            for strategy_name, signal_list in analysis.get('signals_by_strategy', {}).items():
+                for signal in signal_list:
+                    category_key = signal.get('category', 'unknown')
+                    category_count[category_key] = category_count.get(category_key, 0) + 1
+
+                results[strategy_name].append({
+                    'code': analysis['code'],
+                    'name': analysis['name'],
+                    'signals': signal_list,
+                })
+
+                if return_data and analysis.get('indicator_df') is not None:
+                    indicators_dict[analysis['code']] = analysis['indicator_df']
+
+            if completed % progress_step == 0 or completed == len(candidates):
+                selected_total = sum(len(items) for items in results.values())
+                print("  " + tracker.line(
+                    completed,
+                    extra=(
+                        f"有效 {completed - skipped_data_count} 只 | "
+                        f"已选出 {selected_total} 只"
+                    )
+                ))
+
+        if execution_mode == 'parallel' and len(candidates) > 1:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(
+                        self._analyze_single_stock,
+                        code,
+                        name,
+                        selected_strategies,
+                        category,
+                        return_data,
+                    )
+                    for code, name in candidates
+                ]
+                for future in as_completed(futures):
+                    consume_analysis(future.result())
+        else:
+            for code, name in candidates:
+                analysis = self._analyze_single_stock(
+                    code,
+                    name,
+                    selected_strategies,
+                    category,
+                    return_data,
+                )
+                consume_analysis(analysis)
+
+        for strategy_name in results:
+            results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
+
+        for strategy_name, signals in results.items():
             print(f"\n执行策略: {strategy_name}")
-            signals = []
-            valid_count = 0
-            invalid_count = 0
-            
-            for i, code in enumerate(process_codes, 1):
-                # 读取单只股票
-                df = self.csv_manager.read_stock(code)
-                name = stock_names.get(code, '未知')
-                
-                # 过滤
-                invalid_keywords = ['退', '未知', '退市', '已退']
-                if any(kw in name for kw in invalid_keywords):
-                    invalid_count += 1
-                    continue
-                
-                # 过滤 ST/*ST 股票
-                if name.startswith('ST') or name.startswith('*ST'):
-                    invalid_count += 1
-                    continue
-                if df.empty or len(df) < 60:
-                    continue
-                
-                valid_count += 1
-                
-                # 计算指标
-                df_with_indicators = strategy.calculate_indicators(df)
-                
-                # 选股
-                signal_list = strategy.select_stocks(df_with_indicators, name)
-                
-                if signal_list:
-                    for s in signal_list:
-                        cat = s.get('category', 'unknown')
-                        category_count[cat] = category_count.get(cat, 0) + 1
-                        
-                        if category == 'all' or cat == category:
-                            signals.append({
-                                'code': code,
-                                'name': name,
-                                'signals': [s]
-                            })
-                            # 只保存入选股票的数据
-                            if return_data:
-                                indicators_dict[code] = df_with_indicators
-                
-                # 释放内存
-                del df, df_with_indicators
-                
-                # 每100只显示进度并GC
-                if i % 100 == 0 or i == len(process_codes):
-                    gc.collect()
-                    print(f"  进度: [{i}/{len(process_codes)}] 有效 {valid_count} 只，选出 {len(signals)} 只...")
-            
-            results[strategy_name] = signals
-            print(f"  ✓ 选股完成: 共 {len(signals)} 只 (过滤 {invalid_count} 只)")
-        
+            print(
+                f"  ✓ 选股完成: 共 {len(signals)} 只 "
+                f"(有效 {strategy_valid_counts.get(strategy_name, 0)} 只, "
+                f"名称过滤 {invalid_name_count} 只, 数据不足 {skipped_data_count} 只, "
+                f"策略异常 {strategy_error_counts.get(strategy_name, 0)} 次)"
+            )
+        print(f"\n总耗时: {tracker.elapsed_text()}")
+
         # 显示结果汇总
         print("\n" + "=" * 60)
         print("📊 选股结果汇总")
@@ -286,9 +511,17 @@ class QuantSystem:
         # 显示分类统计
         print("\n" + "-" * 60)
         print("分类统计:")
-        print(f"  🥣 回落碗中: {category_count.get('bowl_center', 0)} 只")
-        print(f"  📊 靠近多空线: {category_count.get('near_duokong', 0)} 只")
-        print(f"  📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只")
+        category_labels = {
+            'bowl_center': '🥣 回落碗中',
+            'near_duokong': '📊 靠近多空线',
+            'near_short_trend': '📈 靠近短期趋势线',
+            'b1_v242b': '🎯 B1(V2.42B)',
+        }
+        if category_count:
+            for key, count in sorted(category_count.items()):
+                print(f"  {category_labels.get(key, key)}: {count} 只")
+        else:
+            print("  无分类结果")
         print("-" * 60)
         
         # 如果需要返回数据字典（用于K线图生成）
@@ -298,42 +531,56 @@ class QuantSystem:
         
         return results, stock_names
     
-    def run_full(self, category='all', max_stocks=None):
+    def run_full(self, category='all', max_stocks=None, board='all'):
         """完整流程：更新 + 选股 + 通知（带K线图）
         :param max_stocks: 限制处理的股票数量（用于快速测试）
         """
-        from datetime import datetime
-        import json
-        from pathlib import Path
 
         print("=" * 60)
         print("🚀 执行完整流程")
         if max_stocks:
             print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
+        print(f"   板块范围: {BOARD_LABELS.get(board, board)}")
         print("=" * 60)
 
-        # 1. 更新数据（内置逻辑：3点前不更新，检查每只股票是否有当天数据）
-        self._smart_update(max_stocks=max_stocks)
+        # 1. 智能续抓目标股票池
+        target_universe = self._sync_target_universe(board=board, max_stocks=max_stocks, purpose='run')
 
         # 2. 选股（返回数据和结果）
-        results, stock_names, stock_data_dict = self.select_stocks(category=category, max_stocks=max_stocks, return_data=True)
+        need_stock_data = self._notifications_enabled()
+        selection_result = self.select_stocks(
+            category=category,
+            max_stocks=max_stocks,
+            return_data=need_stock_data,
+            board=board,
+            target_universe=target_universe,
+            strategy_filter='all',
+        )
+        if need_stock_data:
+            results, stock_names, stock_data_dict = selection_result
+        else:
+            results, stock_names = selection_result
+            stock_data_dict = {}
 
         # 3. 发送通知（带K线图）
         if results:
-
-            # 使用带K线图的发送方法
-            self.notifier.send_stock_selection_with_charts(
-                results,
-                stock_names,
-                category_filter=category,
-                stock_data_dict=stock_data_dict,
-                params=self.registry.strategies.get('BowlReboundStrategy', {}).params if self.registry.strategies else {},
-                send_text_first=True
-            )
+            if self._notifications_enabled():
+                default_strategy = self.registry.strategies.get('BowlReboundStrategy')
+                # 使用带K线图的发送方法
+                self.notifier.send_stock_selection_with_charts(
+                    results,
+                    stock_names,
+                    category_filter=category,
+                    stock_data_dict=stock_data_dict,
+                    params=default_strategy.params if default_strategy else {},
+                    send_text_first=True
+                )
+            else:
+                print("\n🔕 钉钉通知已禁用，跳过发送")
 
         return results
     
-    def select_with_b1_match(self, category='all', max_stocks=None, min_similarity=None, lookback_days=None):
+    def select_with_b1_match(self, category='all', max_stocks=None, min_similarity=None, lookback_days=None, board='all', target_universe=None, strategy_filter='all'):
         """
         执行选股 + B1完美图形匹配排序
         
@@ -357,6 +604,7 @@ class QuantSystem:
         print("🎯 执行选股 + B1完美图形匹配")
         if max_stocks:
             print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
+        print(f"   板块范围: {BOARD_LABELS.get(board, board)}")
         print(f"   相似度阈值: {min_similarity}%")
         print(f"   回看天数: {lookback_days}天")
         print("=" * 60)
@@ -366,7 +614,10 @@ class QuantSystem:
         results, stock_names, stock_data_dict = self.select_stocks(
             category=category, 
             max_stocks=max_stocks, 
-            return_data=True
+            return_data=True,
+            board=board,
+            target_universe=target_universe,
+            strategy_filter=strategy_filter,
         )
         
         # 统计选股总数
@@ -475,7 +726,7 @@ class QuantSystem:
             'total_selected': total_selected,
         }
     
-    def run_with_b1_match(self, category='all', max_stocks=None, min_similarity=60.0, lookback_days=25):
+    def run_with_b1_match(self, category='all', max_stocks=None, min_similarity=60.0, lookback_days=25, board='all', strategy_filter='all'):
         """
         完整流程：更新 + 选股 + B1完美图形匹配 + 通知
 
@@ -491,32 +742,80 @@ class QuantSystem:
         print("🚀 执行完整流程（含B1完美图形匹配）")
         if max_stocks:
             print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
+        print(f"   板块范围: {BOARD_LABELS.get(board, board)}")
         print(f"   回看天数: {lookback_days}天")
         print("=" * 60)
 
-        # 1. 更新数据
-        self._smart_update(max_stocks=max_stocks)
+        # 1. 智能续抓目标股票池
+        target_universe = self._sync_target_universe(board=board, max_stocks=max_stocks, purpose='run')
 
         # 2. 选股 + B1完美图形匹配
         match_result = self.select_with_b1_match(
             category=category,
             max_stocks=max_stocks,
             min_similarity=min_similarity,
-            lookback_days=lookback_days
+            lookback_days=lookback_days,
+            board=board,
+            target_universe=target_universe,
+            strategy_filter=strategy_filter,
         )
         
         # 3. 发送通知
         if match_result.get('matched'):
-            print("\n📤 发送钉钉通知...")
-            self.notifier.send_b1_match_results(
-                match_result['matched'],
-                match_result.get('total_selected', 0)
-            )
-            print("✓ 通知发送完成")
+            if self._notifications_enabled():
+                print("\n📤 发送钉钉通知...")
+                self.notifier.send_b1_match_results(
+                    match_result['matched'],
+                    match_result.get('total_selected', 0)
+                )
+                print("✓ 通知发送完成")
+            else:
+                print("\n🔕 钉钉通知已禁用，跳过发送")
         else:
             print("\n⚠️ 没有匹配结果，跳过通知")
         
         return match_result
+
+    def select_only(self, category='all', max_stocks=None, board='all', strategy_filter='all', force_select=False):
+        """只执行筛选，不自动抓取；若本地数据过期则提醒并可先补齐"""
+        print("=" * 60)
+        print("🔎 执行独立筛选")
+        if max_stocks:
+            print(f"   快速测试模式：只处理前 {max_stocks} 只股票")
+        print(f"   板块范围: {BOARD_LABELS.get(board, board)}")
+        print("=" * 60)
+
+        target_universe = self._resolve_target_universe(board=board, max_stocks=max_stocks)
+        if not target_universe:
+            return {}
+
+        freshness = self.fetcher.assess_target_data(target_universe)
+        summary = freshness["summary"]
+        print("\n🗂️ 本地数据状态")
+        print(f"  最新交易日: {freshness.get('latest_trade_date') or '未知'}")
+        print(f"  已最新: {summary.get('up_to_date', 0)} 只")
+        print(f"  过期待补: {summary.get('stale', 0)} 只")
+        print(f"  缺失/损坏: {summary.get('full_refresh', 0)} 只")
+
+        if not freshness["is_fresh"] and not force_select:
+            is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
+            message = "检测到本地数据不是最新，是否先抓取/补齐目标股票池再筛选？"
+            if is_interactive and prompt_yes_no(message, default=True):
+                self.fetcher.sync_target_data(target_universe, board=board, max_stocks=max_stocks, purpose='run')
+            else:
+                print("⚠️ 本地数据不是最新，已停止筛选。可使用 `select --force-select` 强制按现有数据筛选。")
+                return {}
+        elif not freshness["is_fresh"] and force_select:
+            print("⚠️ 已启用强制筛选，将直接使用当前本地数据继续执行")
+
+        return self.select_stocks(
+            category=category,
+            max_stocks=max_stocks,
+            return_data=False,
+            board=board,
+            target_universe=target_universe,
+            strategy_filter=strategy_filter,
+        )
     
     def run_schedule(self):
         """启动定时调度"""
@@ -545,12 +844,21 @@ class QuantSystem:
 
 def print_version():
     """打印版本信息"""
-    import akshare
     import pandas
+    import importlib
     
     print(f"A-Share Quant v{__version__}")
     print(f"Python: {sys.version.split()[0]}")
-    print(f"akshare: {akshare.__version__}")
+    if importlib.util.find_spec("akshare"):
+        import akshare
+        print(f"akshare: {akshare.__version__}")
+    else:
+        print("akshare: 未安装")
+    if importlib.util.find_spec("tushare"):
+        import tushare
+        print(f"tushare: {tushare.__version__}")
+    else:
+        print("tushare: 未安装")
     print(f"pandas: {pandas.__version__}")
     print(f"System: {platform.system()}")
     print(f"B1 Pattern Match: 支持（基于双线+量比+形态三维匹配，10个历史案例）")
@@ -563,7 +871,11 @@ def main():
         epilog="""
 示例:
   python main.py init                          # 首次抓取6年历史数据
+  python main.py init --board main             # 同步主板股票池
+  python main.py select --strategy B1V242BStrategy  # 用指定策略直接筛选本地数据
   python main.py run                           # 完整流程（更新+选股+通知）
+  python main.py run --board star              # 只运行科创板股票池
+  python main.py run --provider tushare        # 使用 tushare 数据源执行完整流程
   python main.py run --b1-match                # 完整流程+B1完美图形匹配排序
   python main.py run --b1-match --min-similarity 70  # 匹配+提高相似度阈值到70%
   python main.py run --b1-match --lookback-days 30   # 使用30天回看期
@@ -591,16 +903,16 @@ B1完美图形匹配:
 
     parser.add_argument(
         'command',
-        choices=['init', 'run', 'web'],
+        choices=['init', 'select', 'run', 'web'],
         nargs='?',
-        help='要执行的命令: init(初始化数据), run(执行选股), web(启动Web服务器)'
+        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器)'
     )
 
     parser.add_argument(
         '--max-stocks',
         type=int,
         default=None,
-        help='限制处理的股票数量（用于快速测试）'
+        help='限制处理的股票数量；若配合 --board 使用，则先按板块过滤再截取前 N 只'
     )
 
     parser.add_argument(
@@ -610,16 +922,42 @@ B1完美图形匹配:
     )
 
     parser.add_argument(
+        '--board',
+        choices=['all', 'main', 'chinext', 'star'],
+        default='all',
+        help='股票池范围: all(全市场), main(主板), chinext(创业板), star(科创板)'
+    )
+
+    parser.add_argument(
+        '--provider',
+        choices=['akshare', 'tushare'],
+        default=None,
+        help='指定数据源，不指定时交互式终端会先询问'
+    )
+
+    parser.add_argument(
+        '--strategy',
+        default=None,
+        help='指定筛选策略名称；不指定时交互式终端可选，默认执行全部策略'
+    )
+
+    parser.add_argument(
+        '--force-select',
+        action='store_true',
+        help='在 select 命令中强制使用当前本地数据筛选，即使数据不是最新'
+    )
+
+    parser.add_argument(
         '--host',
-        default='0.0.0.0',
-        help='Web服务器监听地址 (默认: 0.0.0.0)'
+        default=None,
+        help='Web服务器监听地址 (默认从配置读取，未配置时为 127.0.0.1)'
     )
 
     parser.add_argument(
         '--port',
         type=int,
-        default=5000,
-        help='Web服务器端口 (默认: 5000)'
+        default=None,
+        help='Web服务器端口 (默认从配置读取，未配置时为 5080)'
     )
     
     parser.add_argument(
@@ -673,35 +1011,103 @@ B1完美图形匹配:
     
     # 切换工作目录
     os.chdir(project_root)
-    
-    # 创建系统实例
-    quant = QuantSystem(args.config)
+
+    config = load_config_file(args.config)
+    provider_name = resolve_provider_name(args, config)
+    provider_token = None
+    if provider_name == 'tushare' and args.command in {'init', 'select', 'run'}:
+        provider_token = resolve_tushare_token(
+            config,
+            interactive_prompt=(sys.stdin.isatty() and sys.stdout.isatty())
+        )
+        if not provider_token:
+            print("✗ 未提供 Tushare Token，无法使用 tushare 数据源")
+            print("  可通过环境变量 TUSHARE_TOKEN 或 config/config.yaml 的 data_source.tushare.token 配置")
+            sys.exit(1)
     
     # 执行命令
-    if args.command == 'init':
-        quant.init_data(max_stocks=args.max_stocks)
-    
-    elif args.command == 'run':
-        # 原有选股流程（支持B1完美图形匹配）
-        if args.b1_match:
-            # 启用B1完美图形匹配
-            # 如果命令行未指定，使用配置文件中的默认值
-            min_sim = args.min_similarity if args.min_similarity is not None else default_min_similarity
-            lookback = args.lookback_days if args.lookback_days is not None else default_lookback_days
-            quant.run_with_b1_match(
-                category=args.category,
-                max_stocks=args.max_stocks,
-                min_similarity=min_sim,
-                lookback_days=lookback
-            )
-        else:
-            # 原有选股流程（不带B1匹配）
-            quant.run_full(category=args.category, max_stocks=args.max_stocks)
-    
-    elif args.command == 'web':
-        # 启动Web服务器
-        from web_server import run_web_server
-        run_web_server(host=args.host, port=args.port)
+    try:
+        if args.command == 'init':
+            quant = QuantSystem(args.config, provider_name=provider_name, provider_token=provider_token)
+            quant.init_data(max_stocks=args.max_stocks, board=args.board)
+        
+        elif args.command in {'select', 'run'}:
+            quant = QuantSystem(args.config, provider_name=provider_name, provider_token=provider_token)
+            available_strategies = quant.get_available_strategy_names()
+            strategy_filter = args.strategy
+            if not strategy_filter and sys.stdin.isatty() and sys.stdout.isatty():
+                strategy_filter = prompt_for_strategy(available_strategies, default_strategy="all")
+            strategy_filter = strategy_filter or 'all'
+
+            if strategy_filter != 'all' and strategy_filter not in available_strategies:
+                print(f"✗ 未找到策略: {strategy_filter}")
+                print(f"  当前可用策略: {', '.join(available_strategies)}")
+                sys.exit(1)
+
+            if args.command == 'select':
+                quant.select_only(
+                    category=args.category,
+                    max_stocks=args.max_stocks,
+                    board=args.board,
+                    strategy_filter=strategy_filter,
+                    force_select=args.force_select,
+                )
+                return
+
+            # 原有选股流程（支持B1完美图形匹配）
+            if args.b1_match:
+                min_sim = args.min_similarity if args.min_similarity is not None else default_min_similarity
+                lookback = args.lookback_days if args.lookback_days is not None else default_lookback_days
+                quant.run_with_b1_match(
+                    category=args.category,
+                    max_stocks=args.max_stocks,
+                    min_similarity=min_sim,
+                    lookback_days=lookback,
+                    board=args.board,
+                    strategy_filter=strategy_filter,
+                )
+            else:
+                if strategy_filter == 'all':
+                    quant.run_full(category=args.category, max_stocks=args.max_stocks, board=args.board)
+                else:
+                    # 指定单一策略时，仍沿用 run 的“先更新再筛选”语义
+                    print("=" * 60)
+                    print("🚀 执行完整流程")
+                    if args.max_stocks:
+                        print(f"   快速测试模式：只处理前 {args.max_stocks} 只股票")
+                    print(f"   板块范围: {BOARD_LABELS.get(args.board, args.board)}")
+                    print(f"   指定策略: {strategy_filter}")
+                    print("=" * 60)
+                    target_universe = quant._sync_target_universe(board=args.board, max_stocks=args.max_stocks, purpose='run')
+                    need_stock_data = quant._notifications_enabled()
+                    selection_result = quant.select_stocks(
+                        category=args.category,
+                        max_stocks=args.max_stocks,
+                        return_data=need_stock_data,
+                        board=args.board,
+                        target_universe=target_universe,
+                        strategy_filter=strategy_filter,
+                    )
+                    if quant._notifications_enabled():
+                        results_dict, stock_names, stock_data_dict = selection_result
+                        strategy_obj = quant.registry.strategies.get(strategy_filter)
+                        quant.notifier.send_stock_selection_with_charts(
+                            results_dict,
+                            stock_names,
+                            category_filter=args.category,
+                            stock_data_dict=stock_data_dict,
+                            params=strategy_obj.params if strategy_obj else {},
+                            send_text_first=True
+                        )
+                    else:
+                        print("\n🔕 钉钉通知已禁用，跳过发送")
+        
+        elif args.command == 'web':
+            from web_server import run_web_server
+            run_web_server(host=args.host, port=args.port, config=config)
+    except DataProviderError as e:
+        print(f"✗ {e}")
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -7,8 +7,8 @@
 data_dir: data
 
 dingtalk:
-  webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=cb0bd772e4da7eff45479556c0e0830f3108c277f6b220994f68e8caa83a0d65"
-  secret: "SECe65be9a58252b694eb98a525c64e667b277aa7e45d54d8633c5baa2386b0c4cf"
+  webhook_url: ”“
+  secret: ""
 
 schedule:
   time: "17:00"

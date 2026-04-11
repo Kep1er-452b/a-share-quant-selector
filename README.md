@@ -10,7 +10,7 @@
 
 # A-Share Quant Selector
 
-基于 Python + akshare 的A股量化选股系统，实现碗口反弹策略，支持K线图可视化、Web管理界面和钉钉自动通知。
+基于 Python 的 A 股量化选股系统，支持 `akshare` / `tushare` 双数据源，实现碗口反弹策略，支持 K 线图可视化、Web 管理界面和钉钉自动通知。
 
 ## 📋 TODO 清单
 
@@ -42,21 +42,51 @@ cd a-share-quant-selector
 # 2. 安装依赖
 pip3 install -r requirements.txt
 
-# 3. 配置钉钉通知（可选）
-# 编辑 config/config.yaml 填写 webhook 和 secret
+# 3. 配置本地参数（可选）
+# cp config/config.yaml.template config/config.yaml
 
-# 4. 首次全量抓取数据
+# 4. 如需使用 tushare，推荐设置环境变量
+export TUSHARE_TOKEN="你的_tushare_token"
+
+# 5. 首次全量抓取数据
+# 交互式终端会先询问使用 akshare 还是 tushare
 python3 main.py init
 
-# 5. 执行选股（自动更新数据、选股、发送钉钉）
+# 6. 按板块同步股票池
+python3 main.py init --board main
+python3 main.py init --board chinext
+python3 main.py init --board star
+
+# 7. 执行选股（自动更新数据、选股、默认跳过钉钉）
 python3 main.py run
 
-# 6. 快速测试（只处理前500只股票）
-python3 main.py run --max-stocks 500
+# 8. 按指定策略直接筛选已有数据
+python3 main.py select --provider tushare --strategy B1V242BStrategy
 
-# 7. 启动Web界面
+# 9. 也可以直接指定数据源
+python3 main.py run --provider tushare
+
+# 10. 按板块运行，并在板块内只取前500只
+python3 main.py run --board main --max-stocks 500
+
+# 11. 数据过期时也可强制筛选
+python3 main.py select --strategy BowlReboundStrategy --force-select
+
+# 12. 启动Web界面（默认 http://127.0.0.1:5080）
 python3 main.py web
 ```
+
+默认情况下，选股会使用“并行批处理”模式，一次读取单只股票数据后复用给多个策略，适合 32G 内存机器跑几千只股票。若你想切回更保守的顺序模式，可在 `config/config.yaml` 中加入：
+
+```yaml
+selection:
+  mode: parallel
+  max_workers: 16
+```
+
+将 `mode` 改为 `sequential` 即可关闭并行。
+
+抓取和选股过程中，终端现在会显示百分比进度条与“已耗时”，方便你观察当前跑到哪一步。
 
 ## 📊 策略说明
 
@@ -148,7 +178,7 @@ EMA(EMA(CLOSE, 10), 10)
 ## 🛠️ 技术栈
 
 - **Python 3.8+** - 核心语言
-- **akshare** - A股实时/历史数据获取
+- **akshare / tushare** - A股实时/历史数据获取
 - **pandas/numpy** - 数据处理与技术指标计算
 - **matplotlib** - K线图生成
 - **Flask** - Web管理界面
@@ -170,7 +200,9 @@ EMA(EMA(CLOSE, 10), 10)
 │   ├── pattern_matcher.py    # 相似度计算引擎
 │   └── pattern_feature_extractor.py # 特征提取模块
 ├── utils/               # 工具模块
-│   ├── akshare_fetcher.py  # 数据获取
+│   ├── akshare_fetcher.py  # akshare 数据获取
+│   ├── tushare_fetcher.py  # tushare 数据获取
+│   ├── data_provider.py    # 数据源工厂与公共工具
 │   ├── csv_manager.py      # CSV数据管理
 │   ├── technical.py        # 技术指标(KDJ/EMA/MA等)
 │   ├── kline_chart.py      # K线图生成（标准版）
@@ -192,12 +224,18 @@ EMA(EMA(CLOSE, 10), 10)
 
 | 命令 | 说明 |
 |------|------|
-| `python3 main.py init` | 首次全量抓取6年历史数据 |
-| `python3 main.py update` | 每日增量更新（收盘后执行） |
-| `python3 main.py run` | 完整流程：更新数据 → 选股 → 发送钉钉（含K线图） |
-| `python3 main.py run --max-stocks 500` | 快速测试模式，只处理前500只股票 |
+| `python3 main.py init` | 智能续抓全市场股票池（缺失补抓、过期补更新） |
+| `python3 main.py init --board main` | 同步主板股票池 |
+| `python3 main.py init --board chinext` | 同步创业板股票池 |
+| `python3 main.py init --board star` | 同步科创板股票池 |
+| `python3 main.py select --strategy B1V242BStrategy` | 只使用指定策略筛选本地数据 |
+| `python3 main.py select --strategy BowlReboundStrategy --force-select` | 即使本地数据不是最新，也强制使用现有数据筛选 |
+| `python3 main.py run` | 完整流程：更新数据 → 选股 → 通知（默认跳过钉钉） |
+| `python3 main.py run --provider tushare` | 使用 `tushare` 数据源执行完整流程 |
+| `python3 main.py run --board main --max-stocks 500` | 先筛主板，再处理前500只股票 |
+| `python3 main.py run --strategy B1V242BStrategy` | 先更新，再只执行指定策略 |
 | `python3 main.py run --category bowl_center` | 只筛选回落碗中的股票 |
-| `python3 main.py web` | 启动Web界面 (默认端口5000) |
+| `python3 main.py web` | 启动Web界面（默认 `127.0.0.1:5080`，端口冲突时自动顺延） |
 | `python3 main.py --version` | 显示版本信息 |
 
 ### B1完美图形匹配命令
@@ -233,6 +271,61 @@ EMA(EMA(CLOSE, 10), 10)
 4. **否则** - 执行增量更新
 
 ## ⚙️ 策略配置
+
+### 数据源配置
+
+交互式终端运行 `python3 main.py init/run/web` 时，会先询问使用 `akshare` 还是 `tushare`。
+
+交互式终端运行 `python3 main.py run/select` 时，如未指定 `--strategy`，系统也会提示你选择：
+
+- `all`：执行全部策略
+- `BowlReboundStrategy`
+- `B1V242BStrategy`
+
+系统支持板块股票池参数：
+
+- `--board all`：全市场
+- `--board main`：主板
+- `--board chinext`：创业板
+- `--board star`：科创板
+
+若同时传入 `--board` 和 `--max-stocks`，系统会先按板块过滤，再截取前 `N` 只股票。
+
+`init` 和 `run` 默认使用智能续抓：
+
+- 本地没有 CSV：全量抓取历史数据
+- 本地 CSV 已是最新交易日：跳过
+- 本地 CSV 过期：优先增量补齐
+- 本地文件损坏或历史过短：自动回退到全量重抓
+
+`select` 命令不会默认抓取数据：
+
+- 如果目标股票池本地数据已是最新，直接筛选
+- 如果本地数据过期，终端会提示你是否先抓取/补齐再筛选
+- 如需跳过提醒，使用 `--force-select`
+
+若选择 `tushare`，Token 读取顺序如下：
+
+1. 环境变量 `TUSHARE_TOKEN`
+2. `config/config.yaml` 中的 `data_source.tushare.token`
+3. 终端即时输入
+
+配置模板示例：
+
+```yaml
+data_source:
+  default_provider: "akshare"
+  tushare:
+    token: ""
+
+dingtalk:
+  enabled: false
+
+web:
+  host: "127.0.0.1"
+  port: 5080
+  auto_port: true
+```
 
 编辑 `config/strategy_params.yaml` 调整参数：
 
@@ -363,7 +456,9 @@ K线图包含：
 
 ## 🌐 Web界面
 
-访问 `http://localhost:5000` 可查看：
+默认访问 `http://127.0.0.1:5080` 可查看：
+
+- 如果 `5080` 已被占用，系统会自动切换到下一个可用端口，并在终端打印实际访问地址
 
 - 📊 **系统概览** - 股票数量、最新数据日期
 - 📈 **股票列表** - 所有股票基本信息，支持搜索

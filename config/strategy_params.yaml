@@ -56,6 +56,19 @@ BowlReboundStrategy:
   short_pct: 1
 
 # ============================================
+# B1 (V2.42B) 策略
+# ============================================
+B1V242BStrategy:
+  J_MAX: 13
+  MV_MIN_BILLION: 50
+  YANGYIN_RATIO_57: 1.25
+  YANGYIN_RATIO_14: 2.25
+  PLRY_VOL_RATIO: 1.95
+  HALF_DOWN_VOL_RATIO: 0.5
+  TOP_RANGE_RATIO: 0.95
+  B1_TREND_TOLERANCE: 0.985
+
+# ============================================
 # B1完美图形匹配 (B1PatternMatch)
 # ============================================
 # 功能说明：

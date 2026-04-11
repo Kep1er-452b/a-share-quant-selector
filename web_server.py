@@ -4,9 +4,11 @@ Web 服务器 - A股量化选股系统前端
 from flask import Flask, render_template, jsonify, request, send_from_directory
 import json
 import sys
+import socket
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
+import yaml
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
@@ -25,6 +27,49 @@ registry = get_registry("config/strategy_params.yaml")
 
 # 加载策略
 registry.auto_register_from_directory("strategy")
+
+
+def _load_config(config_path="config/config.yaml"):
+    config_file = Path(config_path)
+    if config_file.exists():
+        with open(config_file, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _config_value(config, *keys, default=None):
+    current = config or {}
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _is_port_available(host, port):
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex((probe_host, port)) != 0
+
+
+def _resolve_web_address(host=None, port=None, auto_port=None, config=None):
+    resolved_host = host or _config_value(config, "web", "host", default="127.0.0.1")
+    resolved_port = port or _config_value(config, "web", "port", default=5080)
+    use_auto_port = auto_port if auto_port is not None else _config_value(config, "web", "auto_port", default=True)
+
+    if _is_port_available(resolved_host, resolved_port):
+        return resolved_host, resolved_port
+
+    if not use_auto_port:
+        raise OSError(f"端口 {resolved_port} 已被占用")
+
+    for candidate in range(resolved_port + 1, resolved_port + 51):
+        if _is_port_available(resolved_host, candidate):
+            print(f"⚠️ 端口 {resolved_port} 已被占用，自动切换到 {candidate}")
+            return resolved_host, candidate
+
+    raise OSError(f"未找到可用端口，请手动指定 --port")
 
 
 @app.route('/')
@@ -232,11 +277,14 @@ def update_config():
         return jsonify({'success': False, 'error': str(e)})
 
 
-def run_web_server(host='0.0.0.0', port=5000, debug=False):
+def run_web_server(host=None, port=None, debug=False, config=None, auto_port=None):
     """启动Web服务器"""
-    print(f"🌐 启动Web服务器: http://{host}:{port}")
+    config = config or _load_config()
+    host, port = _resolve_web_address(host=host, port=port, auto_port=auto_port, config=config)
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    print(f"🌐 启动Web服务器: http://{display_host}:{port}")
     app.run(host=host, port=port, debug=debug)
 
 
 if __name__ == '__main__':
-    run_web_server(debug=True)
+    run_web_server(debug=True, config=_load_config())
