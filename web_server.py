@@ -1,13 +1,13 @@
 """
 Web 服务器 - A股量化选股系统前端
 """
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request
 import json
 import sys
 import socket
+from threading import Event
 from pathlib import Path
 from datetime import datetime
-import pandas as pd
 import yaml
 
 # 添加项目根目录到路径
@@ -15,7 +15,9 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
-from strategy.strategy_registry import get_registry
+from utils.data_provider import BOARD_LABELS
+import strategy.strategy_registry as strategy_registry_module
+from strategy.strategy_registry import StrategyRegistry
 
 app = Flask(__name__, 
             template_folder='web/templates',
@@ -23,10 +25,19 @@ app = Flask(__name__,
 
 # 全局实例
 csv_manager = CSVManager("data")
-registry = get_registry("config/strategy_params.yaml")
+halt_event = Event()
 
-# 加载策略
-registry.auto_register_from_directory("strategy")
+
+def _reload_registry():
+    """重新加载策略注册器，确保参数变更立即生效。"""
+    global registry
+    registry = StrategyRegistry("config/strategy_params.yaml")
+    registry.auto_register_from_directory("strategy")
+    strategy_registry_module._registry = registry
+    return registry
+
+
+registry = _reload_registry()
 
 
 def _load_config(config_path="config/config.yaml"):
@@ -72,6 +83,81 @@ def _resolve_web_address(host=None, port=None, auto_port=None, config=None):
     raise OSError(f"未找到可用端口，请手动指定 --port")
 
 
+def _is_halted():
+    return halt_event.is_set()
+
+
+def _halted_response():
+    return jsonify({
+        'success': False,
+        'halted': True,
+        'error': '系统已急停，重启服务器后方可恢复'
+    }), 503
+
+
+def _classify_board(stock_code):
+    code = str(stock_code or "").strip()
+    if code.startswith(("688", "689")):
+        return "star"
+    if code.startswith(("300", "301")):
+        return "chinext"
+    return "main"
+
+
+def _normalize_csv_value(raw_value):
+    value = str(raw_value or "").strip().lower()
+    return value
+
+
+def _parse_requested_boards(raw_value):
+    allowed = set(BOARD_LABELS.keys()) - {"all"}
+    values = [_normalize_csv_value(item) for item in str(raw_value or "").split(",")]
+    selected = [item for item in values if item in allowed]
+    return selected or ["main", "chinext", "star"]
+
+
+def _parse_requested_strategies(raw_value):
+    available = registry.list_strategies()
+    if not raw_value:
+        return available
+
+    requested = []
+    for item in str(raw_value).split(","):
+        strategy_name = item.strip()
+        if strategy_name and strategy_name in registry.strategies:
+            requested.append(strategy_name)
+
+    return requested or available
+
+
+def _load_stock_names():
+    names_file = Path("data/stock_names.json")
+    if not names_file.exists():
+        return {}
+
+    with open(names_file, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _build_board_counts(stock_codes):
+    counts = {"main": 0, "chinext": 0, "star": 0}
+    for code in stock_codes:
+        counts[_classify_board(code)] += 1
+    return counts
+
+
+@app.before_request
+def block_requests_after_halt():
+    allowed_endpoints = {'index', 'static', 'get_system_status', 'emergency_stop'}
+    if request.endpoint in allowed_endpoints:
+        return None
+
+    if _is_halted() and request.path.startswith('/api/'):
+        return _halted_response()
+
+    return None
+
+
 @app.route('/')
 def index():
     """主页"""
@@ -83,13 +169,11 @@ def get_stocks():
     """获取股票列表"""
     try:
         stocks = csv_manager.list_all_stocks()
-        
-        # 加载股票名称
-        names_file = Path("data/stock_names.json")
-        stock_names = {}
-        if names_file.exists():
-            with open(names_file, 'r', encoding='utf-8') as f:
-                stock_names = json.load(f)
+        stock_names = _load_stock_names()
+
+        requested_board = _normalize_csv_value(request.args.get('board'))
+        if requested_board in {"main", "chinext", "star"}:
+            stocks = [code for code in stocks if _classify_board(code) == requested_board]
         
         # 获取每只股票的基本信息 - 支持分页
         page = int(request.args.get('page', 1))
@@ -107,6 +191,7 @@ def get_stocks():
                 stock_list.append({
                     'code': code,
                     'name': stock_names.get(code, '未知'),
+                    'board': _classify_board(code),
                     'latest_price': round(latest['close'], 2),
                     'latest_date': latest['date'].strftime('%Y-%m-%d'),
                     'market_cap': round(latest.get('market_cap', 0) / 1e8, 2),  # 总市值，单位：亿
@@ -164,27 +249,39 @@ def get_stock_detail(code):
 def run_selection():
     """执行选股"""
     try:
-        stock_codes = csv_manager.list_all_stocks()
-        
-        # 加载股票名称
-        names_file = Path("data/stock_names.json")
-        stock_names = {}
-        if names_file.exists():
-            with open(names_file, 'r', encoding='utf-8') as f:
-                stock_names = json.load(f)
+        requested_boards = _parse_requested_boards(request.args.get('boards'))
+        requested_strategies = _parse_requested_strategies(request.args.get('strategies'))
+
+        stock_codes = [
+            code for code in csv_manager.list_all_stocks()
+            if _classify_board(code) in requested_boards
+        ]
+        stock_names = _load_stock_names()
         
         # 构建数据字典
         stock_data = {}
         for code in stock_codes:
+            if _is_halted():
+                return _halted_response()
             df = csv_manager.read_stock(code)
             if not df.empty and len(df) >= 60:
                 stock_data[code] = (stock_names.get(code, '未知'), df)
         
         # 执行选股
         results = {}
-        for strategy_name, strategy in registry.strategies.items():
+        for strategy_name in requested_strategies:
+            if _is_halted():
+                return _halted_response()
+
+            strategy = registry.get_strategy(strategy_name)
+            if strategy is None:
+                continue
+
             signals = []
             for code, (name, df) in stock_data.items():
+                if _is_halted():
+                    return _halted_response()
+
                 result = strategy.analyze_stock(code, name, df)
                 if result:
                     signals.append({
@@ -194,7 +291,49 @@ def run_selection():
                     })
             results[strategy_name] = signals
         
-        return jsonify({'success': True, 'data': results, 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+        return jsonify({
+            'success': True,
+            'data': results,
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'meta': {
+                'boards': requested_boards,
+                'strategies': requested_strategies,
+                'stock_pool_size': len(stock_data),
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/selection/options')
+def get_selection_options():
+    """获取选股页需要的板块和策略选项。"""
+    try:
+        stock_codes = csv_manager.list_all_stocks()
+        board_counts = _build_board_counts(stock_codes)
+        boards = [
+            {
+                'key': board_key,
+                'label': BOARD_LABELS[board_key],
+                'count': board_counts.get(board_key, 0),
+            }
+            for board_key in ['main', 'chinext', 'star']
+        ]
+
+        strategies = []
+        for strategy_name, strategy in registry.strategies.items():
+            strategies.append({
+                'name': strategy_name,
+                'param_count': len(strategy.params or {}),
+            })
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'boards': boards,
+                'strategies': strategies,
+            }
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -219,6 +358,7 @@ def get_stats():
     """获取系统统计信息"""
     try:
         stocks = csv_manager.list_all_stocks()
+        board_counts = _build_board_counts(stocks)
         
         # 计算数据日期范围
         dates = []
@@ -234,7 +374,9 @@ def get_stats():
             'data': {
                 'total_stocks': len(stocks),
                 'latest_date': latest_date,
-                'strategies': len(registry.strategies)
+                'strategies': len(registry.strategies),
+                'board_counts': board_counts,
+                'halted': _is_halted(),
             }
         })
     except Exception as e:
@@ -260,7 +402,6 @@ def get_config():
 def update_config():
     """更新配置"""
     try:
-        import yaml
         new_config = request.json
         
         config_file = Path("config/strategy_params.yaml")
@@ -268,13 +409,33 @@ def update_config():
             yaml.dump(new_config, f, allow_unicode=True)
         
         # 重新加载策略
-        global registry
-        registry = get_registry("config/strategy_params.yaml")
-        registry.auto_register_from_directory("strategy")
+        _reload_registry()
         
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/system_status')
+def get_system_status():
+    """获取当前系统状态。"""
+    return jsonify({
+        'success': True,
+        'halted': _is_halted(),
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    })
+
+
+@app.route('/api/emergency_stop', methods=['POST'])
+def emergency_stop():
+    """触发全局急停。急停后仅允许查询状态，需重启服务恢复。"""
+    halt_event.set()
+    return jsonify({
+        'success': True,
+        'halted': True,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'message': '系统已急停，重启服务器后方可恢复'
+    })
 
 
 def run_web_server(host=None, port=None, debug=False, config=None, auto_port=None):
@@ -283,7 +444,7 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
     host, port = _resolve_web_address(host=host, port=port, auto_port=auto_port, config=config)
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"🌐 启动Web服务器: http://{display_host}:{port}")
-    app.run(host=host, port=port, debug=debug)
+    app.run(host=host, port=port, debug=debug, threaded=True)
 
 
 if __name__ == '__main__':
