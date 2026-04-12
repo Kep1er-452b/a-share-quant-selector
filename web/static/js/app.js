@@ -1,463 +1,1157 @@
-/**
- * A股量化选股系统 - 前端逻辑
- */
+'use strict';
 
-// 全局状态
-let currentPage = 'dashboard';
-let chartInstance = null;
+const PAGE_TITLES = {
+    dashboard: '系统概览',
+    stocks: '股票列表',
+    selection: '执行选股',
+    strategies: '策略配置',
+};
 
-// 页面切换
-document.querySelectorAll('.nav-item').forEach(item => {
-    item.addEventListener('click', () => {
-        const page = item.dataset.page;
-        switchPage(page);
-    });
-});
+const BOARD_LABELS = {
+    main: '主板',
+    chinext: '创业板',
+    star: '科创板',
+};
+
+const state = {
+    currentPage: 'dashboard',
+    chartInstance: null,
+    allStocksCache: [],
+    strategies: [],
+    boardOptions: [],
+    boardCounts: {},
+    selectionOptionsLoaded: false,
+    systemHalted: false,
+    status: 'ready',
+    toastTimer: null,
+    activeControllers: new Set(),
+};
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function formatNumber(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    return numeric.toLocaleString('zh-CN');
+}
+
+function formatDateTime(value) {
+    if (!value) {
+        return '--';
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return String(value);
+    }
+
+    return new Intl.DateTimeFormat('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    }).format(date);
+}
+
+function toast(message, type = 'info', duration = 2600) {
+    const el = document.getElementById('toast');
+    if (!el) {
+        return;
+    }
+
+    window.clearTimeout(state.toastTimer);
+    el.textContent = message;
+    el.className = `toast ${type} show`;
+    state.toastTimer = window.setTimeout(() => {
+        el.className = 'toast';
+    }, duration);
+}
+
+function setStatus(mode) {
+    state.status = mode;
+    const dot = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    const sidebar = document.getElementById('sidebar-status-text');
+    const hero = document.getElementById('hero-session-state');
+    const stat = document.getElementById('stat-session');
+    const map = {
+        ready: 'READY',
+        running: 'RUNNING',
+        halted: 'HALTED',
+        error: 'ERROR',
+    };
+    const label = map[mode] || map.ready;
+
+    if (dot) {
+        dot.className = `status-dot ${mode}`;
+    }
+    if (text) {
+        text.textContent = label;
+    }
+    if (sidebar) {
+        sidebar.textContent = label;
+    }
+    if (hero) {
+        hero.textContent = label;
+    }
+    if (stat) {
+        stat.textContent = label;
+    }
+}
+
+function classifyBoard(code) {
+    const stockCode = String(code || '').trim();
+    if (stockCode.startsWith('688') || stockCode.startsWith('689')) {
+        return 'star';
+    }
+    if (stockCode.startsWith('300') || stockCode.startsWith('301')) {
+        return 'chinext';
+    }
+    return 'main';
+}
+
+function boardBadge(boardOrCode) {
+    const board = BOARD_LABELS[boardOrCode] ? boardOrCode : classifyBoard(boardOrCode);
+    return `<span class="board-badge ${board}">${BOARD_LABELS[board] || board}</span>`;
+}
+
+function abortActiveRequests() {
+    state.activeControllers.forEach(controller => controller.abort());
+    state.activeControllers.clear();
+}
+
+async function apiFetch(url, fetchOptions = {}, config = {}) {
+    const { allowWhenHalted = false, interpretHalt = true } = config;
+
+    if (state.systemHalted && !allowWhenHalted) {
+        throw new Error('系统已急停，当前操作不可执行');
+    }
+
+    const controller = new AbortController();
+    state.activeControllers.add(controller);
+
+    try {
+        const response = await fetch(url, {
+            ...fetchOptions,
+            signal: controller.signal,
+        });
+
+        const contentType = response.headers.get('content-type') || '';
+        const data = contentType.includes('application/json')
+            ? await response.json()
+            : await response.text();
+
+        if (interpretHalt && data && typeof data === 'object' && data.halted) {
+            applyHaltState(data.error || '系统已急停，重启服务器后方可恢复');
+            throw new Error(data.error || '系统已急停');
+        }
+
+        if (!response.ok) {
+            const message = data && typeof data === 'object'
+                ? (data.error || data.message || `请求失败 (${response.status})`)
+                : `请求失败 (${response.status})`;
+            throw new Error(message);
+        }
+
+        return data;
+    } finally {
+        state.activeControllers.delete(controller);
+    }
+}
 
 function switchPage(page) {
-    currentPage = page;
-    
-    // 更新导航
+    if (state.systemHalted) {
+        return;
+    }
+
+    state.currentPage = page;
+
     document.querySelectorAll('.nav-item').forEach(item => {
         item.classList.toggle('active', item.dataset.page === page);
     });
-    
-    // 更新页面标题
-    const titles = {
-        'dashboard': '系统概览',
-        'stocks': '股票列表',
-        'selection': '选股结果',
-        'strategies': '策略配置'
-    };
-    document.getElementById('page-title').textContent = titles[page];
-    
-    // 显示对应页面
-    document.querySelectorAll('.page').forEach(p => {
-        p.classList.toggle('active', p.id === page + '-page');
+
+    document.querySelectorAll('.page').forEach(pageEl => {
+        pageEl.classList.toggle('active', pageEl.id === `${page}-page`);
     });
-    
-    // 加载页面数据
+
+    document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
+
     if (page === 'dashboard') {
         loadStats();
-    } else if (page === 'stocks') {
+    }
+    if (page === 'stocks') {
         loadStocks();
-    } else if (page === 'strategies') {
+    }
+    if (page === 'selection') {
+        loadSelectionOptions();
+    }
+    if (page === 'strategies') {
         loadStrategies();
     }
 }
 
-// 加载统计信息
 async function loadStats() {
-    try {
-        const response = await fetch('/api/stats');
-        const result = await response.json();
-        
-        if (result.success) {
-            document.getElementById('stat-stocks').textContent = result.data.total_stocks;
-            document.getElementById('stat-date').textContent = result.data.latest_date;
-            document.getElementById('stat-strategies').textContent = result.data.strategies;
-        }
-    } catch (error) {
-        console.error('加载统计信息失败:', error);
-    }
-}
-
-// 加载股票列表 - 支持分页获取所有股票
-async function loadStocks() {
-    const tbody = document.getElementById('stocks-tbody');
-    tbody.innerHTML = '<tr><td colspan="7" class="loading">正在加载股票列表...</td></tr>';
-    
-    try {
-        let allStocks = [];
-        let page = 1;
-        let totalPages = 1;
-        
-        // 分页获取所有股票
-        do {
-            const response = await fetch(`/api/stocks?page=${page}&per_page=500`);
-            const result = await response.json();
-            
-            if (result.success) {
-                allStocks = allStocks.concat(result.data);
-                totalPages = result.total_pages;
-                tbody.innerHTML = `<tr><td colspan="7" class="loading">已加载 ${allStocks.length} / ${result.total} 只股票...</td></tr>`;
-                page++;
-            } else {
-                break;
-            }
-        } while (page <= totalPages);
-        
-        renderStocks(allStocks);
-    } catch (error) {
-        tbody.innerHTML = `<tr><td colspan="7" class="loading">加载失败: ${error.message}</td></tr>`;
-    }
-}
-
-// 渲染股票列表
-function renderStocks(stocks) {
-    const tbody = document.getElementById('stocks-tbody');
-    
-    if (stocks.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="loading">暂无数据</td></tr>';
+    if (state.systemHalted) {
         return;
     }
-    
-    tbody.innerHTML = stocks.map(stock => `
-        <tr>
-            <td><strong>${stock.code}</strong></td>
-            <td>${stock.name}</td>
-            <td>¥${stock.latest_price}</td>
-            <td>${stock.latest_date}</td>
-            <td>${stock.market_cap}</td>
-            <td>${stock.data_count}</td>
-            <td>
-                <button class="btn btn-secondary" onclick="viewStockDetail('${stock.code}')">
-                    查看
-                </button>
-            </td>
-        </tr>
-    `).join('');
-    
-    // 搜索功能
-    document.getElementById('stock-search').addEventListener('input', (e) => {
-        const keyword = e.target.value.toLowerCase();
-        const rows = tbody.querySelectorAll('tr');
-        rows.forEach(row => {
-            const text = row.textContent.toLowerCase();
-            row.style.display = text.includes(keyword) ? '' : 'none';
-        });
-    });
-}
 
-// 查看股票详情
-async function viewStockDetail(code) {
     try {
-        const response = await fetch(`/api/stock/${code}`);
-        const result = await response.json();
-        
-        if (result.success) {
-            showStockModal(code, result.data);
-        } else {
-            alert('加载股票详情失败: ' + result.error);
+        const result = await apiFetch('/api/stats');
+        if (!result.success) {
+            return;
+        }
+
+        const data = result.data;
+        const boardCounts = data.board_counts || {};
+
+        document.getElementById('stat-stocks').textContent = formatNumber(data.total_stocks);
+        document.getElementById('stat-date').textContent = escapeHtml(data.latest_date || '--');
+        document.getElementById('stat-strategies').textContent = formatNumber(data.strategies);
+        document.getElementById('hero-strategy-count').textContent = formatNumber(data.strategies);
+        document.getElementById('hero-latest-date').textContent = escapeHtml(data.latest_date || '--');
+        document.getElementById('stocks-total-label').textContent = `当前本地股票池 ${formatNumber(data.total_stocks)} 只`;
+
+        document.getElementById('board-count-main').textContent = formatNumber(boardCounts.main || 0);
+        document.getElementById('board-count-chinext').textContent = formatNumber(boardCounts.chinext || 0);
+        document.getElementById('board-count-star').textContent = formatNumber(boardCounts.star || 0);
+
+        document.getElementById('hero-universe').textContent = 'ALL BOARDS';
+        document.getElementById('sidebar-universe-text').textContent = 'ALL BOARDS';
+        if (data.halted) {
+            setStatus('halted');
+        } else if (state.status !== 'running') {
+            setStatus('ready');
         }
     } catch (error) {
-        alert('加载股票详情失败: ' + error.message);
+        console.error('loadStats failed:', error);
     }
 }
 
-// 显示股票详情弹窗
-function showStockModal(code, data) {
-    const modal = document.getElementById('stock-modal');
-    document.getElementById('modal-title').textContent = `股票详情: ${code}`;
-    
-    // 准备图表数据（数据是最新的在前，图表需要最早的在前）
-    const reversedData = [...data].reverse();
-    const labels = reversedData.map(d => d.date);
-    const prices = reversedData.map(d => d.close);
-    const kValues = reversedData.map(d => d.K);
-    const dValues = reversedData.map(d => d.D);
-    const jValues = reversedData.map(d => d.J);
-    
-    // 绘制K线图和KDJ指标
-    const ctx = document.getElementById('stock-chart').getContext('2d');
-    
-    if (chartInstance) {
-        chartInstance.destroy();
+async function loadStocks() {
+    if (state.systemHalted) {
+        return;
     }
-    
-    chartInstance = new Chart(ctx, {
+
+    const tbody = document.getElementById('stocks-tbody');
+    tbody.innerHTML = '<tr><td colspan="8" class="state-loading">正在载入股票列表...</td></tr>';
+
+    try {
+        let page = 1;
+        let totalPages = 1;
+        let allStocks = [];
+
+        do {
+            const result = await apiFetch(`/api/stocks?page=${page}&per_page=500`);
+            if (!result.success) {
+                throw new Error(result.error || '股票列表加载失败');
+            }
+
+            allStocks = allStocks.concat(result.data);
+            totalPages = result.total_pages;
+            tbody.innerHTML = `<tr><td colspan="8" class="state-loading">已加载 ${formatNumber(allStocks.length)} / ${formatNumber(result.total)} 只股票...</td></tr>`;
+            page += 1;
+        } while (page <= totalPages);
+
+        state.allStocksCache = allStocks;
+        renderStocks(allStocks);
+    } catch (error) {
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        tbody.innerHTML = `<tr><td colspan="8" class="state-empty">加载失败: ${escapeHtml(error.message)}</td></tr>`;
+    }
+}
+
+function renderStocks(stocks) {
+    const tbody = document.getElementById('stocks-tbody');
+
+    if (!stocks.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="state-empty">没有匹配的股票</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = stocks.map(stock => {
+        const board = stock.board || classifyBoard(stock.code);
+        return `
+            <tr>
+                <td class="code-cell">${escapeHtml(stock.code)}</td>
+                <td>${escapeHtml(stock.name || '未知')}</td>
+                <td>${boardBadge(board)}</td>
+                <td class="mono">${escapeHtml(stock.latest_price)}</td>
+                <td class="mono">${escapeHtml(stock.latest_date)}</td>
+                <td class="mono">${escapeHtml(stock.market_cap)}</td>
+                <td class="mono">${escapeHtml(stock.data_count)}</td>
+                <td>
+                    <button class="btn btn-ghost view-detail-btn" type="button"
+                        data-code="${escapeHtml(stock.code)}"
+                        data-name="${escapeHtml(stock.name || '')}">
+                        详情
+                    </button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+async function viewStockDetail(code, name) {
+    if (state.systemHalted) {
+        return;
+    }
+
+    document.getElementById('modal-title').textContent = `${code} ${name || ''}`.trim();
+    document.getElementById('stock-info').innerHTML = '<div class="state-loading">加载个股详情...</div>';
+    document.getElementById('stock-modal').classList.add('active');
+
+    try {
+        const result = await apiFetch(`/api/stock/${code}`);
+        if (!result.success) {
+            throw new Error(result.error || '个股详情加载失败');
+        }
+        renderStockChart(result.data || []);
+    } catch (error) {
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        document.getElementById('stock-info').innerHTML = `<div class="state-empty">加载失败: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
+function renderStockChart(data) {
+    if (!data.length) {
+        document.getElementById('stock-info').innerHTML = '<div class="state-empty">暂无图表数据</div>';
+        return;
+    }
+
+    const reversed = [...data].reverse();
+    const labels = reversed.map(item => item.date);
+    const prices = reversed.map(item => item.close);
+    const kValues = reversed.map(item => item.K);
+    const dValues = reversed.map(item => item.D);
+    const jValues = reversed.map(item => item.J);
+
+    const canvas = document.getElementById('stock-chart');
+    const ctx = canvas.getContext('2d');
+
+    if (state.chartInstance) {
+        state.chartInstance.destroy();
+    }
+
+    Chart.defaults.color = '#7d8c9a';
+
+    state.chartInstance = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: labels,
+            labels,
             datasets: [
                 {
                     label: '收盘价',
                     data: prices,
-                    borderColor: '#2563eb',
-                    backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                    borderColor: '#f59f0b',
+                    backgroundColor: 'rgba(245, 159, 11, 0.08)',
                     fill: true,
-                    tension: 0.1,
-                    yAxisID: 'y'
+                    tension: 0.12,
+                    pointRadius: 0,
+                    borderWidth: 1.6,
+                    yAxisID: 'yPrice',
                 },
                 {
                     label: 'K',
                     data: kValues,
-                    borderColor: '#f59e0b',
-                    backgroundColor: 'transparent',
-                    borderWidth: 1,
+                    borderColor: '#4ba3ff',
                     pointRadius: 0,
-                    yAxisID: 'y1'
+                    borderWidth: 1.1,
+                    tension: 0.12,
+                    yAxisID: 'yKDJ',
                 },
                 {
                     label: 'D',
                     data: dValues,
-                    borderColor: '#10b981',
-                    backgroundColor: 'transparent',
-                    borderWidth: 1,
+                    borderColor: '#23c483',
                     pointRadius: 0,
-                    yAxisID: 'y1'
+                    borderWidth: 1.1,
+                    tension: 0.12,
+                    yAxisID: 'yKDJ',
                 },
                 {
                     label: 'J',
                     data: jValues,
-                    borderColor: '#ef4444',
-                    backgroundColor: 'transparent',
-                    borderWidth: 1,
+                    borderColor: '#ff5c5c',
                     pointRadius: 0,
-                    yAxisID: 'y1'
-                }
-            ]
+                    borderWidth: 1.1,
+                    tension: 0.12,
+                    yAxisID: 'yKDJ',
+                },
+            ],
         },
         options: {
             responsive: true,
+            maintainAspectRatio: true,
+            animation: false,
             interaction: {
                 mode: 'index',
-                intersect: false
+                intersect: false,
             },
             plugins: {
                 legend: {
-                    display: true
-                }
+                    labels: {
+                        color: '#b2bfcc',
+                        font: {
+                            family: '"IBM Plex Mono", monospace',
+                            size: 11,
+                        },
+                    },
+                },
             },
             scales: {
-                y: {
-                    type: 'linear',
-                    display: true,
-                    position: 'left',
-                    title: {
-                        display: true,
-                        text: '价格'
-                    }
+                x: {
+                    ticks: {
+                        color: '#7d8c9a',
+                        maxTicksLimit: 10,
+                        font: {
+                            family: '"IBM Plex Mono", monospace',
+                            size: 10,
+                        },
+                    },
+                    grid: {
+                        color: 'rgba(255,255,255,0.06)',
+                    },
                 },
-                y1: {
+                yPrice: {
                     type: 'linear',
-                    display: true,
+                    position: 'left',
+                    ticks: {
+                        color: '#b2bfcc',
+                        font: {
+                            family: '"IBM Plex Mono", monospace',
+                            size: 10,
+                        },
+                    },
+                    grid: {
+                        color: 'rgba(255,255,255,0.06)',
+                    },
+                },
+                yKDJ: {
+                    type: 'linear',
                     position: 'right',
                     min: 0,
                     max: 100,
-                    title: {
-                        display: true,
-                        text: 'KDJ'
+                    ticks: {
+                        color: '#7d8c9a',
+                        stepSize: 20,
+                        font: {
+                            family: '"IBM Plex Mono", monospace',
+                            size: 10,
+                        },
                     },
                     grid: {
-                        drawOnChartArea: false
-                    }
-                }
-            }
-        }
+                        drawOnChartArea: false,
+                    },
+                },
+            },
+        },
     });
-    
-    // 显示最新信息
+
     const latest = data[0];
-    const jColor = latest.J > 80 ? '#ef4444' : (latest.J < 20 ? '#10b981' : '#666');
+    const jClass = Number(latest.J) > 80 ? 'down' : (Number(latest.J) < 20 ? 'up' : '');
+
     document.getElementById('stock-info').innerHTML = `
-        <div class="signal-details" style="margin-top: 16px;">
-            <span>最新价: <strong>¥${latest.close}</strong></span>
-            <span>最高: <strong>¥${latest.high}</strong></span>
-            <span>最低: <strong>¥${latest.low}</strong></span>
-            <span>成交量: <strong>${latest.volume}</strong></span>
-            <span>市值: <strong>${latest.market_cap}亿</strong></span>
-        </div>
-        <div class="signal-details" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e7eb;">
-            <span>K: <strong style="color: #f59e0b">${latest.K}</strong></span>
-            <span>D: <strong style="color: #10b981">${latest.D}</strong></span>
-            <span>J: <strong style="color: ${jColor}">${latest.J}</strong></span>
+        <div class="stock-kv">
+            <div class="kv-item">
+                <div class="kv-label">最新价</div>
+                <div class="kv-value">¥${escapeHtml(latest.close)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">最高</div>
+                <div class="kv-value">¥${escapeHtml(latest.high)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">最低</div>
+                <div class="kv-value">¥${escapeHtml(latest.low)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">成交量</div>
+                <div class="kv-value">${formatNumber(latest.volume)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">市值 (亿)</div>
+                <div class="kv-value">${escapeHtml(latest.market_cap)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">K</div>
+                <div class="kv-value">${escapeHtml(latest.K)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">D</div>
+                <div class="kv-value">${escapeHtml(latest.D)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">J</div>
+                <div class="kv-value ${jClass}">${escapeHtml(latest.J)}</div>
+            </div>
         </div>
     `;
-    
-    modal.classList.add('active');
 }
 
-// 关闭弹窗
 function closeModal() {
     document.getElementById('stock-modal').classList.remove('active');
 }
 
-// 执行选股
-async function runSelection() {
-    const btn = document.getElementById('run-selection-btn');
-    const indicator = document.getElementById('status-indicator');
-    
-    btn.disabled = true;
-    btn.innerHTML = '<span class="icon">⏳</span> 选股中...';
-    indicator.innerHTML = '<span class="dot yellow"></span> 运行中';
-    
-    // 切换到选股结果页
-    switchPage('selection');
-    document.getElementById('selection-results').innerHTML = '<p class="loading">正在执行选股策略...</p>';
-    
+function renderBoardOptions(boards) {
+    const container = document.getElementById('board-filter');
+    container.innerHTML = boards.map(board => `
+        <label class="board-option">
+            <input class="option-input" type="checkbox" name="board" value="${escapeHtml(board.key)}" checked>
+            <span class="board-option-card">
+                <span class="board-option-name">${escapeHtml(board.label)}</span>
+                <span class="board-option-meta">${formatNumber(board.count)} 只股票</span>
+            </span>
+        </label>
+    `).join('');
+}
+
+function renderStrategyOptions(strategies) {
+    const container = document.getElementById('strategy-filter');
+
+    if (!strategies.length) {
+        container.innerHTML = '<div class="state-empty">未检测到可用策略</div>';
+        return;
+    }
+
+    container.innerHTML = strategies.map(strategy => `
+        <label class="strategy-option">
+            <input class="option-input" type="checkbox" name="strategy" value="${escapeHtml(strategy.name)}" checked>
+            <span class="strategy-option-card">
+                <span class="strategy-option-name">${escapeHtml(strategy.name)}</span>
+                <span class="strategy-option-meta">${formatNumber(strategy.param_count)} 个参数</span>
+            </span>
+        </label>
+    `).join('');
+}
+
+async function loadSelectionOptions(forceReload = false) {
+    if (state.systemHalted) {
+        return;
+    }
+
+    if (state.selectionOptionsLoaded && !forceReload) {
+        updateSelectionSnapshot();
+        return;
+    }
+
     try {
-        const response = await fetch('/api/select');
-        const result = await response.json();
-        
-        if (result.success) {
-            renderSelectionResults(result.data, result.time);
-        } else {
-            document.getElementById('selection-results').innerHTML = 
-                `<p class="loading text-danger">选股失败: ${result.error}</p>`;
+        const result = await apiFetch('/api/selection/options');
+        if (!result.success) {
+            throw new Error(result.error || '选项加载失败');
         }
+
+        state.boardOptions = result.data.boards || [];
+        state.boardCounts = Object.fromEntries(state.boardOptions.map(item => [item.key, item.count]));
+        state.strategies = result.data.strategies || [];
+        state.selectionOptionsLoaded = true;
+
+        renderBoardOptions(state.boardOptions);
+        renderStrategyOptions(state.strategies);
+        updateSelectionSnapshot();
     } catch (error) {
-        document.getElementById('selection-results').innerHTML = 
-            `<p class="loading text-danger">选股失败: ${error.message}</p>`;
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = '<span class="icon">▶️</span> 执行选股';
-        indicator.innerHTML = '<span class="dot green"></span> 就绪';
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+
+        document.getElementById('board-filter').innerHTML = `<div class="state-empty">加载失败: ${escapeHtml(error.message)}</div>`;
+        document.getElementById('strategy-filter').innerHTML = `<div class="state-empty">加载失败: ${escapeHtml(error.message)}</div>`;
     }
 }
 
-// 渲染选股结果
-function renderSelectionResults(results, time) {
-    document.getElementById('selection-time').textContent = `选股时间: ${time}`;
-    
-    const container = document.getElementById('selection-results');
-    
-    let html = '';
+function getSelectedBoards() {
+    return Array.from(document.querySelectorAll('#board-filter input[name="board"]:checked'))
+        .map(input => input.value);
+}
+
+function getSelectedStrategies() {
+    return Array.from(document.querySelectorAll('#strategy-filter input[name="strategy"]:checked'))
+        .map(input => input.value);
+}
+
+function updateSelectionSnapshot() {
+    const selectedBoards = getSelectedBoards();
+    const selectedStrategies = getSelectedStrategies();
+
+    const stockPool = selectedBoards.reduce((sum, key) => sum + (state.boardCounts[key] || 0), 0);
+
+    document.getElementById('selected-boards-count').textContent = formatNumber(selectedBoards.length);
+    document.getElementById('selected-strategies-count').textContent = formatNumber(selectedStrategies.length);
+    document.getElementById('selection-stock-pool').textContent = formatNumber(stockPool);
+    document.getElementById('board-selection-meta').textContent = `${selectedBoards.length} / ${state.boardOptions.length || 0} 已选`;
+    document.getElementById('selection-execution-note').textContent = stockPool
+        ? `预计扫描 ${formatNumber(stockPool)} 只股票`
+        : '当前没有可执行股票池';
+
+    const boardText = selectedBoards.length === Object.keys(BOARD_LABELS).length
+        ? 'ALL BOARDS'
+        : selectedBoards.map(key => BOARD_LABELS[key]).join(' / ') || 'NONE';
+    document.getElementById('sidebar-universe-text').textContent = boardText;
+}
+
+function setRunButtonsLoading(isLoading) {
+    const buttons = [
+        document.getElementById('run-selection-btn'),
+        document.getElementById('execute-selection-btn'),
+    ];
+
+    buttons.forEach(button => {
+        if (!button) {
+            return;
+        }
+        button.disabled = isLoading;
+        button.innerHTML = isLoading
+            ? `
+                <svg viewBox="0 0 12 12" fill="currentColor">
+                    <rect x="2" y="2" width="3" height="8"></rect>
+                    <rect x="7" y="2" width="3" height="8"></rect>
+                </svg>
+                运行中
+            `
+            : `
+                <svg viewBox="0 0 12 12" fill="currentColor">
+                    <polygon points="2,1 10,6 2,11"></polygon>
+                </svg>
+                ${button.id === 'execute-selection-btn' ? '立即执行' : '执行选股'}
+            `;
+    });
+}
+
+function buildMetric(label, value, className = '') {
+    return `
+        <div class="metric">
+            <div class="metric-label">${escapeHtml(label)}</div>
+            <div class="metric-value ${className}">${escapeHtml(value)}</div>
+        </div>
+    `;
+}
+
+function buildSignalMetrics(signal) {
+    const metrics = [];
+    metrics.push(buildMetric('当前价', `¥${signal.close ?? '--'}`, 'highlight'));
+
+    const jValue = Number(signal.J);
+    const jClass = Number.isFinite(jValue) ? (jValue > 80 ? 'down' : (jValue < 20 ? 'up' : '')) : '';
+    metrics.push(buildMetric('J 值', signal.J ?? '--', jClass));
+    metrics.push(buildMetric('市值 (亿)', signal.market_cap ?? '--'));
+
+    if (signal.volume_ratio !== undefined) {
+        metrics.push(buildMetric('量比', `${signal.volume_ratio}x`));
+    } else if (signal.yangyin_ratio_57 !== undefined) {
+        metrics.push(buildMetric('57阳阴比', signal.yangyin_ratio_57));
+    } else if (signal.yangyin_ratio_14 !== undefined) {
+        metrics.push(buildMetric('14阳阴比', signal.yangyin_ratio_14));
+    }
+
+    if (signal.hm_short !== undefined && signal.hm_long !== undefined) {
+        metrics.push(buildMetric('短/长线', `${signal.hm_short} / ${signal.hm_long}`));
+    } else if (signal.wl !== undefined && signal.yl !== undefined) {
+        metrics.push(buildMetric('WL / YL', `${signal.wl} / ${signal.yl}`));
+    }
+
+    return metrics.join('');
+}
+
+function renderSelectionResults(results, time, meta = {}) {
+    const strategies = meta.strategies || Object.keys(results);
+    const selectedBoards = meta.boards || getSelectedBoards();
+    const selectedStrategies = meta.strategies || getSelectedStrategies();
+    const stockPoolSize = meta.stock_pool_size || 0;
+
     let totalCount = 0;
-    
-    for (const [strategyName, signals] of Object.entries(results)) {
-        totalCount += signals.length;
-        
+    strategies.forEach(name => {
+        totalCount += (results[name] || []).length;
+    });
+
+    document.getElementById('selection-results-headline').textContent = totalCount
+        ? `本次共命中 ${formatNumber(totalCount)} 条信号`
+        : '本次执行未筛出符合条件的股票';
+    document.getElementById('selection-results-meta').textContent = time || 'Run Complete';
+
+    let html = `
+        <div class="selection-summary">
+            <div class="selection-summary-strip">
+                <div>
+                    <div class="selection-summary-title">Selection Completed</div>
+                    <div class="selection-summary-sub">
+                        板块 ${escapeHtml(selectedBoards.map(key => BOARD_LABELS[key] || key).join(' / '))}
+                        · 策略 ${formatNumber(selectedStrategies.length)} 个
+                    </div>
+                </div>
+                <div class="selection-summary-time">${escapeHtml(time || '--')}</div>
+            </div>
+            <div class="selection-summary-grid">
+                <div class="selection-summary-card">
+                    <span class="label">Signals</span>
+                    <span class="value">${formatNumber(totalCount)}</span>
+                </div>
+                <div class="selection-summary-card">
+                    <span class="label">Strategies</span>
+                    <span class="value">${formatNumber(selectedStrategies.length)}</span>
+                </div>
+                <div class="selection-summary-card">
+                    <span class="label">Stock Pool</span>
+                    <span class="value">${formatNumber(stockPoolSize)}</span>
+                </div>
+                <div class="selection-summary-card">
+                    <span class="label">Boards</span>
+                    <span class="value">${formatNumber(selectedBoards.length)}</span>
+                </div>
+            </div>
+        </div>
+    `;
+
+    strategies.forEach(strategyName => {
+        const signals = results[strategyName] || [];
+
         html += `
-            <div class="selection-strategy">
-                <h4>${strategyName} (${signals.length}只)</h4>
+            <section class="strategy-result-card">
+                <div class="strategy-result-header">
+                    <span class="strategy-result-name">${escapeHtml(strategyName)}</span>
+                    <span class="strategy-result-count">${formatNumber(signals.length)} 只</span>
+                </div>
         `;
-        
-        if (signals.length === 0) {
-            html += '<p class="text-muted">暂无选股信号</p>';
+
+        if (!signals.length) {
+            html += '<div class="signal-empty">当前策略在本次筛选条件下没有命中信号。</div>';
         } else {
-            html += signals.map(signal => {
-                const s = signal.signals[0];
+            html += '<div class="signals-list">';
+            html += signals.map(item => {
+                const signal = Array.isArray(item.signals) ? (item.signals[0] || {}) : {};
+                const reasonTags = (signal.reasons || []).map(reason => `<span class="tag">${escapeHtml(reason)}</span>`).join('');
+
                 return `
-                    <div class="signal-card">
-                        <div class="signal-header">
-                            <span class="signal-title">${signal.code} ${signal.name}</span>
-                            <div class="signal-tags">
-                                ${s.reasons.map(r => `<span class="tag">${r}</span>`).join('')}
-                            </div>
+                    <div class="signal-row">
+                        <div class="signal-identity">
+                            <span class="signal-code">${escapeHtml(item.code)}</span>
+                            <span class="signal-name">
+                                ${escapeHtml(item.name || '未知')}
+                                ${boardBadge(item.code)}
+                            </span>
                         </div>
-                        <div class="signal-details">
-                            <span>当前价: <strong>¥${s.close}</strong></span>
-                            <span>J值: <strong>${s.J}</strong></span>
-                            <span>量比: <strong>${s.volume_ratio}x</strong></span>
-                            <span>市值: <strong>${s.market_cap}亿</strong></span>
+                        <div class="signal-metrics">
+                            ${buildSignalMetrics(signal)}
+                        </div>
+                        <div class="signal-side">
+                            <div class="signal-tags">${reasonTags || '<span class="tag">MATCH</span>'}</div>
+                            <button class="btn btn-ghost view-detail-btn" type="button"
+                                data-code="${escapeHtml(item.code)}"
+                                data-name="${escapeHtml(item.name || '')}">
+                                查看K线
+                            </button>
                         </div>
                     </div>
                 `;
             }).join('');
+            html += '</div>';
         }
-        
-        html += '</div>';
-    }
-    
-    html = `<p style="margin-bottom: 20px;"><strong>共选出 ${totalCount} 只股票</strong></p>` + html;
-    
-    container.innerHTML = html;
+
+        html += '</section>';
+    });
+
+    document.getElementById('selection-results').innerHTML = html;
 }
 
-// 加载策略配置
-async function loadStrategies() {
-    const container = document.getElementById('strategies-config');
-    container.innerHTML = '<p class="loading">加载中...</p>';
-    
+async function runSelection() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法继续执行', 'error');
+        return;
+    }
+
+    if (state.currentPage !== 'selection') {
+        switchPage('selection');
+    }
+
+    await loadSelectionOptions();
+
+    const boards = getSelectedBoards();
+    const strategies = getSelectedStrategies();
+
+    if (!boards.length) {
+        toast('请至少选择一个股票类型', 'error');
+        return;
+    }
+    if (!strategies.length) {
+        toast('请至少选择一个策略', 'error');
+        return;
+    }
+
+    setRunButtonsLoading(true);
+    setStatus('running');
+    document.getElementById('selection-results-headline').textContent = '正在执行选股，请稍候';
+    document.getElementById('selection-results-meta').textContent = 'Running';
+    document.getElementById('selection-results').innerHTML = '<div class="state-loading">正在按当前板块与策略组合执行筛选...</div>';
+
     try {
-        const response = await fetch('/api/config');
-        const result = await response.json();
-        
-        if (result.success) {
-            renderStrategiesConfig(result.data);
-        } else {
-            container.innerHTML = `<p class="loading">加载失败: ${result.error}</p>`;
+        const params = new URLSearchParams({
+            boards: boards.join(','),
+            strategies: strategies.join(','),
+        });
+
+        const result = await apiFetch(`/api/select?${params.toString()}`);
+        if (!result.success) {
+            throw new Error(result.error || '执行失败');
         }
+
+        renderSelectionResults(result.data || {}, result.time, result.meta || {});
+        toast('选股执行完成', 'success');
     } catch (error) {
-        container.innerHTML = `<p class="loading">加载失败: ${error.message}</p>`;
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+
+        document.getElementById('selection-results-headline').textContent = '执行失败';
+        document.getElementById('selection-results-meta').textContent = 'Error';
+        document.getElementById('selection-results').innerHTML = `<div class="state-empty">执行失败: ${escapeHtml(error.message)}</div>`;
+        toast(`执行失败: ${error.message}`, 'error');
+        setStatus('error');
+    } finally {
+        if (!state.systemHalted) {
+            setRunButtonsLoading(false);
+            setStatus('ready');
+        }
     }
 }
 
-// 渲染策略配置
+function flattenConfigEntries(obj, path = []) {
+    const entries = [];
+
+    Object.entries(obj || {}).forEach(([key, value]) => {
+        const nextPath = [...path, key];
+        const isNested = value && typeof value === 'object' && !Array.isArray(value);
+
+        if (isNested) {
+            entries.push(...flattenConfigEntries(value, nextPath));
+            return;
+        }
+
+        entries.push({
+            path: nextPath.join('.'),
+            label: key,
+            value,
+        });
+    });
+
+    return entries;
+}
+
 function renderStrategiesConfig(config) {
     const container = document.getElementById('strategies-config');
-    
-    let html = '';
-    
-    for (const [strategyName, params] of Object.entries(config)) {
-        html += `
-            <div class="strategy-config-item" data-strategy="${strategyName}">
-                <h4>${strategyName}</h4>
-        `;
-        
-        for (const [paramName, value] of Object.entries(params)) {
-            html += `
+    const blocks = Object.entries(config || {}).map(([strategyName, params]) => {
+        const entries = flattenConfigEntries(params);
+        const rows = entries.map(entry => {
+            const inputType = typeof entry.value === 'number' ? 'number' : 'text';
+            const step = typeof entry.value === 'number' && !Number.isInteger(entry.value) ? 'any' : '1';
+            return `
                 <div class="param-row">
-                    <label>${paramName}:</label>
-                    <input type="text" 
-                           name="${strategyName}.${paramName}" 
-                           value="${value}"
-                           data-strategy="${strategyName}"
-                           data-param="${paramName}">
+                    <span class="param-label">${escapeHtml(entry.label)}</span>
+                    <span class="param-path">${escapeHtml(entry.path)}</span>
+                    <input
+                        class="param-input"
+                        type="${inputType}"
+                        step="${step}"
+                        value="${escapeHtml(entry.value)}"
+                        data-strategy="${escapeHtml(strategyName)}"
+                        data-path="${escapeHtml(entry.path)}">
                 </div>
             `;
-        }
-        
-        html += '</div>';
-    }
-    
-    container.innerHTML = html;
+        }).join('');
+
+        return `
+            <section class="strategy-config-block">
+                <div class="strategy-config-header">
+                    <div class="strategy-config-name">${escapeHtml(strategyName)}</div>
+                </div>
+                <div class="config-params-grid">${rows || '<div class="state-empty">无可编辑参数</div>'}</div>
+            </section>
+        `;
+    }).join('');
+
+    container.innerHTML = blocks || '<div class="state-empty">未读取到策略配置</div>';
 }
 
-// 保存配置
+async function loadStrategies() {
+    if (state.systemHalted) {
+        return;
+    }
+
+    const container = document.getElementById('strategies-config');
+    container.innerHTML = '<div class="state-loading">正在加载策略配置...</div>';
+
+    try {
+        const result = await apiFetch('/api/config');
+        if (!result.success) {
+            throw new Error(result.error || '配置加载失败');
+        }
+        renderStrategiesConfig(result.data || {});
+    } catch (error) {
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        container.innerHTML = `<div class="state-empty">加载失败: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
+function parseInputValue(rawValue) {
+    const value = String(rawValue ?? '').trim();
+    if (value === 'true') {
+        return true;
+    }
+    if (value === 'false') {
+        return false;
+    }
+    if (/^-?\d+(\.\d+)?$/.test(value)) {
+        return Number(value);
+    }
+    return value;
+}
+
+function assignNested(target, path, value) {
+    const keys = path.split('.');
+    let current = target;
+
+    keys.forEach((key, index) => {
+        if (index === keys.length - 1) {
+            current[key] = value;
+            return;
+        }
+        if (!current[key] || typeof current[key] !== 'object') {
+            current[key] = {};
+        }
+        current = current[key];
+    });
+}
+
 async function saveConfig() {
-    const inputs = document.querySelectorAll('#strategies-config input');
+    if (state.systemHalted) {
+        toast('系统已急停，无法保存配置', 'error');
+        return;
+    }
+
     const config = {};
-    
+    const inputs = document.querySelectorAll('#strategies-config .param-input');
+
     inputs.forEach(input => {
         const strategy = input.dataset.strategy;
-        const param = input.dataset.param;
-        let value = input.value;
-        
-        // 尝试转换为数字
-        if (!isNaN(value) && value !== '') {
-            value = Number(value);
-        }
-        
+        const path = input.dataset.path;
         if (!config[strategy]) {
             config[strategy] = {};
         }
-        config[strategy][param] = value;
+        assignNested(config[strategy], path, parseInputValue(input.value));
     });
-    
+
     try {
-        const response = await fetch('/api/config', {
+        const result = await apiFetch('/api/config', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
             },
-            body: JSON.stringify(config)
+            body: JSON.stringify(config),
         });
-        
-        const result = await response.json();
-        
-        if (result.success) {
-            alert('配置保存成功！');
-        } else {
-            alert('保存失败: ' + result.error);
+
+        if (!result.success) {
+            throw new Error(result.error || '保存失败');
         }
+
+        state.selectionOptionsLoaded = false;
+        toast('配置已保存并重新加载策略', 'success');
+        await loadSelectionOptions(true);
     } catch (error) {
-        alert('保存失败: ' + error.message);
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        toast(`保存失败: ${error.message}`, 'error');
     }
 }
 
-// 绑定执行选股按钮
-document.getElementById('run-selection-btn').addEventListener('click', runSelection);
-
-// 点击弹窗外部关闭弹窗
-document.getElementById('stock-modal').addEventListener('click', (e) => {
-    if (e.target.id === 'stock-modal') {
-        closeModal();
+function applyHaltState(message = '全部 Web 功能已停止。重启服务器后方可恢复。') {
+    if (state.systemHalted) {
+        const sub = document.getElementById('halt-overlay-sub');
+        if (sub) {
+            sub.textContent = message;
+        }
+        return;
     }
-});
 
-// 页面加载完成后初始化
-document.addEventListener('DOMContentLoaded', () => {
-    loadStats();
-});
+    state.systemHalted = true;
+    document.body.classList.add('is-halted');
+    abortActiveRequests();
+    closeModal();
+    setStatus('halted');
+
+    const sub = document.getElementById('halt-overlay-sub');
+    if (sub) {
+        sub.textContent = message;
+    }
+
+    document.querySelectorAll('button, input, select, textarea').forEach(element => {
+        element.disabled = true;
+    });
+
+    const haltBtn = document.getElementById('halt-btn');
+    if (haltBtn) {
+        haltBtn.disabled = true;
+        haltBtn.innerHTML = '<span class="halt-btn-dot"></span><span>HALTED</span>';
+    }
+
+    document.getElementById('halt-confirm').classList.remove('active');
+    document.getElementById('halt-overlay').classList.add('active');
+    document.getElementById('selection-results-headline').textContent = '系统已急停';
+    document.getElementById('selection-results-meta').textContent = 'HALTED';
+}
+
+function openHaltConfirm() {
+    if (state.systemHalted) {
+        return;
+    }
+    document.getElementById('halt-confirm').classList.add('active');
+}
+
+function closeHaltConfirm() {
+    document.getElementById('halt-confirm').classList.remove('active');
+}
+
+async function confirmHalt() {
+    if (state.systemHalted) {
+        return;
+    }
+
+    try {
+        await apiFetch('/api/emergency_stop', { method: 'POST' }, {
+            allowWhenHalted: true,
+            interpretHalt: false,
+        });
+    } catch (error) {
+        console.warn('emergency stop request failed:', error);
+    } finally {
+        applyHaltState('全部 Web 功能已停止。当前运行中的请求已被中断，需重启服务器恢复。');
+    }
+}
+
+function updateClock() {
+    const el = document.getElementById('topbar-clock');
+    if (!el) {
+        return;
+    }
+
+    el.textContent = new Intl.DateTimeFormat('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    }).format(new Date());
+}
+
+function bindEvents() {
+    document.getElementById('sidebar-nav').addEventListener('click', event => {
+        const item = event.target.closest('.nav-item');
+        if (!item) {
+            return;
+        }
+        switchPage(item.dataset.page);
+    });
+
+    document.getElementById('stock-search').addEventListener('input', event => {
+        const keyword = event.target.value.trim().toLowerCase();
+        if (!keyword) {
+            renderStocks(state.allStocksCache);
+            return;
+        }
+
+        const filtered = state.allStocksCache.filter(stock =>
+            String(stock.code).toLowerCase().includes(keyword) ||
+            String(stock.name || '').toLowerCase().includes(keyword)
+        );
+        renderStocks(filtered);
+    });
+
+    document.getElementById('stocks-tbody').addEventListener('click', event => {
+        const button = event.target.closest('.view-detail-btn');
+        if (!button) {
+            return;
+        }
+        viewStockDetail(button.dataset.code, button.dataset.name);
+    });
+
+    document.getElementById('selection-results').addEventListener('click', event => {
+        const button = event.target.closest('.view-detail-btn');
+        if (!button) {
+            return;
+        }
+        viewStockDetail(button.dataset.code, button.dataset.name);
+    });
+
+    document.getElementById('board-filter').addEventListener('change', updateSelectionSnapshot);
+    document.getElementById('strategy-filter').addEventListener('change', updateSelectionSnapshot);
+
+    document.getElementById('strategy-select-all-btn').addEventListener('click', () => {
+        document.querySelectorAll('#strategy-filter input[name="strategy"]').forEach(input => {
+            input.checked = true;
+        });
+        updateSelectionSnapshot();
+    });
+
+    document.getElementById('strategy-clear-all-btn').addEventListener('click', () => {
+        document.querySelectorAll('#strategy-filter input[name="strategy"]').forEach(input => {
+            input.checked = false;
+        });
+        updateSelectionSnapshot();
+    });
+
+    document.getElementById('run-selection-btn').addEventListener('click', runSelection);
+    document.getElementById('execute-selection-btn').addEventListener('click', runSelection);
+    document.getElementById('hero-run-btn').addEventListener('click', () => switchPage('selection'));
+    document.getElementById('hero-stocks-btn').addEventListener('click', () => switchPage('stocks'));
+    document.getElementById('refresh-dashboard-btn').addEventListener('click', loadStats);
+    document.getElementById('refresh-selection-options-btn').addEventListener('click', () => loadSelectionOptions(true));
+    document.getElementById('save-config-btn').addEventListener('click', saveConfig);
+
+    document.getElementById('halt-btn').addEventListener('click', openHaltConfirm);
+    document.getElementById('cancel-halt-btn').addEventListener('click', closeHaltConfirm);
+    document.getElementById('confirm-halt-btn').addEventListener('click', confirmHalt);
+
+    document.getElementById('stock-modal').addEventListener('click', event => {
+        if (event.target.id === 'stock-modal') {
+            closeModal();
+        }
+    });
+    document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+}
+
+async function init() {
+    bindEvents();
+    updateClock();
+    window.setInterval(updateClock, 1000);
+
+    try {
+        const result = await apiFetch('/api/system_status', {}, {
+            allowWhenHalted: true,
+            interpretHalt: false,
+        });
+        if (result.halted) {
+            applyHaltState('系统已经处于急停状态。请重启服务器后再恢复使用。');
+            return;
+        }
+    } catch (error) {
+        console.warn('system status check failed:', error);
+    }
+
+    await Promise.all([loadStats(), loadSelectionOptions()]);
+}
+
+document.addEventListener('DOMContentLoaded', init);

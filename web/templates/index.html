@@ -3,169 +3,425 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>A股量化选股系统</title>
+    <meta name="theme-color" content="#0a0d12">
+    <title>A股量化选股控制台</title>
     <link rel="stylesheet" href="/static/css/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
-    <div class="container">
-        <!-- 侧边栏 -->
-        <nav class="sidebar">
-            <div class="logo">
-                <span class="icon">📊</span>
-                <h1>量化选股</h1>
-            </div>
-            <ul class="nav-menu">
-                <li class="nav-item active" data-page="dashboard">
-                    <span class="icon">🏠</span> 概览
-                </li>
-                <li class="nav-item" data-page="stocks">
-                    <span class="icon">📈</span> 股票列表
-                </li>
-                <li class="nav-item" data-page="selection">
-                    <span class="icon">🎯</span> 选股结果
-                </li>
-                <li class="nav-item" data-page="strategies">
-                    <span class="icon">⚙️</span> 策略配置
-                </li>
-            </ul>
-            <div class="sidebar-footer">
-                <p>A股量化选股系统 v1.0</p>
-            </div>
-        </nav>
-
-        <!-- 主内容区 -->
-        <main class="main-content">
-            <!-- 顶部栏 -->
-            <header class="header">
-                <h2 id="page-title">系统概览</h2>
-                <div class="header-actions">
-                    <button class="btn btn-primary" id="run-selection-btn">
-                        <span class="icon">▶️</span> 执行选股
-                    </button>
-                    <span class="status-indicator" id="status-indicator">
-                        <span class="dot green"></span> 就绪
-                    </span>
-                </div>
-            </header>
-
-            <!-- 页面内容 -->
-            <div class="content">
-                <!-- 概览页 -->
-                <div id="dashboard-page" class="page active">
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-icon">📈</div>
-                            <div class="stat-info">
-                                <h3 id="stat-stocks">-</h3>
-                                <p>股票数量</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">📅</div>
-                            <div class="stat-info">
-                                <h3 id="stat-date">-</h3>
-                                <p>最新数据</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">🎯</div>
-                            <div class="stat-info">
-                                <h3 id="stat-strategies">-</h3>
-                                <p>策略数量</p>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <h3>快速操作</h3>
-                        <div class="quick-actions">
-                            <button class="btn btn-secondary" onclick="loadStocks()">
-                                <span class="icon">📋</span> 查看股票列表
-                            </button>
-                            <button class="btn btn-secondary" onclick="runSelection()">
-                                <span class="icon">🎯</span> 执行选股
-                            </button>
-                            <button class="btn btn-secondary" onclick="location.reload()">
-                                <span class="icon">🔄</span> 刷新页面
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 股票列表页 -->
-                <div id="stocks-page" class="page">
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>A股股票列表</h3>
-                            <input type="text" id="stock-search" placeholder="搜索股票代码或名称..." class="search-input">
-                        </div>
-                        <div class="table-container">
-                            <table class="data-table" id="stocks-table">
-                                <thead>
-                                    <tr>
-                                        <th>股票代码</th>
-                                        <th>股票名称</th>
-                                        <th>最新价</th>
-                                        <th>最新日期</th>
-                                        <th>市值(亿)</th>
-                                        <th>数据条数</th>
-                                        <th>操作</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="stocks-tbody">
-                                    <tr><td colspan="7" class="loading">加载中...</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 选股结果页 -->
-                <div id="selection-page" class="page">
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>选股结果</h3>
-                            <span id="selection-time" class="text-muted"></span>
-                        </div>
-                        <div id="selection-results">
-                            <p class="placeholder">点击"执行选股"按钮开始选股</p>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 策略配置页 -->
-                <div id="strategies-page" class="page">
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>策略配置</h3>
-                            <button class="btn btn-primary" onclick="saveConfig()">
-                                <span class="icon">💾</span> 保存配置
-                            </button>
-                        </div>
-                        <div id="strategies-config">
-                            <p class="loading">加载中...</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <!-- 股票详情弹窗 -->
-    <div id="stock-modal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3 id="modal-title">股票详情</h3>
-                <button class="close-btn" onclick="closeModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <canvas id="stock-chart" width="800" height="400"></canvas>
-                <div class="stock-info" id="stock-info"></div>
-            </div>
+<div id="halt-confirm" class="halt-confirm">
+    <div class="halt-confirm-box">
+        <div class="halt-confirm-label">Emergency Control</div>
+        <div class="halt-confirm-title">确认执行急停</div>
+        <p class="halt-confirm-body">
+            急停会立即终止当前 Web 交互与在途请求，并阻止后续所有 API 操作。<br>
+            如需恢复，必须重启 Web 服务。
+        </p>
+        <div class="halt-confirm-actions">
+            <button class="btn btn-danger" id="confirm-halt-btn">确认急停</button>
+            <button class="btn btn-ghost" id="cancel-halt-btn">取消</button>
         </div>
     </div>
+</div>
 
-    <script src="/static/js/app.js"></script>
+<div id="halt-overlay" class="halt-overlay">
+    <div class="halt-overlay-content">
+        <div class="halt-overlay-mark">HALTED</div>
+        <div class="halt-overlay-title">System Halted</div>
+        <p class="halt-overlay-sub" id="halt-overlay-sub">
+            全部 Web 功能已停止。重启服务器后方可恢复。
+        </p>
+    </div>
+</div>
+
+<div class="shell">
+    <aside class="sidebar">
+        <div class="sidebar-brand">
+            <div class="sidebar-brand-mark">
+                <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+                    <rect x="1" y="8" width="3" height="7"></rect>
+                    <rect x="6" y="4" width="3" height="11"></rect>
+                    <rect x="11" y="1" width="3" height="14"></rect>
+                </svg>
+            </div>
+            <div class="sidebar-brand-copy">
+                <span class="sidebar-brand-title">Quant Selector</span>
+                <span class="sidebar-brand-sub">A-Share Console</span>
+            </div>
+        </div>
+
+        <div class="sidebar-meta">
+            <div class="sidebar-meta-label">Environment</div>
+            <div class="sidebar-meta-value">LOCAL DATA / FLASK</div>
+        </div>
+
+        <ul class="sidebar-nav" id="sidebar-nav">
+            <li class="nav-item active" data-page="dashboard">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+                    <rect x="1.5" y="1.5" width="5" height="5"></rect>
+                    <rect x="9.5" y="1.5" width="5" height="5"></rect>
+                    <rect x="1.5" y="9.5" width="5" height="5"></rect>
+                    <rect x="9.5" y="9.5" width="5" height="5"></rect>
+                </svg>
+                <span>系统概览</span>
+            </li>
+            <li class="nav-item" data-page="stocks">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+                    <line x1="2" y1="4" x2="14" y2="4"></line>
+                    <line x1="2" y1="8" x2="14" y2="8"></line>
+                    <line x1="2" y1="12" x2="14" y2="12"></line>
+                </svg>
+                <span>股票列表</span>
+            </li>
+            <li class="nav-item" data-page="selection">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+                    <path d="M2 3h12l-4.5 5v4.5l-3-1.4V8z"></path>
+                </svg>
+                <span>执行选股</span>
+            </li>
+            <li class="nav-item" data-page="strategies">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+                    <circle cx="8" cy="8" r="2.4"></circle>
+                    <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.1 3.1l1.4 1.4M11.5 11.5l1.4 1.4M3.1 12.9l1.4-1.4M11.5 4.5l1.4-1.4"></path>
+                </svg>
+                <span>策略配置</span>
+            </li>
+        </ul>
+
+        <div class="sidebar-footer">
+            <div class="sidebar-footer-row">
+                <span class="sidebar-footer-label">Session</span>
+                <span class="sidebar-footer-value" id="sidebar-status-text">READY</span>
+            </div>
+            <div class="sidebar-footer-row">
+                <span class="sidebar-footer-label">Universe</span>
+                <span class="sidebar-footer-value" id="sidebar-universe-text">ALL BOARDS</span>
+            </div>
+            <div class="sidebar-footer-row">
+                <span class="sidebar-footer-label">Build</span>
+                <span class="sidebar-footer-value">WEB V2</span>
+            </div>
+        </div>
+    </aside>
+
+    <main class="main">
+        <header class="topbar">
+            <div class="topbar-left">
+                <span class="topbar-kicker">A-SHARE QUANT CONSOLE</span>
+                <span class="topbar-title" id="page-title">系统概览</span>
+            </div>
+            <div class="topbar-actions">
+                <div class="status" id="status-indicator">
+                    <span class="status-dot ready" id="status-dot"></span>
+                    <span id="status-text">READY</span>
+                </div>
+                <div class="topbar-clock" id="topbar-clock">--:--:--</div>
+                <button class="btn btn-primary" id="run-selection-btn">
+                    <svg viewBox="0 0 12 12" fill="currentColor">
+                        <polygon points="2,1 10,6 2,11"></polygon>
+                    </svg>
+                    执行选股
+                </button>
+            </div>
+        </header>
+
+        <div class="content">
+            <section id="dashboard-page" class="page active">
+                <div class="hero-grid">
+                    <div class="hero-panel">
+                        <div class="hero-kicker">MARKET MONITOR</div>
+                        <h1 class="hero-title">量化选股控制台</h1>
+                        <p class="hero-text">
+                            将本地数据、板块选择、策略执行与结果回看整合到同一套高信息密度界面中，
+                            保持极简，但不牺牲控制感。
+                        </p>
+                        <div class="hero-actions">
+                            <button class="btn btn-primary" id="hero-run-btn">
+                                <svg viewBox="0 0 12 12" fill="currentColor">
+                                    <polygon points="2,1 10,6 2,11"></polygon>
+                                </svg>
+                                进入执行面板
+                            </button>
+                            <button class="btn btn-secondary" id="hero-stocks-btn">
+                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
+                                    <line x1="1" y1="3" x2="11" y2="3"></line>
+                                    <line x1="1" y1="6" x2="11" y2="6"></line>
+                                    <line x1="1" y1="9" x2="11" y2="9"></line>
+                                </svg>
+                                查看股票池
+                            </button>
+                            <button class="btn btn-ghost" id="refresh-dashboard-btn">
+                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
+                                    <path d="M10 6A4 4 0 1 1 6 2"></path>
+                                    <polyline points="10,2 10,6 6,6"></polyline>
+                                </svg>
+                                刷新概览
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="hero-sidecard">
+                        <div class="hero-sidecard-label">Operating Notes</div>
+                        <div class="hero-sidecard-grid">
+                            <div class="hero-sidecard-item">
+                                <span class="hero-sidecard-key">Universe</span>
+                                <span class="hero-sidecard-value" id="hero-universe">ALL BOARDS</span>
+                            </div>
+                            <div class="hero-sidecard-item">
+                                <span class="hero-sidecard-key">Strategies</span>
+                                <span class="hero-sidecard-value" id="hero-strategy-count">--</span>
+                            </div>
+                            <div class="hero-sidecard-item">
+                                <span class="hero-sidecard-key">Latest Date</span>
+                                <span class="hero-sidecard-value" id="hero-latest-date">--</span>
+                            </div>
+                            <div class="hero-sidecard-item">
+                                <span class="hero-sidecard-key">Session</span>
+                                <span class="hero-sidecard-value" id="hero-session-state">READY</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-block">
+                        <div class="stat-label">股票数量</div>
+                        <div class="stat-value" id="stat-stocks">--</div>
+                        <div class="stat-sub">本地 A 股数据</div>
+                    </div>
+                    <div class="stat-block">
+                        <div class="stat-label">最新数据</div>
+                        <div class="stat-value stat-value-small" id="stat-date">--</div>
+                        <div class="stat-sub">最近交易日</div>
+                    </div>
+                    <div class="stat-block">
+                        <div class="stat-label">策略数量</div>
+                        <div class="stat-value" id="stat-strategies">--</div>
+                        <div class="stat-sub">已注册策略</div>
+                    </div>
+                    <div class="stat-block">
+                        <div class="stat-label">会话状态</div>
+                        <div class="stat-value stat-value-small" id="stat-session">READY</div>
+                        <div class="stat-sub">控制台运行状态</div>
+                    </div>
+                </div>
+
+                <div class="dashboard-grid">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">板块分布</span>
+                            <span class="panel-meta">Stock Universe</span>
+                        </div>
+                        <div class="panel-body">
+                            <div class="board-grid">
+                                <div class="board-card">
+                                    <div class="board-card-label">主板</div>
+                                    <div class="board-card-value" id="board-count-main">--</div>
+                                    <div class="board-card-sub">Main Board</div>
+                                </div>
+                                <div class="board-card">
+                                    <div class="board-card-label">创业板</div>
+                                    <div class="board-card-value" id="board-count-chinext">--</div>
+                                    <div class="board-card-sub">ChiNext</div>
+                                </div>
+                                <div class="board-card">
+                                    <div class="board-card-label">科创板</div>
+                                    <div class="board-card-value" id="board-count-star">--</div>
+                                    <div class="board-card-sub">STAR Market</div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">操作提示</span>
+                            <span class="panel-meta">Workflow</span>
+                        </div>
+                        <div class="panel-body terminal-list">
+                            <div class="terminal-row">01. 先在“执行选股”页选板块，再选策略。</div>
+                            <div class="terminal-row">02. 顶部主按钮会沿用当前筛选条件执行。</div>
+                            <div class="terminal-row">03. 急停会中止所有后续 Web API 调用，需重启服务恢复。</div>
+                            <div class="terminal-row">04. 策略配置页支持直接编辑并保存参数。</div>
+                        </div>
+                    </section>
+                </div>
+            </section>
+
+            <section id="stocks-page" class="page">
+                <div class="panel">
+                    <div class="panel-header panel-header-wrap">
+                        <div>
+                            <span class="panel-title">A 股股票列表</span>
+                            <div class="panel-subtitle" id="stocks-total-label">完整股票池视图</div>
+                        </div>
+                        <input type="text" id="stock-search" class="search-input" placeholder="搜索代码或名称">
+                    </div>
+                    <div class="table-wrap">
+                        <table class="data-table" id="stocks-table">
+                            <thead>
+                                <tr>
+                                    <th>代码</th>
+                                    <th>名称</th>
+                                    <th>板块</th>
+                                    <th>最新价</th>
+                                    <th>日期</th>
+                                    <th>市值 (亿)</th>
+                                    <th>数据量</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stocks-tbody">
+                                <tr>
+                                    <td colspan="8" class="state-loading">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <section id="selection-page" class="page">
+                <div class="selection-layout">
+                    <section class="panel control-panel">
+                        <div class="panel-header panel-header-wrap">
+                            <div>
+                                <span class="panel-title">执行控制台</span>
+                                <div class="panel-subtitle">选择板块范围与策略组合后执行选股</div>
+                            </div>
+                            <button class="btn btn-ghost" id="refresh-selection-options-btn">
+                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
+                                    <path d="M10 6A4 4 0 1 1 6 2"></path>
+                                    <polyline points="10,2 10,6 6,6"></polyline>
+                                </svg>
+                                刷新选项
+                            </button>
+                        </div>
+                        <div class="panel-body control-stack">
+                            <div class="control-section">
+                                <div class="control-section-head">
+                                    <span class="control-section-title">股票类型</span>
+                                    <span class="control-section-meta" id="board-selection-meta">3 / 3 已选</span>
+                                </div>
+                                <div class="board-option-grid" id="board-filter">
+                                    <div class="state-loading">加载中...</div>
+                                </div>
+                            </div>
+
+                            <div class="control-section">
+                                <div class="control-section-head">
+                                    <span class="control-section-title">选股策略</span>
+                                    <div class="inline-actions">
+                                        <button class="text-action" id="strategy-select-all-btn" type="button">全选</button>
+                                        <button class="text-action" id="strategy-clear-all-btn" type="button">清空</button>
+                                    </div>
+                                </div>
+                                <div class="strategy-option-grid" id="strategy-filter">
+                                    <div class="state-loading">加载中...</div>
+                                </div>
+                            </div>
+
+                            <div class="control-section">
+                                <div class="control-section-head">
+                                    <span class="control-section-title">执行快照</span>
+                                    <span class="control-section-meta" id="selection-execution-note">等待执行</span>
+                                </div>
+                                <div class="execution-grid">
+                                    <div class="execution-card">
+                                        <div class="execution-card-label">板块</div>
+                                        <div class="execution-card-value" id="selected-boards-count">0</div>
+                                    </div>
+                                    <div class="execution-card">
+                                        <div class="execution-card-label">策略</div>
+                                        <div class="execution-card-value" id="selected-strategies-count">0</div>
+                                    </div>
+                                    <div class="execution-card">
+                                        <div class="execution-card-label">股票池</div>
+                                        <div class="execution-card-value" id="selection-stock-pool">0</div>
+                                    </div>
+                                </div>
+                                <div class="execution-actions">
+                                    <button class="btn btn-primary btn-wide" id="execute-selection-btn">
+                                        <svg viewBox="0 0 12 12" fill="currentColor">
+                                            <polygon points="2,1 10,6 2,11"></polygon>
+                                        </svg>
+                                        立即执行
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel results-panel">
+                        <div class="panel-header panel-header-wrap">
+                            <div>
+                                <span class="panel-title">结果面板</span>
+                                <div class="panel-subtitle" id="selection-results-headline">尚未执行选股</div>
+                            </div>
+                            <span class="panel-meta" id="selection-results-meta">Awaiting Run</span>
+                        </div>
+                        <div class="panel-body results-panel-body">
+                            <div id="selection-results">
+                                <div class="state-empty">选择股票类型和策略后点击执行，结果会在这里集中展示。</div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </section>
+
+            <section id="strategies-page" class="page">
+                <div class="panel">
+                    <div class="panel-header panel-header-wrap">
+                        <div>
+                            <span class="panel-title">策略参数配置</span>
+                            <div class="panel-subtitle">支持嵌套参数编辑，保存后会即时重载策略注册表</div>
+                        </div>
+                        <button class="btn btn-primary" id="save-config-btn">
+                            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
+                                <path d="M9 1H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V3L9 1z"></path>
+                                <polyline points="3,1 3,5 9,5"></polyline>
+                                <rect x="3" y="8" width="6" height="2.5"></rect>
+                            </svg>
+                            保存配置
+                        </button>
+                    </div>
+                    <div class="panel-body" id="strategies-config">
+                        <div class="state-loading">加载中...</div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </main>
+</div>
+
+<button class="halt-btn" id="halt-btn" type="button">
+    <span class="halt-btn-dot"></span>
+    <span>EMERGENCY HALT</span>
+</button>
+
+<div id="stock-modal" class="modal-backdrop">
+    <div class="modal-box">
+        <div class="modal-header">
+            <div>
+                <div class="modal-kicker">STOCK DETAIL</div>
+                <span class="modal-title" id="modal-title">--</span>
+            </div>
+            <button class="modal-close" id="modal-close-btn" type="button">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <line x1="2" y1="2" x2="14" y2="14"></line>
+                    <line x1="14" y1="2" x2="2" y2="14"></line>
+                </svg>
+            </button>
+        </div>
+        <div class="modal-body">
+            <canvas id="stock-chart"></canvas>
+            <div id="stock-info"></div>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/js/app.js"></script>
 </body>
 </html>
