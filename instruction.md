@@ -5,7 +5,7 @@
 说明：
 
 - 以下内容以 `main.py`、`test_dingtalk.py`、`quant.sh`、`web_server.py` 当前代码为准。
-- 目前主入口实际支持的子命令只有：`init`、`select`、`run`、`web`。
+- 目前主入口实际支持的子命令有：`init`、`select`、`run`、`web`、`calendar`。
 - 仓库里有少量旧文档仍提到 `python3 main.py update`，但当前版本并不支持这个命令。
 
 ## 1. 主入口
@@ -22,6 +22,7 @@ python3 main.py [通用参数] <command> [参数]
 - `select`：只做筛选，不默认更新数据
 - `run`：完整流程，更新数据并执行选股
 - `web`：启动 Web 界面
+- `calendar`：查看或更新本地交易日历缓存
 
 查看版本：
 
@@ -44,6 +45,8 @@ python3 main.py --version
 | `--category` | `all` / `bowl_center` / `near_duokong` / `near_short_trend` | 分类筛选结果 |
 | `--host` | `--host 0.0.0.0` | Web 服务监听地址，仅 `web` 命令有意义 |
 | `--port` | `--port 5080` | Web 服务端口，仅 `web` 命令有意义 |
+| `--update` | `python3 main.py calendar --update` | 在 `calendar` 命令中主动更新交易日历缓存 |
+| `--years` | `--years 2026 2027` | `calendar` 命令要查看/更新的年份列表 |
 | `--force-select` | `python3 main.py select --force-select` | 在 `select` 命令里强制使用当前本地数据，即使数据不是最新 |
 | `--b1-match` | `python3 main.py run --b1-match` | 在 `run` 命令中启用 B1 完美图形匹配 |
 | `--lookback-days` | `--lookback-days 30` | B1 匹配回看天数 |
@@ -188,6 +191,41 @@ web:
 
 - 如果端口已被占用，且 `auto_port: true`，系统会自动尝试顺延端口。
 
+### 3.6 `calendar`
+
+用途：
+
+- 查看当前本地交易日历缓存状态
+- 主动更新 Tushare 交易日历缓存
+- 在 `trade_cal` 不可用时，为系统提供本地兜底交易日判断依据
+
+常用命令：
+
+```bash
+python3 main.py calendar --provider tushare
+python3 main.py calendar --provider tushare --update
+python3 main.py calendar --provider tushare --update --years 2026
+python3 main.py calendar --provider tushare --update --years 2026 2027
+```
+
+说明：
+
+- 系统已内置一份 `2026` 年交易日历种子文件：`config/trade_calendar_seed_2026.json`。
+- 运行 `calendar --provider tushare` 时会显示：
+  - 当前是否有缓存
+  - 已缓存哪些年份
+  - 缓存截至到哪一天
+- 运行 `calendar --provider tushare --update --years ...` 时，会联网调用 Tushare 的 `trade_cal` 更新本地缓存。
+- 本地缓存文件会写到 `data/trade_calendar_cache.json`。
+- 如果 `trade_cal` 临时无响应、超时或被限流，系统会在终端打印类似提示：
+
+```text
+trade_cal 无响应，将使用本地交易日历缓存。请确保本地交易日历缓存已为最新。
+```
+
+- 如果连本地缓存也没有，系统会继续退回到“按工作日近似判断”的最后兜底方案。
+- `web` 模式下如果服务端进程里触发了这类降级，相关提示也会输出到启动 Web 的那个终端窗口里。
+
 ## 4. 当前可用策略名
 
 按当前 `strategy/` 目录静态扫描，仓库内可见的策略类包括：
@@ -224,7 +262,7 @@ python3 main.py run --b1-match --category near_short_trend
 
 如果你是在真正的终端里直接运行，而不是通过脚本重定向：
 
-- 运行 `python3 main.py init` / `run` / `web` 且未写 `--provider` 时，会提示选择：
+- 运行 `python3 main.py init` / `run` / `web` / `calendar` 且未写 `--provider` 时，会提示选择：
   - `akshare`
   - `tushare`
 - 运行 `python3 main.py select` / `run` 且未写 `--strategy` 时，会提示选择：
