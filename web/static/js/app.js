@@ -17,6 +17,8 @@ const state = {
     currentPage: 'dashboard',
     chartInstance: null,
     allStocksCache: [],
+    stocksLoaded: false,
+    stocksLoadingPromise: null,
     strategies: [],
     boardOptions: [],
     boardCounts: {},
@@ -25,6 +27,11 @@ const state = {
     status: 'ready',
     toastTimer: null,
     activeControllers: new Set(),
+    selectionPollTimer: null,
+    currentSelectionJobId: null,
+    localProgressTimer: null,
+    jobStartTime: null,
+    serverElapsedBase: 0,
 };
 
 function escapeHtml(value) {
@@ -132,6 +139,85 @@ function abortActiveRequests() {
     state.activeControllers.clear();
 }
 
+function stopSelectionPolling() {
+    if (state.selectionPollTimer) {
+        window.clearInterval(state.selectionPollTimer);
+        state.selectionPollTimer = null;
+    }
+    stopLocalProgressTimer();
+}
+
+function scrollResultsToTop() {
+    const container = document.querySelector('.results-panel-body');
+    if (container) {
+        container.scrollTop = 0;
+    }
+}
+
+function scrollStocksToTop() {
+    const container = document.querySelector('#stocks-page .table-wrap');
+    if (container) {
+        container.scrollTop = 0;
+        container.scrollLeft = 0;
+    }
+    window.scrollTo(0, 0);
+}
+
+function queueStocksScrollReset() {
+    scrollStocksToTop();
+    window.requestAnimationFrame(() => {
+        scrollStocksToTop();
+        window.requestAnimationFrame(scrollStocksToTop);
+    });
+    window.setTimeout(scrollStocksToTop, 0);
+}
+
+function startLocalProgressTimer(serverElapsed) {
+    stopLocalProgressTimer();
+    state.jobStartTime = Date.now();
+    state.serverElapsedBase = Number(serverElapsed) || 0;
+    state.localProgressTimer = window.setInterval(updateLocalElapsedTime, 200);
+}
+
+function stopLocalProgressTimer() {
+    if (state.localProgressTimer) {
+        window.clearInterval(state.localProgressTimer);
+        state.localProgressTimer = null;
+    }
+    state.jobStartTime = null;
+    state.serverElapsedBase = 0;
+}
+
+function updateLocalElapsedTime() {
+    if (!state.jobStartTime) return;
+
+    const localElapsed = Math.floor((Date.now() - state.jobStartTime) / 1000);
+    const totalElapsed = state.serverElapsedBase + localElapsed;
+
+    const elapsedElements = document.querySelectorAll('.selection-progress-time, .selection-summary-card:nth-child(1) .value');
+    elapsedElements.forEach(el => {
+        if (el && el.classList.contains('selection-progress-time')) {
+            el.textContent = formatDateTime(new Date());
+        }
+    });
+
+    const elapsedCard = document.querySelector('.selection-progress-grid .selection-summary-card:first-child .value');
+    if (elapsedCard) {
+        elapsedCard.textContent = formatElapsed(totalElapsed);
+    }
+
+    const progressSub = document.querySelector('.selection-progress-sub');
+    if (progressSub) {
+        const currentStockMatch = progressSub.textContent.match(/已执行\s+\d+:\d+/);
+        if (currentStockMatch) {
+            progressSub.textContent = progressSub.textContent.replace(
+                /已执行\s+\d+:\d+/,
+                `已执行 ${formatElapsed(totalElapsed)}`
+            );
+        }
+    }
+}
+
 async function apiFetch(url, fetchOptions = {}, config = {}) {
     const { allowWhenHalted = false, interpretHalt = true } = config;
 
@@ -187,12 +273,14 @@ function switchPage(page) {
     });
 
     document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
+    window.scrollTo(0, 0);
 
     if (page === 'dashboard') {
         loadStats();
     }
     if (page === 'stocks') {
         loadStocks();
+        queueStocksScrollReset();
     }
     if (page === 'selection') {
         loadSelectionOptions();
@@ -239,15 +327,27 @@ async function loadStats() {
     }
 }
 
-async function loadStocks() {
+async function loadStocks(forceReload = false) {
     if (state.systemHalted) {
         return;
     }
 
     const tbody = document.getElementById('stocks-tbody');
-    tbody.innerHTML = '<tr><td colspan="8" class="state-loading">正在载入股票列表...</td></tr>';
 
-    try {
+    if (state.stocksLoaded && state.allStocksCache.length && !forceReload) {
+        renderStocks(state.allStocksCache);
+        return;
+    }
+
+    if (state.stocksLoadingPromise && !forceReload) {
+        await state.stocksLoadingPromise;
+        renderStocks(state.allStocksCache);
+        return;
+    }
+
+    tbody.innerHTML = '<tr><td colspan="8" class="state-loading state-table-message">正在载入股票列表...</td></tr>';
+
+    state.stocksLoadingPromise = (async () => {
         let page = 1;
         let totalPages = 1;
         let allStocks = [];
@@ -260,17 +360,25 @@ async function loadStocks() {
 
             allStocks = allStocks.concat(result.data);
             totalPages = result.total_pages;
-            tbody.innerHTML = `<tr><td colspan="8" class="state-loading">已加载 ${formatNumber(allStocks.length)} / ${formatNumber(result.total)} 只股票...</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="8" class="state-loading state-table-message">已加载 ${formatNumber(allStocks.length)} / ${formatNumber(result.total)} 只股票...</td></tr>`;
             page += 1;
         } while (page <= totalPages);
 
         state.allStocksCache = allStocks;
-        renderStocks(allStocks);
+        state.stocksLoaded = true;
+    })();
+
+    try {
+        await state.stocksLoadingPromise;
+        renderStocks(state.allStocksCache);
     } catch (error) {
+        state.stocksLoaded = false;
         if (error.name === 'AbortError' && state.systemHalted) {
             return;
         }
-        tbody.innerHTML = `<tr><td colspan="8" class="state-empty">加载失败: ${escapeHtml(error.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="state-empty state-table-message">加载失败: ${escapeHtml(error.message)}</td></tr>`;
+    } finally {
+        state.stocksLoadingPromise = null;
     }
 }
 
@@ -279,6 +387,7 @@ function renderStocks(stocks) {
 
     if (!stocks.length) {
         tbody.innerHTML = '<tr><td colspan="8" class="state-empty">没有匹配的股票</td></tr>';
+        queueStocksScrollReset();
         return;
     }
 
@@ -303,6 +412,8 @@ function renderStocks(stocks) {
             </tr>
         `;
     }).join('');
+
+    queueStocksScrollReset();
 }
 
 async function viewStockDetail(code, name) {
@@ -667,6 +778,84 @@ function buildSignalMetrics(signal) {
     return metrics.join('');
 }
 
+function formatElapsed(seconds) {
+    const total = Number(seconds) || 0;
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function renderSelectionProgress(job) {
+    const total = Number(job.total_candidates || 0);
+    const completed = Number(job.completed_candidates || 0);
+    const selected = Number(job.selected_count || 0);
+    const percent = Number(job.progress_pct || 0);
+    const currentStock = job.current_stock
+        ? `${job.current_stock.name || '未知'} (${job.current_stock.code || '--'})`
+        : '等待第一批结果...';
+    const logs = Array.isArray(job.logs) ? job.logs.slice().reverse() : [];
+    const elapsed = Number(job.elapsed_seconds || 0);
+
+    document.getElementById('selection-results-headline').textContent = '任务执行中';
+    document.getElementById('selection-results-meta').textContent = `${job.backend || 'thread'} / ${percent}%`;
+
+    document.getElementById('selection-results').innerHTML = `
+        <div class="selection-progress">
+            <div class="selection-progress-head">
+                <div>
+                    <div class="selection-progress-title">Selection In Progress</div>
+                    <div class="selection-progress-sub">
+                        已执行 ${formatElapsed(elapsed)}，当前处理到 ${escapeHtml(currentStock)}
+                    </div>
+                </div>
+                <div class="selection-progress-time">${formatDateTime(new Date())}</div>
+            </div>
+            <div class="selection-progress-bar-wrap">
+                <div class="selection-progress-bar">
+                    <div class="selection-progress-bar-fill" style="width:${Math.min(100, Math.max(0, percent))}%"></div>
+                </div>
+                <div class="selection-progress-bar-text">${percent}%</div>
+            </div>
+            <div class="selection-progress-grid">
+                <div class="selection-summary-card">
+                    <span class="label">Elapsed</span>
+                    <span class="value">${formatElapsed(elapsed)}</span>
+                </div>
+                <div class="selection-summary-card">
+                    <span class="label">Processed</span>
+                    <span class="value">${formatNumber(completed)} / ${formatNumber(total)}</span>
+                </div>
+                <div class="selection-summary-card">
+                    <span class="label">Selected</span>
+                    <span class="value">${formatNumber(selected)}</span>
+                </div>
+                <div class="selection-summary-card">
+                    <span class="label">Skipped</span>
+                    <span class="value">${formatNumber(job.skipped_stock_count || 0)}</span>
+                </div>
+            </div>
+            <div class="progress-log-panel">
+                <div class="progress-log-header">
+                    <span>Execution Feed</span>
+                    <span>${escapeHtml(job.status || 'running').toUpperCase()}</span>
+                </div>
+                <div class="progress-log-list">
+                    ${logs.map(item => `
+                        <div class="progress-log-row">
+                            <span class="progress-log-time">${escapeHtml(item.time)}</span>
+                            <span class="progress-log-message">${escapeHtml(item.message)}</span>
+                        </div>
+                    `).join('') || '<div class="progress-log-row"><span class="progress-log-message">正在初始化任务...</span></div>'}
+                </div>
+            </div>
+        </div>
+    `;
+
+    if (job.status === 'running' || job.status === 'queued') {
+        startLocalProgressTimer(elapsed);
+    }
+}
+
 function renderSelectionResults(results, time, meta = {}) {
     const strategies = meta.strategies || Object.keys(results);
     const selectedBoards = meta.boards || getSelectedBoards();
@@ -730,41 +919,73 @@ function renderSelectionResults(results, time, meta = {}) {
         if (!signals.length) {
             html += '<div class="signal-empty">当前策略在本次筛选条件下没有命中信号。</div>';
         } else {
-            html += '<div class="signals-list">';
+            html += `
+                <div class="results-table-wrap">
+                    <table class="data-table results-table">
+                        <thead>
+                            <tr>
+                                <th>代码</th>
+                                <th>名称</th>
+                                <th>板块</th>
+                                <th>现价</th>
+                                <th>J值</th>
+                                <th>市值(亿)</th>
+                                <th>补充指标</th>
+                                <th>触发条件</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
             html += signals.map(item => {
                 const signal = Array.isArray(item.signals) ? (item.signals[0] || {}) : {};
                 const reasonTags = (signal.reasons || []).map(reason => `<span class="tag">${escapeHtml(reason)}</span>`).join('');
+                const jValue = Number(signal.J);
+                const jClass = Number.isFinite(jValue) ? (jValue > 80 ? 'down' : (jValue < 20 ? 'up' : '')) : '';
+                const extraMetric = signal.volume_ratio !== undefined
+                    ? `量比 ${signal.volume_ratio}x`
+                    : (signal.yangyin_ratio_57 !== undefined
+                        ? `57阳阴比 ${signal.yangyin_ratio_57}`
+                        : (signal.yangyin_ratio_14 !== undefined
+                            ? `14阳阴比 ${signal.yangyin_ratio_14}`
+                            : (signal.hm_short !== undefined && signal.hm_long !== undefined
+                                ? `短/长线 ${signal.hm_short}/${signal.hm_long}`
+                                : (signal.wl !== undefined && signal.yl !== undefined
+                                    ? `WL/YL ${signal.wl}/${signal.yl}`
+                                    : '--'))));
 
                 return `
-                    <div class="signal-row">
-                        <div class="signal-identity">
-                            <span class="signal-code">${escapeHtml(item.code)}</span>
-                            <span class="signal-name">
-                                ${escapeHtml(item.name || '未知')}
-                                ${boardBadge(item.code)}
-                            </span>
-                        </div>
-                        <div class="signal-metrics">
-                            ${buildSignalMetrics(signal)}
-                        </div>
-                        <div class="signal-side">
-                            <div class="signal-tags">${reasonTags || '<span class="tag">MATCH</span>'}</div>
+                    <tr>
+                        <td class="code-cell">${escapeHtml(item.code)}</td>
+                        <td>${escapeHtml(item.name || '未知')}</td>
+                        <td>${boardBadge(item.code)}</td>
+                        <td class="mono">${escapeHtml(signal.close ?? '--')}</td>
+                        <td class="mono metric-value ${jClass}">${escapeHtml(signal.J ?? '--')}</td>
+                        <td class="mono">${escapeHtml(signal.market_cap ?? '--')}</td>
+                        <td class="mono">${escapeHtml(extraMetric)}</td>
+                        <td><div class="result-tag-wrap">${reasonTags || '<span class="tag">MATCH</span>'}</div></td>
+                        <td>
                             <button class="btn btn-ghost view-detail-btn" type="button"
                                 data-code="${escapeHtml(item.code)}"
                                 data-name="${escapeHtml(item.name || '')}">
-                                查看K线
+                                K线
                             </button>
-                        </div>
-                    </div>
+                        </td>
+                    </tr>
                 `;
             }).join('');
-            html += '</div>';
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            `;
         }
 
         html += '</section>';
     });
 
     document.getElementById('selection-results').innerHTML = html;
+    scrollResultsToTop();
 }
 
 async function runSelection() {
@@ -772,6 +993,9 @@ async function runSelection() {
         toast('系统已急停，无法继续执行', 'error');
         return;
     }
+
+    // 先中止仍在后台执行的股票列表/概览请求，避免它们继续占用连接和资源。
+    abortActiveRequests();
 
     if (state.currentPage !== 'selection') {
         switchPage('selection');
@@ -793,23 +1017,33 @@ async function runSelection() {
 
     setRunButtonsLoading(true);
     setStatus('running');
-    document.getElementById('selection-results-headline').textContent = '正在执行选股，请稍候';
-    document.getElementById('selection-results-meta').textContent = 'Running';
-    document.getElementById('selection-results').innerHTML = '<div class="state-loading">正在按当前板块与策略组合执行筛选...</div>';
+    scrollResultsToTop();
+    document.getElementById('selection-results-headline').textContent = '正在启动任务';
+    document.getElementById('selection-results-meta').textContent = 'Initializing';
+    document.getElementById('selection-results').innerHTML = '<div class="state-loading">正在创建选股任务...</div>';
 
     try {
-        const params = new URLSearchParams({
-            boards: boards.join(','),
-            strategies: strategies.join(','),
-        });
+        stopSelectionPolling();
+        state.currentSelectionJobId = null;
 
-        const result = await apiFetch(`/api/select?${params.toString()}`);
+        const result = await apiFetch('/api/select/start', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                boards: boards.join(','),
+                strategies: strategies.join(','),
+            }),
+        });
         if (!result.success) {
             throw new Error(result.error || '执行失败');
         }
 
-        renderSelectionResults(result.data || {}, result.time, result.meta || {});
-        toast('选股执行完成', 'success');
+        state.currentSelectionJobId = result.job_id;
+        renderSelectionProgress(result.data || {});
+        state.selectionPollTimer = window.setInterval(pollSelectionJobStatus, 1000);
+        await pollSelectionJobStatus();
     } catch (error) {
         if (error.name === 'AbortError' && state.systemHalted) {
             return;
@@ -821,10 +1055,73 @@ async function runSelection() {
         toast(`执行失败: ${error.message}`, 'error');
         setStatus('error');
     } finally {
-        if (!state.systemHalted) {
+        // 运行态由轮询结束时负责回收。
+    }
+}
+
+async function pollSelectionJobStatus() {
+    if (!state.currentSelectionJobId) {
+        return;
+    }
+
+    try {
+        const result = await apiFetch(`/api/select/status/${state.currentSelectionJobId}`);
+        if (!result.success) {
+            throw new Error(result.error || '状态同步失败');
+        }
+
+        const job = result.data || {};
+
+        if (job.status === 'running' || job.status === 'queued') {
+            state.serverElapsedBase = Number(job.elapsed_seconds) || 0;
+            state.jobStartTime = Date.now();
+        }
+
+        renderSelectionProgress(job);
+
+        if (job.status === 'completed') {
+            stopSelectionPolling();
+            clearSavedSelectionState();
             setRunButtonsLoading(false);
             setStatus('ready');
+            renderSelectionResults(job.results || {}, job.result_time, {
+                boards: job.boards || getSelectedBoards(),
+                strategies: job.strategies || getSelectedStrategies(),
+                stock_pool_size: job.total_candidates || 0,
+            });
+            toast('选股执行完成', 'success');
+            return;
         }
+
+        if (job.status === 'error') {
+            stopSelectionPolling();
+            clearSavedSelectionState();
+            setRunButtonsLoading(false);
+            setStatus('error');
+            document.getElementById('selection-results-headline').textContent = '执行失败';
+            document.getElementById('selection-results-meta').textContent = 'Error';
+            document.getElementById('selection-results').innerHTML = `<div class="state-empty">执行失败: ${escapeHtml(job.error || '未知错误')}</div>`;
+            toast(`执行失败: ${job.error || '未知错误'}`, 'error');
+            return;
+        }
+
+        if (job.status === 'halted') {
+            stopSelectionPolling();
+            clearSavedSelectionState();
+            applyHaltState(job.error || '系统已急停，当前任务已终止。');
+        }
+    } catch (error) {
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        stopSelectionPolling();
+        clearSavedSelectionState();
+        setRunButtonsLoading(false);
+        setStatus('error');
+        document.getElementById('selection-results-headline').textContent = '状态同步失败';
+        document.getElementById('selection-results-meta').textContent = 'Error';
+        document.getElementById('selection-results').innerHTML = `<div class="state-empty">状态同步失败: ${escapeHtml(error.message)}</div>`;
+        toast(`状态同步失败: ${error.message}`, 'error');
     }
 }
 
@@ -990,6 +1287,7 @@ function applyHaltState(message = '全部 Web 功能已停止。重启服务器�
 
     state.systemHalted = true;
     document.body.classList.add('is-halted');
+    stopSelectionPolling();
     abortActiveRequests();
     closeModal();
     setStatus('halted');
@@ -1133,10 +1431,57 @@ function bindEvents() {
     document.getElementById('modal-close-btn').addEventListener('click', closeModal);
 }
 
+const SELECTION_STATE_KEY = 'quant_selection_state';
+
+function saveSelectionState() {
+    if (!state.currentSelectionJobId) {
+        sessionStorage.removeItem(SELECTION_STATE_KEY);
+        return;
+    }
+
+    try {
+        sessionStorage.setItem(SELECTION_STATE_KEY, JSON.stringify({
+            jobId: state.currentSelectionJobId,
+            savedAt: Date.now(),
+            currentPage: state.currentPage,
+        }));
+    } catch (e) {
+        console.warn('Failed to save selection state:', e);
+    }
+}
+
+function loadSavedSelectionState() {
+    try {
+        const raw = sessionStorage.getItem(SELECTION_STATE_KEY);
+        if (!raw) return null;
+
+        const data = JSON.parse(raw);
+        if (!data.jobId || !data.savedAt) return null;
+
+        const ageMs = Date.now() - data.savedAt;
+        if (ageMs > 30 * 60 * 1000) {
+            sessionStorage.removeItem(SELECTION_STATE_KEY);
+            return null;
+        }
+
+        return data;
+    } catch (e) {
+        console.warn('Failed to load selection state:', e);
+        sessionStorage.removeItem(SELECTION_STATE_KEY);
+        return null;
+    }
+}
+
+function clearSavedSelectionState() {
+    sessionStorage.removeItem(SELECTION_STATE_KEY);
+}
+
 async function init() {
     bindEvents();
     updateClock();
     window.setInterval(updateClock, 1000);
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
 
     try {
         const result = await apiFetch('/api/system_status', {}, {
@@ -1151,7 +1496,76 @@ async function init() {
         console.warn('system status check failed:', error);
     }
 
+    await restoreSelectionStateIfNeeded();
     await Promise.all([loadStats(), loadSelectionOptions()]);
+}
+
+function handleBeforeUnload() {
+    abortActiveRequests();
+    stopSelectionPolling();
+    stopLocalProgressTimer();
+
+    if (state.currentSelectionJobId && (state.status === 'running')) {
+        saveSelectionState();
+    } else {
+        clearSavedSelectionState();
+    }
+
+    if (state.chartInstance) {
+        try {
+            state.chartInstance.destroy();
+        } catch (e) {}
+        state.chartInstance = null;
+    }
+}
+
+async function restoreSelectionStateIfNeeded() {
+    const saved = loadSavedSelectionState();
+    if (!saved) return;
+
+    try {
+        const result = await apiFetch(`/api/select/status/${saved.jobId}`, {}, { allowWhenHalted: true });
+        if (!result.success || !result.data) {
+            clearSavedSelectionState();
+            return;
+        }
+
+        const job = result.data;
+        if (job.status === 'completed' || job.status === 'error' || job.status === 'halted') {
+            clearSavedSelectionState();
+            if (saved.currentPage === 'selection') {
+                switchPage('selection');
+                if (job.status === 'completed' && job.results) {
+                    renderSelectionResults(job.results || {}, job.result_time, {
+                        boards: job.boards || getSelectedBoards(),
+                        strategies: job.strategies || getSelectedStrategies(),
+                        stock_pool_size: job.total_candidates || 0,
+                    });
+                }
+            }
+            return;
+        }
+
+        state.currentSelectionJobId = saved.jobId;
+        setRunButtonsLoading(true);
+        setStatus('running');
+
+        if (state.currentPage !== saved.currentPage) {
+            switchPage(saved.currentPage);
+        }
+
+        document.getElementById('selection-results-headline').textContent = '检测到未完成任务，正在恢复...';
+        document.getElementById('selection-results-meta').textContent = 'Restoring';
+        document.getElementById('selection-results').innerHTML = '<div class="state-loading">正在恢复任务状态...</div>';
+
+        renderSelectionProgress(job);
+        state.selectionPollTimer = window.setInterval(pollSelectionJobStatus, 1000);
+
+        toast('已恢复未完成的选股任务', 'info');
+    } catch (error) {
+        console.warn('Failed to restore selection state:', error);
+        clearSavedSelectionState();
+    }
 }
 
 document.addEventListener('DOMContentLoaded', init);

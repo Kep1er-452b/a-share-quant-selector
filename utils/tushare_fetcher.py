@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from utils.data_provider import BaseDataProvider, DataProviderError
@@ -37,6 +39,9 @@ class TushareFetcher(BaseDataProvider):
         self.ts.set_token(self.token)
         self.pro = self.ts.pro_api(self.token)
         self.stock_meta_file = Path(data_dir) / "tushare_stock_map.json"
+        self.daily_basic_calls = deque()
+        self.daily_basic_limit_per_minute = 180
+        self.daily_basic_rate_limit_wait = 62
 
     def _load_stock_metadata(self):
         if self.stock_meta_file.exists():
@@ -90,7 +95,7 @@ class TushareFetcher(BaseDataProvider):
         for delta in range(max_lookback_days):
             trade_date = (datetime.now() - timedelta(days=delta)).strftime("%Y%m%d")
             try:
-                df = self.pro.daily_basic(
+                df = self._call_daily_basic(
                     trade_date=trade_date,
                     fields="ts_code,trade_date,total_mv"
                 )
@@ -106,11 +111,42 @@ class TushareFetcher(BaseDataProvider):
             return pd.to_datetime(trade_date).date()
         return super().get_latest_trade_date()
 
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        message = str(error)
+        rate_limit_keywords = [
+            "每分钟最多访问该接口",
+            "抱歉，您每分钟最多访问该接口",
+            "rate limit",
+            "too many requests",
+        ]
+        return any(keyword in message.lower() if keyword.isascii() else keyword in message for keyword in rate_limit_keywords)
+
+    def _throttle_daily_basic(self):
+        now = time.time()
+        while self.daily_basic_calls and now - self.daily_basic_calls[0] >= 60:
+            self.daily_basic_calls.popleft()
+
+        if len(self.daily_basic_calls) >= self.daily_basic_limit_per_minute:
+            wait_seconds = 60 - (now - self.daily_basic_calls[0]) + 0.5
+            wait_seconds = max(wait_seconds, 0.5)
+            print(f"  daily_basic 接口接近限流，等待 {wait_seconds:.1f} 秒后继续...")
+            time.sleep(wait_seconds)
+            now = time.time()
+            while self.daily_basic_calls and now - self.daily_basic_calls[0] >= 60:
+                self.daily_basic_calls.popleft()
+
+        self.daily_basic_calls.append(time.time())
+
+    def _call_daily_basic(self, **kwargs):
+        self._throttle_daily_basic()
+        return self.pro.daily_basic(**kwargs)
+
     def _fetch_daily_basic_range(self, ts_code: str, start_date: str, end_date: str):
         last_error = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
-                df = self.pro.daily_basic(
+                df = self._call_daily_basic(
                     ts_code=ts_code,
                     start_date=start_date,
                     end_date=end_date,
@@ -121,7 +157,13 @@ class TushareFetcher(BaseDataProvider):
                 return pd.DataFrame()
             except Exception as e:
                 last_error = e
-                if attempt < 2:
+                if self._is_rate_limit_error(e) and attempt < 3:
+                    wait_seconds = self.daily_basic_rate_limit_wait
+                    print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
+                    time.sleep(wait_seconds)
+                    self.daily_basic_calls.clear()
+                    continue
+                if attempt < 3:
                     time.sleep(0.5 * (attempt + 1))
         if last_error is not None:
             print(f"  获取 daily_basic 失败: {last_error}")
@@ -186,8 +228,8 @@ class TushareFetcher(BaseDataProvider):
                 how="left"
             )
         else:
-            result["turnover_rate"] = 0
-            result["total_mv"] = 0
+            result["turnover_rate"] = np.nan
+            result["total_mv"] = np.nan
 
         result = result.rename(
             columns={
@@ -199,8 +241,8 @@ class TushareFetcher(BaseDataProvider):
 
         # Tushare amount 单位为千元，统一转换为元；total_mv 单位为万元，统一转换为元
         result["amount"] = self._numeric_column(result, "amount") * 1000
-        result["market_cap"] = self._numeric_column(result, "market_cap") * 10000
-        result["turnover"] = self._numeric_column(result, "turnover")
+        result["market_cap"] = self._numeric_column(result, "market_cap", default=np.nan) * 10000
+        result["turnover"] = self._numeric_column(result, "turnover", default=np.nan)
         result["volume"] = self._numeric_column(result, "vol") if "vol" in result.columns else self._numeric_column(result, "volume")
 
         keep_columns = ["date", "open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"]

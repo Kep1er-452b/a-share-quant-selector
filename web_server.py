@@ -5,7 +5,11 @@ from flask import Flask, render_template, jsonify, request
 import json
 import sys
 import socket
-from threading import Event
+import os
+import time
+import uuid
+from threading import Event, Lock, Thread
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 import yaml
@@ -16,6 +20,11 @@ sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
 from utils.data_provider import BOARD_LABELS
+from utils.selection_worker import (
+    build_worker_context,
+    initialize_selection_worker,
+    process_selection_chunk,
+)
 import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
 
@@ -26,6 +35,8 @@ app = Flask(__name__,
 # 全局实例
 csv_manager = CSVManager("data")
 halt_event = Event()
+selection_jobs = {}
+selection_jobs_lock = Lock()
 
 
 def _reload_registry():
@@ -146,9 +157,172 @@ def _build_board_counts(stock_codes):
     return counts
 
 
+def _is_invalid_stock_name(name):
+    invalid_keywords = ['退', '未知', '退市', '已退']
+    if any(keyword in name for keyword in invalid_keywords):
+        return True
+    return name.startswith('ST') or name.startswith('*ST')
+
+
+def _chunk_candidates(candidates, chunk_size):
+    return [candidates[i:i + chunk_size] for i in range(0, len(candidates), chunk_size)]
+
+
+def _get_web_selection_settings():
+    config = _load_config()
+
+    selection_config = config.get('selection', {}) if isinstance(config, dict) else {}
+
+    raw_mode = str(selection_config.get('mode', 'parallel')).strip().lower()
+    mode = raw_mode if raw_mode in {'parallel', 'sequential'} else 'parallel'
+
+    # Web 端默认优先线程池，避免请求内频繁拉起进程导致额外开销。
+    raw_backend = str(selection_config.get('backend', 'thread')).strip().lower()
+    backend = raw_backend if raw_backend in {'process', 'thread', 'sequential'} else 'thread'
+
+    default_workers = min(max(os.cpu_count() or 4, 1), 12)
+    try:
+        max_workers = int(selection_config.get('max_workers', default_workers))
+    except (TypeError, ValueError):
+        max_workers = default_workers
+    max_workers = max(1, min(max_workers, 32))
+
+    try:
+        chunk_size = int(selection_config.get('chunk_size', 50))
+    except (TypeError, ValueError):
+        chunk_size = 50
+    chunk_size = max(10, min(chunk_size, 500))
+
+    return {
+        'mode': mode,
+        'backend': backend,
+        'max_workers': max_workers,
+        'chunk_size': chunk_size,
+    }
+
+
+def _resolve_selection_backend(candidate_count, settings):
+    if settings['mode'] != 'parallel' or candidate_count <= 1:
+        return 'sequential'
+
+    requested_backend = settings['backend']
+    if requested_backend == 'sequential':
+        return 'sequential'
+
+    if requested_backend == 'process':
+        if candidate_count < max(settings['chunk_size'] * 4, 200):
+            return 'thread'
+        return 'process'
+
+    if candidate_count < max(settings['chunk_size'], 40):
+        return 'sequential'
+    return 'thread'
+
+
+def _job_timestamp():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _elapsed_seconds(job):
+    started_at = job.get('started_at_monotonic')
+    if started_at is None:
+        return 0
+    return max(0, int(time.monotonic() - started_at))
+
+
+def _append_job_log(job, message):
+    logs = job.setdefault('logs', [])
+    logs.append({
+        'time': _job_timestamp(),
+        'message': message,
+    })
+    if len(logs) > 12:
+        del logs[:-12]
+
+
+def _update_job(job_id, **updates):
+    with selection_jobs_lock:
+        job = selection_jobs.get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        return job
+
+
+def _append_job_log_by_id(job_id, message):
+    with selection_jobs_lock:
+        job = selection_jobs.get(job_id)
+        if not job:
+            return None
+        _append_job_log(job, message)
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        return job
+
+
+def _serialize_job(job):
+    if not job:
+        return None
+    serialized = {
+        key: value
+        for key, value in job.items()
+        if key not in {'started_at_monotonic'}
+    }
+    serialized['elapsed_seconds'] = _elapsed_seconds(job)
+    return serialized
+
+
+def _find_running_job():
+    with selection_jobs_lock:
+        for job in selection_jobs.values():
+            if job.get('status') in {'queued', 'running'}:
+                return _serialize_job(job)
+    return None
+
+
+def _create_selection_job(requested_boards, requested_strategies):
+    job_id = uuid.uuid4().hex[:12]
+    now = _job_timestamp()
+    job = {
+        'job_id': job_id,
+        'status': 'queued',
+        'created_at': now,
+        'updated_at': now,
+        'started_at_monotonic': time.monotonic(),
+        'elapsed_seconds': 0,
+        'boards': requested_boards,
+        'strategies': requested_strategies,
+        'backend': 'thread',
+        'progress_pct': 0,
+        'total_candidates': 0,
+        'completed_candidates': 0,
+        'valid_stock_count': 0,
+        'skipped_stock_count': 0,
+        'invalid_name_count': 0,
+        'selected_count': 0,
+        'current_stock': None,
+        'results': None,
+        'result_time': None,
+        'error': None,
+        'logs': [],
+    }
+    _append_job_log(job, '任务已创建，等待执行。')
+    with selection_jobs_lock:
+        selection_jobs[job_id] = job
+    return job_id
+
+
 @app.before_request
 def block_requests_after_halt():
-    allowed_endpoints = {'index', 'static', 'get_system_status', 'emergency_stop'}
+    allowed_endpoints = {
+        'index',
+        'static',
+        'get_system_status',
+        'emergency_stop',
+        'get_selection_job_status',
+    }
     if request.endpoint in allowed_endpoints:
         return None
 
@@ -156,6 +330,139 @@ def block_requests_after_halt():
         return _halted_response()
 
     return None
+
+
+def _run_selection_job(job_id, requested_boards, requested_strategies):
+    try:
+        _update_job(
+            job_id,
+            status='running',
+            result_time=None,
+            error=None,
+        )
+
+        stock_codes = [
+            code for code in csv_manager.list_all_stocks()
+            if _classify_board(code) in requested_boards
+        ]
+        stock_names = _load_stock_names()
+
+        candidates = []
+        invalid_name_count = 0
+        for code in stock_codes:
+            name = stock_names.get(code, '未知')
+            if _is_invalid_stock_name(name):
+                invalid_name_count += 1
+                continue
+            candidates.append((code, name))
+
+        data_dir = str(csv_manager.data_dir)
+        settings = _get_web_selection_settings()
+        settings['backend'] = 'thread'
+        backend = _resolve_selection_backend(len(candidates), settings)
+        candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
+        effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
+
+        _update_job(
+            job_id,
+            backend=backend,
+            total_candidates=len(candidates),
+            invalid_name_count=invalid_name_count,
+            current_stock=None,
+        )
+        _append_job_log_by_id(
+            job_id,
+            f"开始执行，股票池 {len(candidates)} 只，板块 {requested_boards}，策略 {requested_strategies}。"
+        )
+
+        results = {strategy_name: [] for strategy_name in requested_strategies}
+        completed_candidates = 0
+        valid_total_count = 0
+        skipped_count = 0
+        error_counts = {strategy_name: 0 for strategy_name in requested_strategies}
+
+        def consume_chunk(chunk_result):
+            nonlocal completed_candidates, valid_total_count, skipped_count
+            completed_candidates += chunk_result.get('processed_count', 0)
+            valid_total_count += chunk_result.get('valid_count', 0)
+            skipped_count += chunk_result.get('skipped_count', 0)
+
+            for strategy_name in requested_strategies:
+                results[strategy_name].extend(
+                    chunk_result['results_by_strategy'].get(strategy_name, [])
+                )
+                error_counts[strategy_name] += chunk_result['error_counts'].get(strategy_name, 0)
+
+            selected_count = sum(len(items) for items in results.values())
+            current_stock = None
+            if chunk_result.get('last_processed_code'):
+                current_stock = {
+                    'code': chunk_result.get('last_processed_code'),
+                    'name': chunk_result.get('last_processed_name', '未知'),
+                }
+
+            progress_pct = int((completed_candidates / max(len(candidates), 1)) * 100)
+            _update_job(
+                job_id,
+                completed_candidates=completed_candidates,
+                valid_stock_count=valid_total_count,
+                skipped_stock_count=skipped_count,
+                selected_count=selected_count,
+                current_stock=current_stock,
+                progress_pct=progress_pct,
+            )
+            if current_stock:
+                _append_job_log_by_id(
+                    job_id,
+                    f"已处理 {completed_candidates}/{len(candidates)}，当前至 {current_stock['name']}({current_stock['code']})。"
+                )
+
+        if backend == 'thread':
+            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = [
+                    executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
+                    for chunk in candidate_chunks
+                ]
+                for future in as_completed(futures):
+                    if _is_halted():
+                        _update_job(job_id, status='halted', error='系统已急停')
+                        _append_job_log_by_id(job_id, '任务因系统急停而终止。')
+                        return
+                    consume_chunk(future.result())
+        else:
+            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            for chunk in candidate_chunks:
+                if _is_halted():
+                    _update_job(job_id, status='halted', error='系统已急停')
+                    _append_job_log_by_id(job_id, '任务因系统急停而终止。')
+                    return
+                consume_chunk(process_selection_chunk(chunk, "all", False, worker_context))
+
+        for strategy_name in results:
+            results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
+
+        _update_job(
+            job_id,
+            status='completed',
+            progress_pct=100,
+            completed_candidates=len(candidates),
+            results=results,
+            result_time=_job_timestamp(),
+            current_stock=None,
+        )
+        _append_job_log_by_id(
+            job_id,
+            f"执行完成，共命中 {sum(len(items) for items in results.values())} 条信号。"
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status='error',
+            error=str(exc),
+            current_stock=None,
+        )
+        _append_job_log_by_id(job_id, f"执行失败: {exc}")
 
 
 @app.route('/')
@@ -257,40 +564,88 @@ def run_selection():
             if _classify_board(code) in requested_boards
         ]
         stock_names = _load_stock_names()
-        
-        # 构建数据字典
-        stock_data = {}
+        candidates = []
+        invalid_name_count = 0
         for code in stock_codes:
-            if _is_halted():
-                return _halted_response()
-            df = csv_manager.read_stock(code)
-            if not df.empty and len(df) >= 60:
-                stock_data[code] = (stock_names.get(code, '未知'), df)
-        
-        # 执行选股
-        results = {}
-        for strategy_name in requested_strategies:
-            if _is_halted():
-                return _halted_response()
-
-            strategy = registry.get_strategy(strategy_name)
-            if strategy is None:
+            name = stock_names.get(code, '未知')
+            if _is_invalid_stock_name(name):
+                invalid_name_count += 1
                 continue
+            candidates.append((code, name))
 
-            signals = []
-            for code, (name, df) in stock_data.items():
+        data_dir = str(csv_manager.data_dir)
+        settings = _get_web_selection_settings()
+        backend = _resolve_selection_backend(len(candidates), settings)
+        candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
+        effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
+
+        print(
+            f"[web] 开始执行选股: boards={requested_boards}, "
+            f"strategies={requested_strategies}, "
+            f"候选={len(candidates)}, backend={backend}, workers={effective_workers}, "
+            f"chunk={settings['chunk_size']}"
+        )
+
+        results = {strategy_name: [] for strategy_name in requested_strategies}
+        valid_total_count = 0
+        skipped_count = 0
+        error_counts = {strategy_name: 0 for strategy_name in requested_strategies}
+
+        def consume_chunk(chunk_result):
+            nonlocal valid_total_count, skipped_count
+            valid_total_count += chunk_result.get('valid_count', 0)
+            skipped_count += chunk_result.get('skipped_count', 0)
+
+            for strategy_name in requested_strategies:
+                results[strategy_name].extend(
+                    chunk_result['results_by_strategy'].get(strategy_name, [])
+                )
+                error_counts[strategy_name] += chunk_result['error_counts'].get(strategy_name, 0)
+
+        if backend == 'process':
+            with ProcessPoolExecutor(
+                max_workers=effective_workers,
+                initializer=initialize_selection_worker,
+                initargs=(data_dir, requested_strategies, str(registry.params_file)),
+            ) as executor:
+                futures = [
+                    executor.submit(process_selection_chunk, chunk, "all", False)
+                    for chunk in candidate_chunks
+                ]
+                for future in as_completed(futures):
+                    if _is_halted():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return _halted_response()
+                    consume_chunk(future.result())
+        elif backend == 'thread':
+            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = [
+                    executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
+                    for chunk in candidate_chunks
+                ]
+                for future in as_completed(futures):
+                    if _is_halted():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return _halted_response()
+                    consume_chunk(future.result())
+        else:
+            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            for chunk in candidate_chunks:
                 if _is_halted():
                     return _halted_response()
+                consume_chunk(process_selection_chunk(chunk, "all", False, worker_context))
 
-                result = strategy.analyze_stock(code, name, df)
-                if result:
-                    signals.append({
-                        'code': result['code'],
-                        'name': result.get('name', stock_names.get(code, '未知')),
-                        'signals': result['signals']
-                    })
-            results[strategy_name] = signals
-        
+        for strategy_name in results:
+            results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
+
+        print(
+            f"[web] 选股完成: valid={valid_total_count}, skipped={skipped_count}, "
+            f"invalid_name={invalid_name_count}, "
+            f"selected={sum(len(items) for items in results.values())}, "
+            f"errors={error_counts}"
+        )
+
         return jsonify({
             'success': True,
             'data': results,
@@ -298,11 +653,64 @@ def run_selection():
             'meta': {
                 'boards': requested_boards,
                 'strategies': requested_strategies,
-                'stock_pool_size': len(stock_data),
+                'stock_pool_size': len(candidates),
+                'invalid_name_count': invalid_name_count,
+                'valid_stock_count': valid_total_count,
+                'skipped_stock_count': skipped_count,
+                'backend': backend,
             }
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/select/start', methods=['POST'])
+def start_selection_job():
+    """启动异步选股任务。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        running_job = _find_running_job()
+        if running_job:
+            return jsonify({
+                'success': False,
+                'error': '已有选股任务正在执行',
+                'job': running_job,
+            }), 409
+
+        payload = request.get_json(silent=True) or {}
+        requested_boards = _parse_requested_boards(payload.get('boards'))
+        requested_strategies = _parse_requested_strategies(payload.get('strategies'))
+
+        job_id = _create_selection_job(requested_boards, requested_strategies)
+        thread = Thread(
+            target=_run_selection_job,
+            args=(job_id, requested_boards, requested_strategies),
+            daemon=True,
+        )
+        thread.start()
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'data': _serialize_job(selection_jobs.get(job_id)),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/select/status/<job_id>')
+def get_selection_job_status(job_id):
+    """查询异步选股任务状态。"""
+    with selection_jobs_lock:
+        job = selection_jobs.get(job_id)
+        if not job:
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+        return jsonify({
+            'success': True,
+            'data': _serialize_job(job),
+        })
 
 
 @app.route('/api/selection/options')
