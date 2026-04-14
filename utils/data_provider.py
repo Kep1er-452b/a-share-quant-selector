@@ -91,6 +91,24 @@ class BaseDataProvider:
         """批量获取最新总市值，默认返回空"""
         return {}
 
+    def get_trade_calendar_status(self) -> dict:
+        """
+        返回交易日历缓存状态。基类默认只提供占位信息。
+        """
+        return {
+            "provider": self.provider_name,
+            "cache_available": False,
+            "latest_cached_date": None,
+            "years": [],
+            "source": "fallback",
+        }
+
+    def update_trade_calendar_cache(self, years=None) -> dict:
+        """
+        更新本地交易日历缓存。默认数据源不支持。
+        """
+        raise DataProviderError(f"{self.provider_name} 数据源暂不支持交易日历缓存更新")
+
     def classify_board(self, stock_code: str, metadata: Optional[dict] = None) -> str:
         """按元数据优先、代码前缀回退的方式划分板块"""
         metadata = metadata or {}
@@ -146,6 +164,28 @@ class BaseDataProvider:
         while latest.weekday() >= 5:
             latest -= timedelta(days=1)
         return latest
+
+    def get_trade_dates_between(self, start_date, end_date) -> List:
+        """
+        获取给定区间内的交易日列表（含起止边界）。
+        基类使用工作日近似，provider 可覆写为真实交易所日历。
+        """
+        start = pd.to_datetime(start_date).date() if start_date else None
+        end = pd.to_datetime(end_date).date() if end_date else None
+        if not start or not end or start > end:
+            return []
+        return list(pd.bdate_range(start=start, end=end).date)
+
+    def get_missing_trade_dates(self, latest_local_date, latest_trade_date) -> List:
+        """
+        获取本地最新日期之后，到目标最新交易日之间仍需补齐的交易日。
+        """
+        start = pd.to_datetime(latest_local_date).date() if latest_local_date else None
+        end = pd.to_datetime(latest_trade_date).date() if latest_trade_date else None
+        if not start or not end or start >= end:
+            return []
+        next_day = start + timedelta(days=1)
+        return self.get_trade_dates_between(next_day, end)
 
     def _quick_row_count(self, path: Path) -> int:
         try:
@@ -347,15 +387,16 @@ class BaseDataProvider:
             name = item.get("name", "")
             latest_local = status_map[code].get("latest_date")
             latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
-            days_needed = max((latest_trade_date - latest_local_date).days + 2, 2) if latest_trade_date and latest_local_date else 30
+            missing_trade_dates = self.get_missing_trade_dates(latest_local_date, latest_trade_date)
+            trading_days_needed = max(len(missing_trade_dates), 1) if latest_trade_date and latest_local_date else 10
 
             processed += 1
             progress_prefix = tracker.line(
                 processed,
                 extra=f"成功 {success_count} | 失败 {failed_count}"
             )
-            print(f"{progress_prefix}\n  -> 增量补齐 {code} {name} ({days_needed} 天)...", end=" ")
-            df = self.fetch_stock_update(code, days=min(days_needed, 1000))
+            print(f"{progress_prefix}\n  -> 增量补齐 {code} {name} (缺 {trading_days_needed} 个交易日)...", end=" ")
+            df = self.fetch_stock_update(code, days=min(trading_days_needed, 1000))
             df = self._apply_market_cap_override(code, df, market_cap_map)
             if df is not None and not df.empty:
                 self.csv_manager.update_stock(code, df)

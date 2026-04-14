@@ -7,6 +7,7 @@ A股量化选股系统 - 主程序
     python main.py select    # 仅执行筛选
     python main.py run       # 完整流程（更新+选股+通知）
     python main.py web       # 启动 Web 界面
+    python main.py calendar  # 查看或更新交易日历缓存
 """
 import sys
 import os
@@ -102,7 +103,7 @@ def resolve_provider_name(args, config):
         return args.provider
 
     is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if is_interactive and args.command in {"init", "run", "web"}:
+    if is_interactive and args.command in {"init", "run", "web", "calendar"}:
         return prompt_for_provider(configured_provider)
 
     return configured_provider
@@ -933,6 +934,20 @@ def print_version():
     print(f"B1 Pattern Match: 支持（基于双线+量比+形态三维匹配，10个历史案例）")
 
 
+def print_calendar_status(status):
+    """打印交易日历缓存状态"""
+    years = ", ".join(status.get("years", [])) or "无"
+    latest_cached_date = status.get("latest_cached_date") or "无"
+    print("=" * 60)
+    print("📅 交易日历缓存状态")
+    print(f"   Provider: {status.get('provider', 'unknown')}")
+    print(f"   缓存可用: {'是' if status.get('cache_available') else '否'}")
+    print(f"   已缓存年份: {years}")
+    print(f"   缓存截至: {latest_cached_date}")
+    print(f"   来源: {status.get('source', 'unknown')}")
+    print("=" * 60)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='A股量化选股系统',
@@ -949,6 +964,8 @@ def main():
   python main.py run --b1-match --min-similarity 70  # 匹配+提高相似度阈值到70%
   python main.py run --b1-match --lookback-days 30   # 使用30天回看期
   python main.py web                           # 启动Web界面
+  python main.py calendar --provider tushare   # 查看交易日历缓存状态
+  python main.py calendar --provider tushare --update --years 2026 2027
   python main.py --version                     # 显示版本信息
 
 分类说明:
@@ -972,9 +989,9 @@ B1完美图形匹配:
 
     parser.add_argument(
         'command',
-        choices=['init', 'select', 'run', 'web'],
+        choices=['init', 'select', 'run', 'web', 'calendar'],
         nargs='?',
-        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器)'
+        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器), calendar(查看/更新交易日历缓存)'
     )
 
     parser.add_argument(
@@ -1027,6 +1044,20 @@ B1完美图形匹配:
         type=int,
         default=None,
         help='Web服务器端口 (默认从配置读取，未配置时为 5080)'
+    )
+
+    parser.add_argument(
+        '--update',
+        action='store_true',
+        help='在 calendar 命令中主动更新交易日历缓存'
+    )
+
+    parser.add_argument(
+        '--years',
+        type=int,
+        nargs='*',
+        default=None,
+        help='calendar 命令要查看/更新的年份列表，例如: --years 2026 2027'
     )
     
     parser.add_argument(
@@ -1084,7 +1115,7 @@ B1完美图形匹配:
     config = load_config_file(args.config)
     provider_name = resolve_provider_name(args, config)
     provider_token = None
-    if provider_name == 'tushare' and args.command in {'init', 'select', 'run'}:
+    if provider_name == 'tushare' and args.command in {'init', 'select', 'run', 'calendar'}:
         provider_token = resolve_tushare_token(
             config,
             interactive_prompt=(sys.stdin.isatty() and sys.stdout.isatty())
@@ -1096,6 +1127,25 @@ B1完美图形匹配:
     
     # 执行命令
     try:
+        if args.command == 'calendar':
+            if provider_name != 'tushare':
+                print("⚠️ 当前只有 tushare provider 支持交易日历缓存。")
+                print("  若使用 akshare，系统将仅使用本地工作日近似判断，不支持 trade_cal 缓存更新。")
+                if args.update:
+                    print("✗ `calendar --update` 仅支持 `--provider tushare`")
+                    sys.exit(1)
+            quant = QuantSystem(args.config, provider_name=provider_name, provider_token=provider_token)
+            status = quant.fetcher.get_trade_calendar_status()
+            print_calendar_status(status)
+
+            if args.update:
+                years = args.years or [datetime.now().year]
+                print(f"\n🔄 开始更新交易日历缓存: {', '.join(str(year) for year in years)}")
+                updated_status = quant.fetcher.update_trade_calendar_cache(years=years)
+                print("✓ 交易日历缓存更新完成")
+                print_calendar_status(updated_status)
+            return
+
         if args.command == 'init':
             quant = QuantSystem(args.config, provider_name=provider_name, provider_token=provider_token)
             quant.init_data(max_stocks=args.max_stocks, board=args.board)

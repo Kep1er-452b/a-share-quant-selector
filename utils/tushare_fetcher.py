@@ -42,6 +42,136 @@ class TushareFetcher(BaseDataProvider):
         self.daily_basic_calls = deque()
         self.daily_basic_limit_per_minute = 180
         self.daily_basic_rate_limit_wait = 62
+        self.trade_calendar_cache_file = Path(data_dir) / "trade_calendar_cache.json"
+        self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
+        self.trade_calendar_cache = {}
+        self.trade_calendar_range_cache = {}
+        self._trade_calendar_warning_emitted = False
+        self._load_trade_calendar_cache()
+
+    def _load_trade_calendar_cache(self):
+        merged_cache = {"years": {}, "updated_at": None}
+
+        for path in [self.trade_calendar_seed_file, self.trade_calendar_cache_file]:
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f) or {}
+                years = payload.get("years", {})
+                for year, info in years.items():
+                    merged_cache["years"][str(year)] = info
+                updated_at = payload.get("updated_at")
+                if updated_at:
+                    merged_cache["updated_at"] = updated_at
+            except Exception:
+                continue
+
+        self.trade_calendar_cache = merged_cache
+
+    def _save_trade_calendar_cache(self):
+        payload = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "years": self.trade_calendar_cache.get("years", {}),
+        }
+        try:
+            with open(self.trade_calendar_cache_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"  保存交易日历缓存失败: {e}")
+
+    def _calendar_latest_cached_date(self):
+        latest_date = None
+        for info in self.trade_calendar_cache.get("years", {}).values():
+            open_dates = info.get("open_dates", [])
+            if not open_dates:
+                continue
+            year_latest = max(open_dates)
+            if latest_date is None or year_latest > latest_date:
+                latest_date = year_latest
+        return latest_date
+
+    def _get_cached_trade_dates_between(self, start_date, end_date):
+        start = pd.to_datetime(start_date).date() if start_date else None
+        end = pd.to_datetime(end_date).date() if end_date else None
+        if not start or not end or start > end:
+            return []
+
+        result = []
+        for year in range(start.year, end.year + 1):
+            info = self.trade_calendar_cache.get("years", {}).get(str(year), {})
+            for date_text in info.get("open_dates", []):
+                date_value = pd.to_datetime(date_text).date()
+                if start <= date_value <= end:
+                    result.append(date_value)
+        return sorted(set(result))
+
+    def _warn_trade_calendar_fallback(self, reason, used_cache=True):
+        if self._trade_calendar_warning_emitted:
+            return
+        self._trade_calendar_warning_emitted = True
+        latest_cached_date = self._calendar_latest_cached_date() or "无缓存"
+        fallback_mode = "本地交易日历缓存" if used_cache else "本地工作日近似判断"
+        print(
+            f"  trade_cal 无响应，将使用{fallback_mode}。"
+            f"请确保本地交易日历缓存已为最新。"
+            f"当前日历缓存截至: {latest_cached_date}。"
+            f"原因: {reason}"
+        )
+        print("  可执行 `python3 main.py calendar --provider tushare --update --years 2026` 更新日历缓存。")
+
+    def _fetch_trade_calendar_year(self, year: int):
+        df = self.pro.trade_cal(
+            exchange="",
+            start_date=f"{year}0101",
+            end_date=f"{year}1231",
+            fields="cal_date,is_open,pretrade_date",
+        )
+        if df is None or df.empty or not {"cal_date", "is_open"}.issubset(df.columns):
+            raise DataProviderError(f"Tushare trade_cal 返回空数据: {year}")
+
+        open_days = (
+            df[df["is_open"].astype(int) == 1]["cal_date"]
+            .astype(str)
+            .sort_values()
+            .tolist()
+        )
+        if not open_days:
+            raise DataProviderError(f"Tushare trade_cal 未返回开市日: {year}")
+
+        return {
+            "year": str(year),
+            "source": "tushare",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "open_dates": open_days,
+        }
+
+    def get_trade_calendar_status(self) -> dict:
+        years = sorted(self.trade_calendar_cache.get("years", {}).keys())
+        return {
+            "provider": self.provider_name,
+            "cache_available": bool(years),
+            "latest_cached_date": self._calendar_latest_cached_date(),
+            "years": years,
+            "source": "cache" if years else "fallback",
+        }
+
+    def update_trade_calendar_cache(self, years=None) -> dict:
+        if not years:
+            current_year = datetime.now().year
+            years = [current_year]
+
+        normalized_years = sorted({int(year) for year in years})
+        updated_years = {}
+        for year in normalized_years:
+            updated_years[str(year)] = self._fetch_trade_calendar_year(year)
+
+        current_years = self.trade_calendar_cache.setdefault("years", {})
+        current_years.update(updated_years)
+        self.trade_calendar_cache["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_trade_calendar_cache()
+        self._trade_calendar_warning_emitted = False
+        return self.get_trade_calendar_status()
 
     def _load_stock_metadata(self):
         if self.stock_meta_file.exists():
@@ -110,6 +240,65 @@ class TushareFetcher(BaseDataProvider):
         if trade_date:
             return pd.to_datetime(trade_date).date()
         return super().get_latest_trade_date()
+
+    def get_trade_dates_between(self, start_date, end_date):
+        start = pd.to_datetime(start_date).date() if start_date else None
+        end = pd.to_datetime(end_date).date() if end_date else None
+        if not start or not end or start > end:
+            return []
+
+        cache_key = (start.isoformat(), end.isoformat())
+        if cache_key in self.trade_calendar_range_cache:
+            return self.trade_calendar_range_cache[cache_key]
+
+        try:
+            df = self.pro.trade_cal(
+                exchange="",
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                fields="cal_date,is_open",
+            )
+            if df is not None and not df.empty and {"cal_date", "is_open"}.issubset(df.columns):
+                open_days = df[df["is_open"].astype(int) == 1]["cal_date"]
+                trade_dates = list(pd.to_datetime(open_days).dt.date)
+                self.trade_calendar_range_cache[cache_key] = trade_dates
+                return trade_dates
+        except Exception as e:
+            cached_trade_dates = self._get_cached_trade_dates_between(start, end)
+            if cached_trade_dates:
+                self.trade_calendar_range_cache[cache_key] = cached_trade_dates
+                self._warn_trade_calendar_fallback(str(e), used_cache=True)
+                return cached_trade_dates
+
+            trade_dates = super().get_trade_dates_between(start, end)
+            self.trade_calendar_range_cache[cache_key] = trade_dates
+            self._warn_trade_calendar_fallback(str(e), used_cache=False)
+            return trade_dates
+
+        cached_trade_dates = self._get_cached_trade_dates_between(start, end)
+        if cached_trade_dates:
+            self.trade_calendar_range_cache[cache_key] = cached_trade_dates
+            return cached_trade_dates
+
+        trade_dates = super().get_trade_dates_between(start, end)
+        self.trade_calendar_range_cache[cache_key] = trade_dates
+        return trade_dates
+
+    def _resolve_update_start_date(self, days: int, end_date):
+        """
+        按交易日回推增量抓取起点，而不是简单按自然日回退。
+        """
+        end = pd.to_datetime(end_date).date() if end_date else datetime.now().date()
+        lookback_days = max(days * 4 + 10, 20)
+        calendar_start = end - timedelta(days=lookback_days)
+        trade_dates = self.get_trade_dates_between(calendar_start, end)
+
+        if trade_dates:
+            window_size = max(days + 1, 2)  # 额外带上 1 个交易日作缓冲，便于去重合并
+            start_index = max(len(trade_dates) - window_size, 0)
+            return trade_dates[start_index]
+
+        return end - timedelta(days=max(days + 5, 10))
 
     @staticmethod
     def _is_rate_limit_error(error: Exception) -> bool:
@@ -335,10 +524,10 @@ class TushareFetcher(BaseDataProvider):
         抓取近期数据用于增量更新
         """
         ts_code = self._to_ts_code(stock_code)
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=max(days + 5, 10))
+        end_date = self.get_latest_trade_date() or datetime.now().date()
+        start_date = self._resolve_update_start_date(days, end_date)
         start_str = start_date.strftime("%Y%m%d")
-        end_str = end_date.strftime("%Y%m%d")
+        end_str = pd.to_datetime(end_date).strftime("%Y%m%d")
 
         try:
             price_df = self.ts.pro_bar(
