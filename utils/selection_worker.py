@@ -67,8 +67,12 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     processed_count = len(candidates)
     valid_count = 0
     skipped_count = 0
+    last_processed_code = None
+    last_processed_name = None
 
     for code, name in candidates:
+        last_processed_code = code
+        last_processed_name = name
         df = csv_manager.read_stock(code)
         if df.empty or len(df) < 60:
             skipped_count += 1
@@ -113,4 +117,6 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
         "indicators_dict": indicators_dict,
         "category_count": category_count,
         "error_counts": error_counts,
+        "last_processed_code": last_processed_code,
+        "last_processed_name": last_processed_name,
     }

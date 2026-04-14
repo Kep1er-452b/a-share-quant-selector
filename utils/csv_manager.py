@@ -54,6 +54,29 @@ class CSVManager:
         # 写入CSV
         df.to_csv(path, index=False)
         return path
+
+    @staticmethod
+    def _preserve_existing_metrics(existing_df, new_df):
+        """
+        在增量更新时，若新数据缺少辅助字段，则尽量保留旧值。
+        主要保护 turnover / market_cap，避免接口限流时把旧值覆盖成空值或 0。
+        """
+        if existing_df.empty or new_df.empty:
+            return new_df
+
+        result = new_df.copy()
+        existing_by_date = existing_df.drop_duplicates(subset=['date'], keep='last').set_index('date')
+
+        for column in ['turnover', 'market_cap']:
+            if column not in result.columns or column not in existing_by_date.columns:
+                continue
+
+            fallback_values = result['date'].map(existing_by_date[column])
+            current_values = pd.to_numeric(result[column], errors='coerce')
+            invalid_mask = current_values.isna() | (current_values <= 0)
+            result.loc[invalid_mask, column] = fallback_values[invalid_mask].values
+
+        return result
     
     def update_stock(self, stock_code, new_df):
         """增量更新股票数据"""
@@ -61,6 +84,8 @@ class CSVManager:
         
         if existing_df.empty:
             return self.write_stock(stock_code, new_df)
+
+        new_df = self._preserve_existing_metrics(existing_df, new_df)
         
         # 合并数据
         combined = pd.concat([existing_df, new_df], ignore_index=True)
