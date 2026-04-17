@@ -103,7 +103,7 @@ def resolve_provider_name(args, config):
         return args.provider
 
     is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if is_interactive and args.command in {"init", "run", "web", "calendar"}:
+    if is_interactive and args.command in {"init", "select", "run", "web", "calendar"}:
         return prompt_for_provider(configured_provider)
 
     return configured_provider

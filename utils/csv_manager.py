@@ -71,10 +71,17 @@ class CSVManager:
             if column not in result.columns or column not in existing_by_date.columns:
                 continue
 
-            fallback_values = result['date'].map(existing_by_date[column])
-            current_values = pd.to_numeric(result[column], errors='coerce')
+            # 增量数据里这两列有时是 int，有时是 float。先统一转成浮点，
+            # 避免回填旧值（常见为小数）时触发 pandas 的 dtype 冲突。
+            result[column] = pd.to_numeric(result[column], errors='coerce').astype(float)
+            fallback_values = pd.to_numeric(
+                result['date'].map(existing_by_date[column]),
+                errors='coerce'
+            ).astype(float)
+            current_values = result[column]
             invalid_mask = current_values.isna() | (current_values <= 0)
-            result.loc[invalid_mask, column] = fallback_values[invalid_mask].values
+            if invalid_mask.any():
+                result.loc[invalid_mask, column] = fallback_values[invalid_mask].values
 
         return result
     
