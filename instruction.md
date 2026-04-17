@@ -262,7 +262,7 @@ python3 main.py run --b1-match --category near_short_trend
 
 如果你是在真正的终端里直接运行，而不是通过脚本重定向：
 
-- 运行 `python3 main.py init` / `run` / `web` / `calendar` 且未写 `--provider` 时，会提示选择：
+- 运行 `python3 main.py init` / `select` / `run` / `web` / `calendar` 且未写 `--provider` 时，会提示选择：
   - `akshare`
   - `tushare`
 - 运行 `python3 main.py select` / `run` 且未写 `--strategy` 时，会提示选择：
