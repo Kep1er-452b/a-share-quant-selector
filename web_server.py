@@ -19,7 +19,14 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
-from utils.data_provider import BOARD_LABELS
+from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
+from utils.market_overview import (
+    build_heatmap_payload,
+    rebuild_market_caches,
+    ensure_market_caches,
+    market_cache_needs_refresh,
+    is_hidden_market_stock,
+)
 from utils.selection_worker import (
     build_worker_context,
     initialize_selection_worker,
@@ -37,6 +44,8 @@ csv_manager = CSVManager("data")
 halt_event = Event()
 selection_jobs = {}
 selection_jobs_lock = Lock()
+update_jobs = {}
+update_jobs_lock = Lock()
 
 
 def _reload_registry():
@@ -155,6 +164,14 @@ def _build_board_counts(stock_codes):
     for code in stock_codes:
         counts[_classify_board(code)] += 1
     return counts
+
+
+def _filter_hidden_stock_codes(stock_codes, stock_names=None):
+    names = stock_names or {}
+    return [
+        code for code in stock_codes
+        if not is_hidden_market_stock(code, names.get(code, ""))
+    ]
 
 
 def _is_invalid_stock_name(name):
@@ -282,6 +299,64 @@ def _find_running_job():
     return None
 
 
+def _update_update_job(job_id, **updates):
+    with update_jobs_lock:
+        job = update_jobs.get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        return job
+
+
+def _append_update_job_log(job_id, message):
+    with update_jobs_lock:
+        job = update_jobs.get(job_id)
+        if not job:
+            return None
+        _append_job_log(job, message)
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        return job
+
+
+def _find_running_update_job():
+    with update_jobs_lock:
+        for job in update_jobs.values():
+            if job.get('status') in {'queued', 'running'}:
+                return _serialize_job(job)
+    return None
+
+
+def _create_update_job(provider):
+    job_id = uuid.uuid4().hex[:12]
+    now = _job_timestamp()
+    job = {
+        'job_id': job_id,
+        'status': 'queued',
+        'provider': provider,
+        'created_at': now,
+        'updated_at': now,
+        'started_at_monotonic': time.monotonic(),
+        'elapsed_seconds': 0,
+        'progress_pct': 0,
+        'processed_count': 0,
+        'total_count': 0,
+        'current_step': '等待执行',
+        'current_stock': None,
+        'started_at': None,
+        'finished_at': None,
+        'error': None,
+        'logs': [],
+        'cache_refresh': None,
+    }
+    _append_job_log(job, '更新任务已创建，等待执行。')
+    with update_jobs_lock:
+        update_jobs[job_id] = job
+    return job_id
+
+
 def _create_selection_job(requested_boards, requested_strategies):
     job_id = uuid.uuid4().hex[:12]
     now = _job_timestamp()
@@ -322,6 +397,7 @@ def block_requests_after_halt():
         'get_system_status',
         'emergency_stop',
         'get_selection_job_status',
+        'get_update_job_status',
     }
     if request.endpoint in allowed_endpoints:
         return None
@@ -465,6 +541,164 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
         _append_job_log_by_id(job_id, f"执行失败: {exc}")
 
 
+def _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=100):
+    total_count = int(payload.get('total_count') or 0)
+    processed_count = int(payload.get('processed_count') or 0)
+    raw_progress = int(payload.get('progress_pct') or 0)
+    overall_progress = min(100, max(0, phase_offset + int(raw_progress * phase_weight / 100)))
+    current_stock = payload.get('current_stock')
+    current_step = payload.get('current_step') or '同步数据中'
+
+    _update_update_job(
+        job_id,
+        progress_pct=overall_progress,
+        processed_count=processed_count,
+        total_count=total_count,
+        current_step=current_step,
+        current_stock=current_stock,
+    )
+
+
+def _refresh_market_caches_for_job(job_id, data_dir):
+    _append_update_job_log(job_id, '开始刷新市场缓存。')
+
+    def cache_progress(payload):
+        stage = payload.get('stage')
+        if stage == 'snapshot':
+            _emit_update_progress(job_id, payload, phase_offset=82, phase_weight=12)
+        elif stage == 'industry':
+            _emit_update_progress(job_id, payload, phase_offset=94, phase_weight=5)
+
+    cache_result = rebuild_market_caches(
+        data_dir=data_dir,
+        progress_callback=cache_progress,
+        preserve_existing=True,
+    )
+
+    if cache_result.get('errors'):
+        _append_update_job_log(
+            job_id,
+            f"缓存刷新完成，但存在降级项: {cache_result['errors']}"
+        )
+    else:
+        _append_update_job_log(job_id, '市场缓存刷新完成。')
+
+    _update_update_job(job_id, cache_refresh=cache_result.get('errors') or {})
+
+
+def _run_update_job(job_id, provider_name, provider_token):
+    config = _load_config()
+    data_dir = str(_config_value(config, 'data_dir', default='data'))
+
+    try:
+        if _is_halted():
+            _update_update_job(job_id, status='halted', error='系统已急停')
+            _append_update_job_log(job_id, '任务因系统急停而终止。')
+            return
+
+        _update_update_job(
+            job_id,
+            status='running',
+            started_at=_job_timestamp(),
+            current_step='准备更新环境',
+            error=None,
+            progress_pct=1,
+        )
+        _append_update_job_log(job_id, f'开始执行数据更新，数据源: {provider_name}。')
+
+        provider = create_data_provider(
+            provider_name=provider_name,
+            data_dir=data_dir,
+            config=config,
+            token=(provider_token or '').strip() or None,
+        )
+        target_universe = provider.get_target_universe(board='all', max_stocks=None)
+        _update_update_job(
+            job_id,
+            total_count=len(target_universe),
+            current_step='分析目标股票池',
+        )
+        _append_update_job_log(job_id, f'目标股票池 {len(target_universe)} 只，准备开始同步。')
+
+        def progress_callback(payload):
+            _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=82)
+            if payload.get('current_stock') and payload.get('stage') == 'sync':
+                stock = payload['current_stock']
+                step = payload.get('current_step') or '同步数据中'
+                processed = payload.get('processed_count') or 0
+                total = payload.get('total_count') or 0
+                if processed == 1 or processed == total or processed % 150 == 0:
+                    _append_update_job_log(
+                        job_id,
+                        f"{step}: {stock.get('name', '未知')}({stock.get('code', '--')}) {processed}/{max(total, 1)}"
+                    )
+
+        provider.sync_target_data(
+            target_universe,
+            board='all',
+            max_stocks=None,
+            purpose='run',
+            progress_callback=progress_callback,
+            halt_checker=_is_halted,
+        )
+
+        if _is_halted():
+            _update_update_job(job_id, status='halted', error='系统已急停')
+            _append_update_job_log(job_id, '任务因系统急停而终止。')
+            return
+
+        _refresh_market_caches_for_job(job_id, data_dir)
+        _update_update_job(
+            job_id,
+            status='completed',
+            progress_pct=100,
+            current_step='更新完成',
+            current_stock=None,
+            finished_at=_job_timestamp(),
+        )
+        _append_update_job_log(job_id, '数据更新与缓存重建已完成。')
+    except InterruptedError:
+        _update_update_job(
+            job_id,
+            status='halted',
+            error='系统已急停',
+            current_stock=None,
+            finished_at=_job_timestamp(),
+        )
+        _append_update_job_log(job_id, '任务因系统急停而终止。')
+    except DataProviderError as exc:
+        _update_update_job(
+            job_id,
+            status='error',
+            error=str(exc),
+            current_stock=None,
+            finished_at=_job_timestamp(),
+        )
+        _append_update_job_log(job_id, f'更新失败: {exc}')
+    except Exception as exc:
+        _update_update_job(
+            job_id,
+            status='error',
+            error=str(exc),
+            current_stock=None,
+            finished_at=_job_timestamp(),
+        )
+        _append_update_job_log(job_id, f'更新失败: {exc}')
+
+
+def _warm_market_caches_background():
+    config = _load_config()
+    data_dir = str(_config_value(config, 'data_dir', default='data'))
+    try:
+        if market_cache_needs_refresh(data_dir=data_dir):
+            rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
+        else:
+            ensure_market_caches(data_dir=data_dir)
+        print("✓ 市场云图缓存已就绪")
+    except Exception as exc:
+        print(f"⚠️ 市场云图缓存预热失败: {exc}")
+
+
 @app.route('/')
 def index():
     """主页"""
@@ -477,6 +711,7 @@ def get_stocks():
     try:
         stocks = csv_manager.list_all_stocks()
         stock_names = _load_stock_names()
+        stocks = _filter_hidden_stock_codes(stocks, stock_names)
 
         requested_board = _normalize_csv_value(request.args.get('board'))
         if requested_board in {"main", "chinext", "star"}:
@@ -564,6 +799,7 @@ def run_selection():
             if _classify_board(code) in requested_boards
         ]
         stock_names = _load_stock_names()
+        stock_codes = _filter_hidden_stock_codes(stock_codes, stock_names)
         candidates = []
         invalid_name_count = 0
         for code in stock_codes:
@@ -717,7 +953,8 @@ def get_selection_job_status(job_id):
 def get_selection_options():
     """获取选股页需要的板块和策略选项。"""
     try:
-        stock_codes = csv_manager.list_all_stocks()
+        stock_names = _load_stock_names()
+        stock_codes = _filter_hidden_stock_codes(csv_manager.list_all_stocks(), stock_names)
         board_counts = _build_board_counts(stock_codes)
         boards = [
             {
@@ -765,7 +1002,8 @@ def get_strategies():
 def get_stats():
     """获取系统统计信息"""
     try:
-        stocks = csv_manager.list_all_stocks()
+        stock_names = _load_stock_names()
+        stocks = _filter_hidden_stock_codes(csv_manager.list_all_stocks(), stock_names)
         board_counts = _build_board_counts(stocks)
         
         # 计算数据日期范围
@@ -789,6 +1027,177 @@ def get_stats():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/heatmap')
+def get_heatmap():
+    """获取市场云图数据。"""
+    try:
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        scope = _normalize_csv_value(request.args.get('scope')) or 'all'
+        if scope not in {'all', 'main', 'chinext', 'star'}:
+            scope = 'all'
+
+        metric = _normalize_csv_value(request.args.get('metric')) or 'daily'
+        if metric not in {'daily', 'weekly', 'monthly', 'five_day'}:
+            metric = 'daily'
+
+        payload = build_heatmap_payload(data_dir=data_dir, scope=scope, metric=metric)
+        return jsonify({'success': True, 'data': payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/heatmap/meta')
+def get_heatmap_meta():
+    """获取市场云图元信息。"""
+    try:
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        cache_bundle = ensure_market_caches(data_dir=data_dir)
+        snapshot_stocks = cache_bundle.get('snapshot', {}).get('stocks', []) or []
+        visible_snapshot_stocks = [
+            stock for stock in snapshot_stocks
+            if not is_hidden_market_stock(stock.get('code'), stock.get('name'))
+        ]
+        industry_items = cache_bundle.get('industry', {}).get('items', {}) or {}
+        industry_mapped_count = sum(
+            1 for stock in visible_snapshot_stocks
+            if industry_items.get(stock.get('code'))
+        )
+        industry_unmapped_count = max(len(visible_snapshot_stocks) - industry_mapped_count, 0)
+        default_provider = get_config_value(config, 'data_source', 'default_provider', default='akshare')
+        has_tushare_token = bool(
+            os.getenv('TUSHARE_TOKEN')
+            or get_config_value(config, 'data_source', 'tushare', 'token')
+        )
+        cache_refresh_pending = market_cache_needs_refresh(data_dir=data_dir)
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'latest_date': cache_bundle.get('snapshot', {}).get('latest_date'),
+                'default_provider': str(default_provider or 'akshare').lower(),
+                'has_tushare_token': has_tushare_token,
+                'markets': [
+                    {'key': 'all', 'label': 'A股全图', 'enabled': True},
+                    {'key': 'main', 'label': '上证A股', 'enabled': True},
+                    {'key': 'chinext', 'label': '创业板', 'enabled': True},
+                    {'key': 'star', 'label': '科创板', 'enabled': True},
+                    {
+                        'key': 'bse',
+                        'label': '北交所A股',
+                        'enabled': False,
+                        'hint': '当前系统版本并不支持北交所，敬请期待～',
+                    },
+                ],
+                'metrics': [
+                    {'key': 'daily', 'label': '日线'},
+                    {'key': 'weekly', 'label': '本周以来'},
+                    {'key': 'monthly', 'label': '本月以来'},
+                    {'key': 'five_day', 'label': '最近五个交易日'},
+                ],
+                'cache_status': {
+                    'snapshot_updated_at': cache_bundle.get('snapshot', {}).get('updated_at'),
+                    'industry_updated_at': cache_bundle.get('industry', {}).get('updated_at'),
+                    'index_updated_at': cache_bundle.get('indices', {}).get('updated_at'),
+                    'industry_mapped_count': industry_mapped_count,
+                    'industry_unmapped_count': industry_unmapped_count,
+                    'refresh_pending': cache_refresh_pending,
+                    'errors': cache_bundle.get('errors', {}),
+                },
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/update/options')
+def get_update_options():
+    """获取 Web 更新数据功能的默认选项。"""
+    try:
+        config = _load_config()
+        default_provider = get_config_value(config, 'data_source', 'default_provider', default='akshare')
+        has_tushare_token = bool(
+            os.getenv('TUSHARE_TOKEN')
+            or get_config_value(config, 'data_source', 'tushare', 'token')
+        )
+        latest_date = ensure_market_caches(
+            data_dir=str(_config_value(config, 'data_dir', default='data'))
+        ).get('snapshot', {}).get('latest_date')
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'default_provider': str(default_provider or 'akshare').lower(),
+                'has_tushare_token': has_tushare_token,
+                'latest_date': latest_date,
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/update/start', methods=['POST'])
+def start_update_job():
+    """启动异步更新任务。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        running_job = _find_running_update_job()
+        if running_job:
+            return jsonify({
+                'success': False,
+                'error': '已有更新任务正在执行',
+                'job': running_job,
+            }), 409
+
+        running_selection = _find_running_job()
+        if running_selection:
+            return jsonify({
+                'success': False,
+                'error': '当前有选股任务正在执行，请等待完成后再更新数据',
+                'job': running_selection,
+            }), 409
+
+        payload = request.get_json(silent=True) or {}
+        provider = _normalize_csv_value(payload.get('provider')) or 'akshare'
+        if provider not in {'akshare', 'tushare'}:
+            return jsonify({'success': False, 'error': '不支持的数据源'}), 400
+
+        tushare_token = str(payload.get('tushare_token') or '').strip()
+        job_id = _create_update_job(provider)
+        thread = Thread(
+            target=_run_update_job,
+            args=(job_id, provider, tushare_token),
+            daemon=True,
+        )
+        thread.start()
+
+        with update_jobs_lock:
+            job = update_jobs.get(job_id)
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'data': _serialize_job(job),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/update/status/<job_id>')
+def get_update_job_status(job_id):
+    """查询异步更新任务状态。"""
+    with update_jobs_lock:
+        job = update_jobs.get(job_id)
+        if not job:
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+        return jsonify({
+            'success': True,
+            'data': _serialize_job(job),
+        })
 
 
 @app.route('/api/config', methods=['GET'])
@@ -852,6 +1261,7 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
     host, port = _resolve_web_address(host=host, port=port, auto_port=auto_port, config=config)
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"🌐 启动Web服务器: http://{display_host}:{port}")
+    Thread(target=_warm_market_caches_background, daemon=True).start()
     app.run(host=host, port=port, debug=debug, threaded=True)
 
 

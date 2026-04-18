@@ -326,21 +326,37 @@ class BaseDataProvider:
             "is_fresh": summary["stale"] == 0 and summary["full_refresh"] == 0,
         }
 
-    def sync_target_data(self, target_universe: List[dict], board: str = "all", max_stocks=None, purpose: str = "init"):
+    def sync_target_data(
+        self,
+        target_universe: List[dict],
+        board: str = "all",
+        max_stocks=None,
+        purpose: str = "init",
+        progress_callback=None,
+        halt_checker=None,
+    ):
         """
         智能续抓目标股票池：
         - 缺失/损坏/历史过短 -> 全量抓取
         - 已有但过期 -> 优先增量补齐
         - 已是最新 -> 跳过
         """
+        def emit_progress(**payload):
+            if progress_callback:
+                progress_callback(payload)
+
+        def ensure_not_halted():
+            if halt_checker and halt_checker():
+                raise InterruptedError("系统已急停")
+
         if not target_universe:
             print("✗ 目标股票池为空")
             return
 
+        ensure_not_halted()
         latest_trade_date = self.get_latest_trade_date()
         latest_trade_date = pd.to_datetime(latest_trade_date).date() if latest_trade_date else None
         latest_trade_date_str = latest_trade_date.isoformat() if latest_trade_date else "未知"
-        target_codes = [item["code"] for item in target_universe]
 
         status_map = {}
         up_to_date = []
@@ -365,10 +381,31 @@ class BaseDataProvider:
         print(f"  已最新: {len(up_to_date)} 只")
         print(f"  需增量补齐: {len(incremental)} 只")
         print(f"  需全量重抓: {len(full_refresh)} 只")
+        emit_progress(
+            stage="assessment",
+            current_step="检查本地数据状态",
+            latest_trade_date=latest_trade_date_str,
+            target_count=len(target_universe),
+            up_to_date_count=len(up_to_date),
+            incremental_count=len(incremental),
+            full_refresh_count=len(full_refresh),
+            processed_count=0,
+            total_count=len(incremental) + len(full_refresh),
+            progress_pct=0,
+            current_stock=None,
+        )
 
         if not incremental and not full_refresh:
             print("✓ 目标股票池已完整且为最新，无需继续抓取")
             self._write_profile_state(board, max_stocks, target_universe, latest_trade_date, status_map)
+            emit_progress(
+                stage="completed",
+                current_step="本地数据已是最新",
+                processed_count=0,
+                total_count=0,
+                progress_pct=100,
+                current_stock=None,
+            )
             return
 
         market_cap_targets = [item["code"] for item in incremental + full_refresh]
@@ -381,8 +418,19 @@ class BaseDataProvider:
         failed_count = 0
         print("\n开始同步目标股票池数据...")
         print("=" * 60)
+        emit_progress(
+            stage="sync",
+            current_step="开始同步目标股票池数据",
+            processed_count=processed,
+            total_count=total_work,
+            progress_pct=0,
+            current_stock=None,
+            success_count=success_count,
+            failed_count=failed_count,
+        )
 
         for item in incremental:
+            ensure_not_halted()
             code = item["code"]
             name = item.get("name", "")
             latest_local = status_map[code].get("latest_date")
@@ -391,9 +439,20 @@ class BaseDataProvider:
             trading_days_needed = max(len(missing_trade_dates), 1) if latest_trade_date and latest_local_date else 10
 
             processed += 1
+            current_stock = {"code": code, "name": name}
             progress_prefix = tracker.line(
                 processed,
                 extra=f"成功 {success_count} | 失败 {failed_count}"
+            )
+            emit_progress(
+                stage="sync",
+                current_step="增量补齐",
+                processed_count=processed,
+                total_count=total_work,
+                progress_pct=int((processed / max(total_work, 1)) * 100),
+                current_stock=current_stock,
+                success_count=success_count,
+                failed_count=failed_count,
             )
             print(f"{progress_prefix}\n  -> 增量补齐 {code} {name} (缺 {trading_days_needed} 个交易日)...", end=" ")
             df = self.fetch_stock_update(code, days=min(trading_days_needed, 1000))
@@ -413,6 +472,16 @@ class BaseDataProvider:
                 tracker.total = max(total_work, 1)
                 status_map[code]["status"] = "full_refresh"
                 status_map[code]["reason"] = "incremental_failed"
+            emit_progress(
+                stage="sync",
+                current_step="增量补齐完成",
+                processed_count=processed,
+                total_count=total_work,
+                progress_pct=int((processed / max(total_work, 1)) * 100),
+                current_stock=current_stock,
+                success_count=success_count,
+                failed_count=failed_count,
+            )
 
             if processed % 10 == 0:
                 time.sleep(0.1)
@@ -425,12 +494,24 @@ class BaseDataProvider:
                 seen_codes.add(item["code"])
 
         for item in refresh_queue:
+            ensure_not_halted()
             code = item["code"]
             name = item.get("name", "")
             processed += 1
+            current_stock = {"code": code, "name": name}
             progress_prefix = tracker.line(
                 processed,
                 extra=f"成功 {success_count} | 失败 {failed_count}"
+            )
+            emit_progress(
+                stage="sync",
+                current_step="全量重抓",
+                processed_count=processed,
+                total_count=total_work,
+                progress_pct=int((processed / max(total_work, 1)) * 100),
+                current_stock=current_stock,
+                success_count=success_count,
+                failed_count=failed_count,
             )
             print(f"{progress_prefix}\n  -> 全量重抓 {code} {name} ...", end=" ")
             df = self.fetch_stock_history(code, years=6)
@@ -450,6 +531,16 @@ class BaseDataProvider:
                 status_map[code] = failed
                 failed_count += 1
                 print("✗")
+            emit_progress(
+                stage="sync",
+                current_step="全量重抓完成",
+                processed_count=processed,
+                total_count=total_work,
+                progress_pct=int((processed / max(total_work, 1)) * 100),
+                current_stock=current_stock,
+                success_count=success_count,
+                failed_count=failed_count,
+            )
 
             if processed % 10 == 0:
                 time.sleep(0.1)
@@ -461,6 +552,17 @@ class BaseDataProvider:
             final_summary[info["status"]] = final_summary.get(info["status"], 0) + 1
         summary_text = " | ".join(f"{k}: {v}" for k, v in sorted(final_summary.items()))
         print(f"同步完成: {summary_text} | 总耗时 {tracker.elapsed_text()}")
+        emit_progress(
+            stage="completed",
+            current_step="目标股票池同步完成",
+            processed_count=processed,
+            total_count=total_work,
+            progress_pct=100,
+            current_stock=None,
+            success_count=success_count,
+            failed_count=failed_count,
+            summary=final_summary,
+        )
 
         self._write_profile_state(board, max_stocks, target_universe, latest_trade_date, status_map)
 

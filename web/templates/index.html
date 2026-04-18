@@ -7,6 +7,7 @@
     <title>A股量化选股控制台</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 </head>
 <body>
 <div id="halt-confirm" class="halt-confirm">
@@ -64,6 +65,13 @@
                     <rect x="9.5" y="9.5" width="5" height="5"></rect>
                 </svg>
                 <span>系统概览</span>
+            </li>
+            <li class="nav-item" data-page="heatmap">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+                    <rect x="1.5" y="1.5" width="13" height="13"></rect>
+                    <path d="M1.5 6h13M5.5 1.5v13"></path>
+                </svg>
+                <span>市场云图</span>
             </li>
             <li class="nav-item" data-page="stocks">
                 <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
@@ -258,7 +266,7 @@
                         <input type="text" id="stock-search" class="search-input" placeholder="搜索代码或名称">
                     </div>
                     <div class="table-wrap">
-                        <table class="data-table" id="stocks-table">
+                        <table class="data-table stable-scroll-table" id="stocks-table">
                             <thead>
                                 <tr>
                                     <th>代码</th>
@@ -277,6 +285,114 @@
                                 </tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </section>
+
+            <section id="heatmap-page" class="page">
+                <div class="heatmap-layout">
+                    <aside class="panel heatmap-sidebar-panel">
+                        <div class="panel-header">
+                            <span class="panel-title">市场筛选</span>
+                            <span class="panel-meta">Heatmap Controls</span>
+                        </div>
+                        <div class="panel-body heatmap-sidebar-body">
+                            <div class="heatmap-date-card">
+                                <span class="heatmap-date-label">最新交易日</span>
+                                <span class="heatmap-date-value" id="heatmap-latest-date">--</span>
+                            </div>
+
+                            <div class="heatmap-filter-section">
+                                <div class="heatmap-filter-title">市场范围</div>
+                                <div class="heatmap-filter-list" id="heatmap-market-filter">
+                                    <button class="heatmap-filter-btn active" data-scope="all" type="button">A股全图</button>
+                                    <button class="heatmap-filter-btn" data-scope="main" type="button">上证A股</button>
+                                    <button class="heatmap-filter-btn" data-scope="chinext" type="button">创业板</button>
+                                    <button class="heatmap-filter-btn" data-scope="star" type="button">科创板</button>
+                                    <button
+                                        class="heatmap-filter-btn disabled"
+                                        data-scope="bse"
+                                        type="button"
+                                        disabled
+                                        title="当前系统版本并不支持北交所，敬请期待～">
+                                        北交所A股
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="heatmap-filter-section">
+                                <div class="heatmap-filter-title">涨跌口径</div>
+                                <div class="heatmap-filter-list metric" id="heatmap-metric-filter">
+                                    <button class="heatmap-filter-btn active" data-metric="daily" type="button">日线</button>
+                                    <button class="heatmap-filter-btn" data-metric="weekly" type="button">本周以来</button>
+                                    <button class="heatmap-filter-btn" data-metric="monthly" type="button">本月以来</button>
+                                    <button class="heatmap-filter-btn" data-metric="five_day" type="button">最近五个交易日</button>
+                                </div>
+                            </div>
+
+                            <div class="heatmap-legend">
+                                <div class="heatmap-legend-title">颜色参考</div>
+                                <div class="heatmap-legend-bar">
+                                    <span class="neg">-4%</span>
+                                    <span class="mid">0%</span>
+                                    <span class="pos">+4%</span>
+                                </div>
+                                <div class="heatmap-filter-note" id="heatmap-cache-note">将根据本地 CSV 与缓存文件生成市场云图</div>
+                            </div>
+                        </div>
+                    </aside>
+
+                    <div class="heatmap-main">
+                        <section class="panel heatmap-header-panel">
+                            <div class="panel-body heatmap-header-body">
+                                <div class="heatmap-index-grid" id="heatmap-index-grid">
+                                    <div class="state-loading">加载指数摘要...</div>
+                                </div>
+                                <div class="heatmap-ticker-strip">
+                                    <div class="heatmap-ticker-track" id="heatmap-ticker-track">市场统计加载中...</div>
+                                </div>
+                            </div>
+                        </section>
+
+                        <div class="heatmap-fullscreen-shell" id="heatmap-fullscreen-shell">
+                            <section class="panel heatmap-panel">
+                                <div class="panel-header panel-header-wrap">
+                                    <div>
+                                        <span class="panel-title">A股市场云图</span>
+                                        <div class="panel-subtitle" id="heatmap-subtitle">按行业聚合，面积映射总市值，颜色映射最新口径涨跌幅</div>
+                                    </div>
+                                    <div class="heatmap-panel-actions">
+                                        <button class="btn btn-ghost" id="heatmap-fullscreen-btn" type="button" aria-pressed="false">
+                                            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
+                                                <polyline points="4,1.5 1.5,1.5 1.5,4"></polyline>
+                                                <polyline points="8,1.5 10.5,1.5 10.5,4"></polyline>
+                                                <polyline points="1.5,8 1.5,10.5 4,10.5"></polyline>
+                                                <polyline points="8,10.5 10.5,10.5 10.5,8"></polyline>
+                                            </svg>
+                                            <span class="heatmap-fullscreen-label">全屏显示</span>
+                                        </button>
+                                        <button class="btn btn-ghost" id="refresh-heatmap-btn" type="button">
+                                            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
+                                                <path d="M10 6A4 4 0 1 1 6 2"></path>
+                                                <polyline points="10,2 10,6 6,6"></polyline>
+                                            </svg>
+                                            刷新云图
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="panel-body heatmap-panel-body">
+                                    <div class="heatmap-status-row">
+                                        <span id="heatmap-scope-label">A股全图</span>
+                                        <span id="heatmap-metric-label">日线</span>
+                                        <span id="heatmap-stock-count">-- 只股票</span>
+                                    </div>
+                                    <div class="heatmap-chart-wrap">
+                                        <div class="heatmap-loading-overlay" id="heatmap-loading-overlay">正在生成市场云图...</div>
+                                        <div id="heatmap-chart"></div>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -394,10 +510,88 @@
     </main>
 </div>
 
-<button class="halt-btn" id="halt-btn" type="button">
-    <span class="halt-btn-dot"></span>
-    <span>EMERGENCY HALT</span>
-</button>
+<div class="floating-controls" id="floating-controls">
+    <button class="floating-btn update-btn" id="update-data-btn" type="button">
+        <span>更新数据</span>
+    </button>
+    <button class="floating-btn halt-btn" id="halt-btn" type="button">
+        <span class="halt-btn-dot"></span>
+        <span>急停</span>
+    </button>
+</div>
+
+<div id="update-modal" class="modal-backdrop">
+    <div class="modal-box update-modal-box">
+        <div class="modal-header">
+            <div>
+                <div class="modal-kicker">DATA UPDATE</div>
+                <span class="modal-title" id="update-modal-title">选择更新数据源</span>
+            </div>
+            <button class="modal-close" id="update-modal-close-btn" type="button">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <line x1="2" y1="2" x2="14" y2="14"></line>
+                    <line x1="14" y1="2" x2="2" y2="14"></line>
+                </svg>
+            </button>
+        </div>
+        <div class="modal-body update-modal-body">
+            <div class="update-modal-step active" id="update-provider-step">
+                <div class="update-modal-note">请选择本次更新要使用的数据源。</div>
+                <div class="update-provider-grid">
+                    <button class="update-provider-btn" data-provider="akshare" type="button">AkShare</button>
+                    <button class="update-provider-btn" data-provider="tushare" type="button">Tushare</button>
+                </div>
+            </div>
+
+            <div class="update-modal-step" id="update-token-step">
+                <div class="update-modal-note">选择了 Tushare。请输入 Token，若本地已配置也可留空继续。</div>
+                <label class="update-token-label" for="update-tushare-token">Tushare Token</label>
+                <input class="search-input update-token-input" id="update-tushare-token" type="password" placeholder="输入 Tushare Token，或留空使用本地配置">
+                <div class="update-token-actions">
+                    <button class="btn btn-ghost" id="update-token-back-btn" type="button">返回</button>
+                    <button class="btn btn-primary" id="update-token-confirm-btn" type="button">开始更新</button>
+                </div>
+            </div>
+
+            <div class="update-modal-step" id="update-progress-step">
+                <div class="update-modal-note" id="update-progress-headline">更新任务进行中...</div>
+                <div class="selection-progress-bar-wrap update-progress-bar-wrap">
+                    <div class="selection-progress-bar">
+                        <div class="selection-progress-bar-fill" id="update-progress-bar-fill" style="width:0%"></div>
+                    </div>
+                    <div class="selection-progress-bar-text" id="update-progress-pct">0%</div>
+                </div>
+                <div class="selection-progress-grid update-progress-grid">
+                    <div class="selection-summary-card">
+                        <span class="label">当前步骤</span>
+                        <span class="value" id="update-current-step">等待执行</span>
+                    </div>
+                    <div class="selection-summary-card">
+                        <span class="label">已处理</span>
+                        <span class="value" id="update-processed-count">0 / 0</span>
+                    </div>
+                    <div class="selection-summary-card">
+                        <span class="label">数据源</span>
+                        <span class="value" id="update-provider-value">--</span>
+                    </div>
+                    <div class="selection-summary-card">
+                        <span class="label">耗时</span>
+                        <span class="value" id="update-elapsed-value">00:00</span>
+                    </div>
+                </div>
+                <div class="progress-log-panel">
+                    <div class="progress-log-header">
+                        <span>Update Feed</span>
+                        <span id="update-progress-status">QUEUED</span>
+                    </div>
+                    <div class="progress-log-list" id="update-progress-logs">
+                        <div class="progress-log-row"><span class="progress-log-message">等待任务启动...</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 
 <div id="stock-modal" class="modal-backdrop">
     <div class="modal-box">
@@ -416,6 +610,43 @@
         <div class="modal-body">
             <canvas id="stock-chart"></canvas>
             <div id="stock-info"></div>
+        </div>
+    </div>
+</div>
+
+<div id="industry-modal" class="modal-backdrop">
+    <div class="modal-box industry-modal-box">
+        <div class="modal-header">
+            <div>
+                <div class="modal-kicker">INDUSTRY DETAIL</div>
+                <span class="modal-title" id="industry-modal-title">--</span>
+            </div>
+            <button class="modal-close" id="industry-modal-close-btn" type="button">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <line x1="2" y1="2" x2="14" y2="14"></line>
+                    <line x1="14" y1="2" x2="2" y2="14"></line>
+                </svg>
+            </button>
+        </div>
+        <div class="modal-body">
+            <div class="industry-modal-subtitle" id="industry-modal-subtitle">--</div>
+            <div class="table-wrap industry-table-wrap">
+                <table class="data-table stable-scroll-table industry-detail-table">
+                    <thead>
+                        <tr>
+                            <th>代码</th>
+                            <th>名称</th>
+                            <th>板块</th>
+                            <th>股价</th>
+                            <th id="industry-modal-change-header">涨跌幅</th>
+                            <th>市值(亿)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="industry-modal-tbody">
+                        <tr><td colspan="6" class="state-loading">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 </div>
