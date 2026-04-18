@@ -2,6 +2,7 @@
 
 const PAGE_TITLES = {
     dashboard: '系统概览',
+    heatmap: '市场云图',
     stocks: '股票列表',
     selection: '执行选股',
     strategies: '策略配置',
@@ -16,6 +17,7 @@ const BOARD_LABELS = {
 const state = {
     currentPage: 'dashboard',
     chartInstance: null,
+    heatmapChart: null,
     allStocksCache: [],
     stocksLoaded: false,
     stocksLoadingPromise: null,
@@ -29,9 +31,19 @@ const state = {
     activeControllers: new Set(),
     selectionPollTimer: null,
     currentSelectionJobId: null,
+    updatePollTimer: null,
+    currentUpdateJobId: null,
     localProgressTimer: null,
     jobStartTime: null,
     serverElapsedBase: 0,
+    heatmapMetaLoaded: false,
+    heatmapMarkets: [],
+    heatmapScope: 'all',
+    heatmapMetric: 'daily',
+    heatmapGroups: [],
+    heatmapLoading: false,
+    updateModalStep: 'provider',
+    updateProvider: null,
 };
 
 function escapeHtml(value) {
@@ -70,6 +82,76 @@ function formatDateTime(value) {
         second: '2-digit',
         hour12: false,
     }).format(date);
+}
+
+function formatPercent(value, digits = 2) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    const fixed = numeric.toFixed(digits);
+    return `${numeric > 0 ? '+' : ''}${fixed}%`;
+}
+
+function heatmapMetricLabel(metric) {
+    const mapping = {
+        daily: '日线',
+        weekly: '本周以来',
+        monthly: '本月以来',
+        five_day: '最近五个交易日',
+    };
+    return mapping[metric] || metric;
+}
+
+function heatmapScopeLabel(scope) {
+    const mapping = {
+        all: 'A股全图',
+        main: '上证A股',
+        chinext: '创业板',
+        star: '科创板',
+        bse: '北交所A股',
+    };
+    return mapping[scope] || scope;
+}
+
+function signedClass(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric === 0) {
+        return '';
+    }
+    return numeric > 0 ? 'up' : 'down';
+}
+
+function heatmapColor(changePct) {
+    const value = Number(changePct);
+    if (!Number.isFinite(value)) {
+        return '#45515d';
+    }
+    const clamped = Math.max(-4, Math.min(4, value));
+    if (clamped >= 0) {
+        const ratio = clamped / 4;
+        const red = Math.round(79 + (201 - 79) * ratio);
+        const green = Math.round(90 - (90 - 65) * ratio);
+        const blue = Math.round(102 - (102 - 65) * ratio);
+        return `rgb(${red}, ${green}, ${blue})`;
+    }
+    const ratio = Math.abs(clamped) / 4;
+    const red = Math.round(69 - (69 - 18) * ratio);
+    const green = Math.round(81 + (156 - 81) * ratio);
+    const blue = Math.round(93 - (93 - 85) * ratio);
+    return `rgb(${red}, ${green}, ${blue})`;
+}
+
+function heatmapGroupPalette(index) {
+    const palette = [
+        { base: 'rgba(125, 139, 156, 0.20)', hover: 'rgba(125, 139, 156, 0.06)' },
+        { base: 'rgba(111, 126, 145, 0.18)', hover: 'rgba(111, 126, 145, 0.05)' },
+        { base: 'rgba(140, 130, 150, 0.18)', hover: 'rgba(140, 130, 150, 0.05)' },
+        { base: 'rgba(138, 125, 118, 0.18)', hover: 'rgba(138, 125, 118, 0.05)' },
+        { base: 'rgba(111, 140, 136, 0.18)', hover: 'rgba(111, 140, 136, 0.05)' },
+        { base: 'rgba(118, 128, 109, 0.18)', hover: 'rgba(118, 128, 109, 0.05)' },
+    ];
+    return palette[index % palette.length];
 }
 
 function toast(message, type = 'info', duration = 2600) {
@@ -145,6 +227,13 @@ function stopSelectionPolling() {
         state.selectionPollTimer = null;
     }
     stopLocalProgressTimer();
+}
+
+function stopUpdatePolling() {
+    if (state.updatePollTimer) {
+        window.clearInterval(state.updatePollTimer);
+        state.updatePollTimer = null;
+    }
 }
 
 function scrollResultsToTop() {
@@ -262,6 +351,10 @@ function switchPage(page) {
         return;
     }
 
+    if (page !== 'heatmap') {
+        exitHeatmapFullscreenIfNeeded().catch(() => {});
+    }
+
     state.currentPage = page;
 
     document.querySelectorAll('.nav-item').forEach(item => {
@@ -277,6 +370,10 @@ function switchPage(page) {
 
     if (page === 'dashboard') {
         loadStats();
+    }
+    if (page === 'heatmap') {
+        loadHeatmapMeta();
+        loadHeatmap();
     }
     if (page === 'stocks') {
         loadStocks();
@@ -324,6 +421,377 @@ async function loadStats() {
         }
     } catch (error) {
         console.error('loadStats failed:', error);
+    }
+}
+
+async function loadHeatmapMeta(forceReload = false) {
+    if (state.systemHalted) {
+        return;
+    }
+    if (state.heatmapMetaLoaded && !forceReload) {
+        renderHeatmapFilters();
+        return;
+    }
+
+    try {
+        const result = await apiFetch('/api/heatmap/meta');
+        if (!result.success) {
+            throw new Error(result.error || '市场云图元数据加载失败');
+        }
+        const data = result.data || {};
+        state.heatmapMetaLoaded = true;
+        state.heatmapMarkets = data.markets || [];
+        const cacheErrors = data.cache_status?.errors || {};
+        const unmappedCount = Number(data.cache_status?.industry_unmapped_count || 0);
+        const refreshPending = Boolean(data.cache_status?.refresh_pending);
+        document.getElementById('heatmap-latest-date').textContent = data.latest_date || '--';
+        document.getElementById('heatmap-cache-note').textContent = Object.keys(cacheErrors).length
+            ? `缓存已降级使用旧数据: ${Object.keys(cacheErrors).join(' / ')}`
+            : (refreshPending
+                ? '行业分类缓存正在后台补全，未分类会逐步减少'
+                : (unmappedCount > 0
+                ? `行业缓存仍有 ${formatNumber(unmappedCount)} 只股票未归类，系统会继续尝试补全`
+                : '行业分类缓存已完整匹配，板块可直接点开查看全部股票'));
+        renderHeatmapFilters();
+    } catch (error) {
+        document.getElementById('heatmap-cache-note').textContent = `元数据加载失败: ${error.message}`;
+    }
+}
+
+function renderHeatmapFilters() {
+    const marketContainer = document.getElementById('heatmap-market-filter');
+    if (marketContainer && state.heatmapMarkets.length) {
+        marketContainer.innerHTML = state.heatmapMarkets.map(item => `
+            <button
+                class="heatmap-filter-btn ${state.heatmapScope === item.key ? 'active' : ''} ${item.enabled ? '' : 'disabled'}"
+                data-scope="${escapeHtml(item.key)}"
+                type="button"
+                ${item.enabled ? '' : 'disabled'}
+                title="${escapeHtml(item.hint || '')}">
+                ${escapeHtml(item.label)}
+            </button>
+        `).join('');
+    }
+
+    const metricContainer = document.getElementById('heatmap-metric-filter');
+    if (metricContainer) {
+        metricContainer.querySelectorAll('[data-metric]').forEach(button => {
+            button.classList.toggle('active', button.dataset.metric === state.heatmapMetric);
+        });
+    }
+}
+
+function setHeatmapLoading(isLoading, message = '正在生成市场云图...') {
+    state.heatmapLoading = isLoading;
+    const wrap = document.querySelector('.heatmap-chart-wrap');
+    const overlay = document.getElementById('heatmap-loading-overlay');
+    if (!wrap || !overlay) {
+        return;
+    }
+    wrap.classList.toggle('loading', isLoading);
+    overlay.textContent = message;
+}
+
+function buildTickerText(stats, latestDate) {
+    const medianText = Number.isFinite(Number(stats?.median_change_pct))
+        ? `${Number(stats.median_change_pct).toFixed(2)}%`
+        : '--';
+    const parts = [
+        `上涨家数 ${formatNumber(stats?.up_count ?? 0)}`,
+        `下跌家数 ${formatNumber(stats?.down_count ?? 0)}`,
+        `平盘家数 ${formatNumber(stats?.flat_count ?? 0)}`,
+        `中位涨幅 ${medianText}`,
+        `最新交易日 ${latestDate || '--'}`,
+    ];
+    return `${parts.join('   •   ')}   •   ${parts.join('   •   ')}`;
+}
+
+function renderHeatmapIndices(indices) {
+    const container = document.getElementById('heatmap-index-grid');
+    if (!container) {
+        return;
+    }
+    if (!indices || !indices.length) {
+        container.innerHTML = '<div class="state-empty">暂无指数摘要缓存</div>';
+        return;
+    }
+    container.innerHTML = indices.map(item => `
+        <div class="heatmap-index-card">
+            <div class="heatmap-index-name">${escapeHtml(item.name)}</div>
+            <span class="heatmap-index-price">${escapeHtml(formatNumber(item.latest_price))}</span>
+            <span class="heatmap-index-change ${signedClass(item.change_pct)}">${escapeHtml(formatPercent(item.change_pct))}</span>
+        </div>
+    `).join('');
+}
+
+function getHeatmapFullscreenShell() {
+    return document.getElementById('heatmap-fullscreen-shell');
+}
+
+function getFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+
+function fullscreenEnabled() {
+    return Boolean(document.fullscreenEnabled || document.webkitFullscreenEnabled);
+}
+
+function resizeHeatmapChart(delay = 0) {
+    window.setTimeout(() => {
+        if (state.heatmapChart) {
+            state.heatmapChart.resize();
+        }
+    }, delay);
+}
+
+function syncHeatmapFullscreenState() {
+    const shell = getHeatmapFullscreenShell();
+    const button = document.getElementById('heatmap-fullscreen-btn');
+    const label = button ? button.querySelector('.heatmap-fullscreen-label') : null;
+    const isFullscreen = Boolean(shell && getFullscreenElement() === shell);
+
+    document.body.classList.toggle('heatmap-fullscreen-active', isFullscreen);
+    if (button) {
+        button.classList.toggle('active', isFullscreen);
+        button.setAttribute('aria-pressed', String(isFullscreen));
+    }
+    if (label) {
+        label.textContent = isFullscreen ? '退出全屏' : '全屏显示';
+    }
+
+    resizeHeatmapChart(40);
+    resizeHeatmapChart(220);
+}
+
+async function exitHeatmapFullscreenIfNeeded() {
+    const shell = getHeatmapFullscreenShell();
+    if (shell && getFullscreenElement() === shell) {
+        if (document.exitFullscreen) {
+            await document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen();
+        }
+    }
+}
+
+async function toggleHeatmapFullscreen() {
+    if (state.systemHalted) {
+        return;
+    }
+
+    const shell = getHeatmapFullscreenShell();
+    if (!shell || !fullscreenEnabled()) {
+        toast('当前浏览器不支持全屏模式', 'error');
+        return;
+    }
+
+    try {
+        if (getFullscreenElement() === shell) {
+            await exitHeatmapFullscreenIfNeeded();
+            return;
+        }
+        if (getFullscreenElement()) {
+            if (document.exitFullscreen) {
+                await document.exitFullscreen();
+            } else if (document.webkitExitFullscreen) {
+                document.webkitExitFullscreen();
+            }
+        }
+        if (shell.requestFullscreen) {
+            await shell.requestFullscreen();
+        } else if (shell.webkitRequestFullscreen) {
+            shell.webkitRequestFullscreen();
+        } else {
+            throw new Error('浏览器未提供可用的全屏接口');
+        }
+    } catch (error) {
+        toast(`全屏切换失败: ${error.message}`, 'error');
+    }
+}
+
+function renderHeatmapChart(groups) {
+    const container = document.getElementById('heatmap-chart');
+    if (!container) {
+        return;
+    }
+    if (!window.echarts) {
+        container.innerHTML = '<div class="state-empty">ECharts 加载失败，无法渲染云图。</div>';
+        return;
+    }
+    if (!state.heatmapChart) {
+        state.heatmapChart = window.echarts.init(container);
+        window.addEventListener('resize', () => {
+            if (state.heatmapChart) {
+                state.heatmapChart.resize();
+            }
+        });
+    }
+
+    state.heatmapGroups = Array.isArray(groups) ? groups : [];
+
+    const treeData = state.heatmapGroups.map((group, index) => {
+        const palette = heatmapGroupPalette(index);
+        return {
+            name: `${group.name}`,
+            group_name: group.name,
+            value: Number(group.market_cap || 0) / 1e8,
+            stock_count: group.stock_count,
+            change_pct: group.change_pct,
+            itemStyle: {
+                color: palette.base,
+            },
+            emphasis: {
+                itemStyle: {
+                    color: palette.hover,
+                    borderColor: 'rgba(255,255,255,0.26)',
+                    borderWidth: 3,
+                },
+            },
+            children: (group.children || []).map(item => ({
+                name: `${item.name}\n${Number.isFinite(Number(item.change_pct)) ? formatPercent(item.change_pct) : '--'}`,
+                value: item.value,
+                code: item.code,
+                industry: item.industry,
+                board: item.board,
+                latest_price: item.latest_price,
+                change_pct: item.change_pct,
+                market_cap: item.market_cap,
+                itemStyle: {
+                    color: heatmapColor(item.change_pct),
+                },
+            })),
+        };
+    });
+
+    state.heatmapChart.setOption({
+        backgroundColor: 'transparent',
+        tooltip: {
+            confine: true,
+            formatter(params) {
+                const data = params.data || {};
+                if (!data.code) {
+                    const groupChange = Number.isFinite(Number(data.change_pct))
+                        ? formatPercent(data.change_pct)
+                        : '--';
+                    return [
+                        `<strong>${escapeHtml(data.group_name || params.name)}</strong>`,
+                        `股票数: ${formatNumber(data.stock_count || data.children?.length || 0)}`,
+                        `平均涨跌幅: ${escapeHtml(groupChange)}`,
+                        '点击板块边框可查看全部个股明细',
+                    ].join('<br>');
+                }
+                const changeText = Number.isFinite(Number(data.change_pct))
+                    ? formatPercent(data.change_pct)
+                    : '--';
+                return [
+                    `<strong>${escapeHtml(data.name.split('\n')[0])}</strong>`,
+                    `代码: ${escapeHtml(data.code)}`,
+                    `行业: ${escapeHtml(data.industry || '未分类')}`,
+                    `最新价: ${escapeHtml(data.latest_price)}`,
+                    `涨跌幅: ${escapeHtml(changeText)}`,
+                    `总市值: ${escapeHtml(formatNumber(((Number(data.market_cap) || 0) / 1e8).toFixed(2)))} 亿`,
+                ].join('<br>');
+            },
+        },
+        series: [{
+            type: 'treemap',
+            roam: false,
+            nodeClick: false,
+            breadcrumb: { show: false },
+            visibleMin: 1,
+            squareRatio: 1.25,
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            label: {
+                show: true,
+                formatter(params) {
+                    return params.name;
+                },
+                color: '#f3f6fa',
+                fontSize: 12,
+            },
+            upperLabel: {
+                show: true,
+                color: '#f3f6fa',
+                height: 22,
+                fontSize: 16,
+            },
+            itemStyle: {
+                borderColor: 'rgba(255,255,255,0.08)',
+                borderWidth: 1,
+                gapWidth: 1,
+            },
+            emphasis: {
+                upperLabel: {
+                    color: '#ffffff',
+                },
+            },
+            levels: [
+                {
+                    itemStyle: {
+                        borderColor: 'rgba(255,255,255,0.12)',
+                        borderWidth: 2,
+                        gapWidth: 2,
+                    },
+                    upperLabel: {
+                        show: true,
+                    },
+                },
+                {
+                    itemStyle: {
+                        gapWidth: 1,
+                        borderColorSaturation: 0.5,
+                    },
+                },
+            ],
+            data: treeData,
+        }],
+    });
+
+    state.heatmapChart.off('click');
+    state.heatmapChart.on('click', params => {
+        const data = params?.data || {};
+        if (data.code) {
+            viewStockDetail(data.code, data.name ? String(data.name).split('\n')[0] : '');
+            return;
+        }
+        const groupName = data.group_name || params?.name;
+        const group = state.heatmapGroups.find(item => item.name === groupName);
+        if (group) {
+            openIndustryModal(group);
+        }
+    });
+}
+
+async function loadHeatmap(forceReload = false) {
+    if (state.systemHalted) {
+        return;
+    }
+    setHeatmapLoading(true, forceReload ? '正在刷新市场云图...' : '正在生成市场云图...');
+
+    try {
+        const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}`);
+        if (!result.success) {
+            throw new Error(result.error || '市场云图加载失败');
+        }
+        const data = result.data || {};
+        document.getElementById('heatmap-latest-date').textContent = data.latest_date || '--';
+        document.getElementById('heatmap-subtitle').textContent = `按行业聚合，面积映射总市值，颜色映射${heatmapMetricLabel(state.heatmapMetric)}涨跌幅`;
+        document.getElementById('heatmap-scope-label').textContent = heatmapScopeLabel(state.heatmapScope);
+        document.getElementById('heatmap-metric-label').textContent = heatmapMetricLabel(state.heatmapMetric);
+        document.getElementById('heatmap-stock-count').textContent = `${formatNumber(data.stock_count || 0)} 只股票`;
+        document.getElementById('heatmap-ticker-track').textContent = buildTickerText(data.ticker_stats, data.latest_date);
+        renderHeatmapIndices(data.header_indices || []);
+        renderHeatmapChart(data.groups || []);
+    } catch (error) {
+        const container = document.getElementById('heatmap-chart');
+        if (container) {
+            container.innerHTML = `<div class="state-empty">市场云图加载失败: ${escapeHtml(error.message)}</div>`;
+        }
+    } finally {
+        setHeatmapLoading(false);
     }
 }
 
@@ -617,6 +1085,191 @@ function renderStockChart(data) {
 
 function closeModal() {
     document.getElementById('stock-modal').classList.remove('active');
+}
+
+function closeIndustryModal() {
+    document.getElementById('industry-modal').classList.remove('active');
+}
+
+function openIndustryModal(group) {
+    if (!group || !Array.isArray(group.children)) {
+        return;
+    }
+
+    document.getElementById('industry-modal-title').textContent = group.name || '板块详情';
+    document.getElementById('industry-modal-subtitle').textContent =
+        `${heatmapMetricLabel(state.heatmapMetric)} · ${formatNumber(group.children.length)} 只股票 · 点击板块边框打开的明细视图`;
+    document.getElementById('industry-modal-change-header').textContent = `${heatmapMetricLabel(state.heatmapMetric)}涨跌幅`;
+
+    const tbody = document.getElementById('industry-modal-tbody');
+    tbody.innerHTML = group.children.map(item => `
+        <tr>
+            <td class="code-cell">${escapeHtml(item.code)}</td>
+            <td>${escapeHtml(item.name || '未知')}</td>
+            <td>${boardBadge(item.board || item.code)}</td>
+            <td class="mono">${escapeHtml(item.latest_price ?? '--')}</td>
+            <td class="mono metric-value ${signedClass(item.change_pct)}">${escapeHtml(formatPercent(item.change_pct))}</td>
+            <td class="mono">${escapeHtml(formatNumber(((Number(item.market_cap) || 0) / 1e8).toFixed(2)))}</td>
+        </tr>
+    `).join('');
+    document.getElementById('industry-modal').classList.add('active');
+}
+
+function setUpdateModalStep(step) {
+    state.updateModalStep = step;
+    document.querySelectorAll('#update-modal .update-modal-step').forEach(element => {
+        element.classList.toggle('active', element.id === `update-${step}-step`);
+    });
+
+    const title = document.getElementById('update-modal-title');
+    if (!title) {
+        return;
+    }
+    if (step === 'provider') {
+        title.textContent = '选择更新数据源';
+    } else if (step === 'token') {
+        title.textContent = '输入 Tushare Token';
+    } else {
+        title.textContent = '更新任务执行中';
+    }
+}
+
+function openUpdateModal() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法继续更新数据', 'error');
+        return;
+    }
+    state.updateProvider = null;
+    document.getElementById('update-tushare-token').value = '';
+    setUpdateModalStep('provider');
+    document.getElementById('update-modal').classList.add('active');
+}
+
+function closeUpdateModal() {
+    if (state.currentUpdateJobId && state.updateModalStep === 'progress') {
+        return;
+    }
+    document.getElementById('update-modal').classList.remove('active');
+}
+
+async function startUpdateJob(provider, token = '') {
+    setUpdateModalStep('progress');
+    document.getElementById('update-provider-value').textContent = provider.toUpperCase();
+    document.getElementById('update-progress-headline').textContent = '正在启动更新任务...';
+    document.getElementById('update-progress-logs').innerHTML = '<div class="progress-log-row"><span class="progress-log-message">正在创建任务...</span></div>';
+
+    try {
+        const result = await apiFetch('/api/update/start', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                provider,
+                tushare_token: token,
+            }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '更新任务启动失败');
+        }
+        state.currentUpdateJobId = result.job_id;
+        renderUpdateJob(result.data || {});
+        stopUpdatePolling();
+        state.updatePollTimer = window.setInterval(pollUpdateJobStatus, 1000);
+        await pollUpdateJobStatus();
+    } catch (error) {
+        setUpdateModalStep('provider');
+        toast(`更新失败: ${error.message}`, 'error');
+    }
+}
+
+function renderUpdateJob(job) {
+    const percent = Number(job.progress_pct || 0);
+    const updateButton = document.getElementById('update-data-btn');
+    if (updateButton) {
+        updateButton.disabled = ['queued', 'running'].includes(job.status);
+    }
+    document.getElementById('update-progress-bar-fill').style.width = `${Math.min(100, Math.max(0, percent))}%`;
+    document.getElementById('update-progress-pct').textContent = `${percent}%`;
+    document.getElementById('update-current-step').textContent = job.current_step || '等待执行';
+    document.getElementById('update-processed-count').textContent = `${formatNumber(job.processed_count || 0)} / ${formatNumber(job.total_count || 0)}`;
+    document.getElementById('update-provider-value').textContent = String(job.provider || '--').toUpperCase();
+    document.getElementById('update-elapsed-value').textContent = formatElapsed(job.elapsed_seconds || 0);
+    document.getElementById('update-progress-status').textContent = String(job.status || 'queued').toUpperCase();
+    document.getElementById('update-progress-headline').textContent = job.error
+        ? `更新失败: ${job.error}`
+        : (job.current_stock
+            ? `当前处理: ${job.current_stock.name || '未知'} (${job.current_stock.code || '--'})`
+            : (job.current_step || '更新任务进行中...'));
+
+    const logs = Array.isArray(job.logs) ? [...job.logs].reverse() : [];
+    document.getElementById('update-progress-logs').innerHTML = logs.map(item => `
+        <div class="progress-log-row">
+            <span class="progress-log-time">${escapeHtml(item.time)}</span>
+            <span class="progress-log-message">${escapeHtml(item.message)}</span>
+        </div>
+    `).join('') || '<div class="progress-log-row"><span class="progress-log-message">等待任务启动...</span></div>';
+}
+
+async function pollUpdateJobStatus() {
+    if (!state.currentUpdateJobId) {
+        return;
+    }
+    try {
+        const result = await apiFetch(`/api/update/status/${state.currentUpdateJobId}`, {}, {
+            allowWhenHalted: true,
+        });
+        if (!result.success) {
+            throw new Error(result.error || '更新状态同步失败');
+        }
+        const job = result.data || {};
+        renderUpdateJob(job);
+
+        if (job.status === 'completed') {
+            stopUpdatePolling();
+            state.currentUpdateJobId = null;
+            const updateButton = document.getElementById('update-data-btn');
+            if (updateButton) {
+                updateButton.disabled = false;
+            }
+            toast('数据更新完成', 'success');
+            await loadStats();
+            if (state.currentPage === 'heatmap') {
+                await Promise.all([loadHeatmapMeta(true), loadHeatmap(true)]);
+            } else {
+                state.heatmapMetaLoaded = false;
+            }
+            window.setTimeout(() => {
+                document.getElementById('update-modal').classList.remove('active');
+            }, 600);
+            return;
+        }
+
+        if (job.status === 'error') {
+            stopUpdatePolling();
+            state.currentUpdateJobId = null;
+            const updateButton = document.getElementById('update-data-btn');
+            if (updateButton) {
+                updateButton.disabled = false;
+            }
+            toast(`更新失败: ${job.error || '未知错误'}`, 'error');
+            return;
+        }
+
+        if (job.status === 'halted') {
+            stopUpdatePolling();
+            state.currentUpdateJobId = null;
+            applyHaltState(job.error || '系统已急停，当前更新任务已终止。');
+        }
+    } catch (error) {
+        stopUpdatePolling();
+        state.currentUpdateJobId = null;
+        const updateButton = document.getElementById('update-data-btn');
+        if (updateButton) {
+            updateButton.disabled = false;
+        }
+        toast(`更新状态同步失败: ${error.message}`, 'error');
+    }
 }
 
 function renderBoardOptions(boards) {
@@ -1290,6 +1943,9 @@ function applyHaltState(message = '全部 Web 功能已停止。重启服务器�
     stopSelectionPolling();
     abortActiveRequests();
     closeModal();
+    closeIndustryModal();
+    stopUpdatePolling();
+    exitHeatmapFullscreenIfNeeded().catch(() => {});
     setStatus('halted');
 
     const sub = document.getElementById('halt-overlay-sub');
@@ -1302,12 +1958,17 @@ function applyHaltState(message = '全部 Web 功能已停止。重启服务器�
     });
 
     const haltBtn = document.getElementById('halt-btn');
+    const updateBtn = document.getElementById('update-data-btn');
     if (haltBtn) {
         haltBtn.disabled = true;
         haltBtn.innerHTML = '<span class="halt-btn-dot"></span><span>HALTED</span>';
     }
+    if (updateBtn) {
+        updateBtn.disabled = true;
+    }
 
     document.getElementById('halt-confirm').classList.remove('active');
+    document.getElementById('update-modal').classList.remove('active');
     document.getElementById('halt-overlay').classList.add('active');
     document.getElementById('selection-results-headline').textContent = '系统已急停';
     document.getElementById('selection-results-meta').textContent = 'HALTED';
@@ -1418,10 +2079,54 @@ function bindEvents() {
     document.getElementById('refresh-dashboard-btn').addEventListener('click', loadStats);
     document.getElementById('refresh-selection-options-btn').addEventListener('click', () => loadSelectionOptions(true));
     document.getElementById('save-config-btn').addEventListener('click', saveConfig);
+    document.getElementById('refresh-heatmap-btn').addEventListener('click', () => loadHeatmap(true));
+    document.getElementById('heatmap-fullscreen-btn').addEventListener('click', toggleHeatmapFullscreen);
+    document.getElementById('update-data-btn').addEventListener('click', openUpdateModal);
 
     document.getElementById('halt-btn').addEventListener('click', openHaltConfirm);
     document.getElementById('cancel-halt-btn').addEventListener('click', closeHaltConfirm);
     document.getElementById('confirm-halt-btn').addEventListener('click', confirmHalt);
+
+    document.getElementById('heatmap-market-filter').addEventListener('click', event => {
+        const button = event.target.closest('[data-scope]');
+        if (!button || button.disabled) {
+            return;
+        }
+        state.heatmapScope = button.dataset.scope;
+        renderHeatmapFilters();
+        loadHeatmap();
+    });
+
+    document.getElementById('heatmap-metric-filter').addEventListener('click', event => {
+        const button = event.target.closest('[data-metric]');
+        if (!button) {
+            return;
+        }
+        state.heatmapMetric = button.dataset.metric;
+        renderHeatmapFilters();
+        loadHeatmap();
+    });
+
+    document.querySelectorAll('.update-provider-btn').forEach(button => {
+        button.addEventListener('click', async () => {
+            state.updateProvider = button.dataset.provider;
+            if (state.updateProvider === 'tushare') {
+                setUpdateModalStep('token');
+                return;
+            }
+            await startUpdateJob(state.updateProvider);
+        });
+    });
+    document.getElementById('update-token-back-btn').addEventListener('click', () => setUpdateModalStep('provider'));
+    document.getElementById('update-token-confirm-btn').addEventListener('click', async () => {
+        await startUpdateJob('tushare', document.getElementById('update-tushare-token').value.trim());
+    });
+    document.getElementById('update-modal-close-btn').addEventListener('click', closeUpdateModal);
+    document.getElementById('update-modal').addEventListener('click', event => {
+        if (event.target.id === 'update-modal') {
+            closeUpdateModal();
+        }
+    });
 
     document.getElementById('stock-modal').addEventListener('click', event => {
         if (event.target.id === 'stock-modal') {
@@ -1429,6 +2134,15 @@ function bindEvents() {
         }
     });
     document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+
+    document.getElementById('industry-modal').addEventListener('click', event => {
+        if (event.target.id === 'industry-modal') {
+            closeIndustryModal();
+        }
+    });
+    document.getElementById('industry-modal-close-btn').addEventListener('click', closeIndustryModal);
+    document.addEventListener('fullscreenchange', syncHeatmapFullscreenState);
+    document.addEventListener('webkitfullscreenchange', syncHeatmapFullscreenState);
 }
 
 const SELECTION_STATE_KEY = 'quant_selection_state';
@@ -1478,6 +2192,7 @@ function clearSavedSelectionState() {
 
 async function init() {
     bindEvents();
+    syncHeatmapFullscreenState();
     updateClock();
     window.setInterval(updateClock, 1000);
 
@@ -1503,6 +2218,7 @@ async function init() {
 function handleBeforeUnload() {
     abortActiveRequests();
     stopSelectionPolling();
+    stopUpdatePolling();
     stopLocalProgressTimer();
 
     if (state.currentSelectionJobId && (state.status === 'running')) {
@@ -1516,6 +2232,12 @@ function handleBeforeUnload() {
             state.chartInstance.destroy();
         } catch (e) {}
         state.chartInstance = null;
+    }
+    if (state.heatmapChart) {
+        try {
+            state.heatmapChart.dispose();
+        } catch (e) {}
+        state.heatmapChart = null;
     }
 }
 

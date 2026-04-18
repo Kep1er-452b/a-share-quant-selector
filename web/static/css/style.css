@@ -676,6 +676,7 @@ button {
 
 .table-wrap {
     overflow: auto;
+    position: relative;
 }
 
 #stocks-page .table-wrap {
@@ -691,6 +692,7 @@ button {
     border-spacing: 0;
     min-width: 760px;
     table-layout: fixed;
+    align-self: start;
 }
 
 .data-table th,
@@ -704,6 +706,24 @@ button {
 
 .data-table tbody tr {
     height: 32px;
+}
+
+.stable-scroll-table {
+    border-collapse: collapse;
+    border-spacing: 0;
+}
+
+.stable-scroll-table tbody {
+    vertical-align: top;
+}
+
+.stable-scroll-table tbody tr {
+    height: auto !important;
+}
+
+.stable-scroll-table th,
+.stable-scroll-table td {
+    background-clip: padding-box;
 }
 
 #stocks-table tbody tr,
@@ -775,12 +795,17 @@ button {
     width: 76px;
 }
 
-#stocks-table thead {
-    display: table-header-group;
+#stocks-table thead,
+.industry-detail-table thead {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
 }
 
-#stocks-table tbody {
-    display: table-row-group;
+#stocks-table tbody,
+.industry-detail-table tbody {
+    display: block;
+    width: 100%;
     overflow-anchor: none;
 }
 
@@ -792,9 +817,17 @@ button {
     background-clip: padding-box;
 }
 
-#stocks-table tbody tr {
-    display: table-row;
+#stocks-table tbody tr,
+.industry-detail-table tbody tr {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
     height: auto !important;
+}
+
+#stocks-table td,
+.industry-detail-table td {
+    vertical-align: top;
 }
 
 #stocks-table th:nth-child(2),
@@ -1444,25 +1477,329 @@ button {
     font-size: 1rem;
 }
 
-.halt-btn {
+.heatmap-layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    gap: 20px;
+}
+
+.heatmap-sidebar-panel {
+    align-self: start;
+    position: sticky;
+    top: calc(var(--header-h) + 16px);
+}
+
+.heatmap-sidebar-body {
+    display: grid;
+    gap: 18px;
+}
+
+.heatmap-date-card {
+    display: grid;
+    gap: 8px;
+    padding: 14px;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
+    border: 1px solid var(--border);
+}
+
+.heatmap-date-label,
+.heatmap-filter-title,
+.heatmap-legend-title {
+    color: var(--text-3);
+    font-size: 0.68rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.heatmap-date-value {
+    color: var(--text-0);
+    font-family: var(--font-mono);
+    font-size: 1.2rem;
+}
+
+.heatmap-filter-section {
+    display: grid;
+    gap: 10px;
+}
+
+.heatmap-filter-list {
+    display: grid;
+    gap: 10px;
+}
+
+.heatmap-filter-list.metric {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.heatmap-filter-btn {
+    min-height: 42px;
+    padding: 0 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-1);
+    cursor: pointer;
+}
+
+.heatmap-filter-btn:hover:not(:disabled) {
+    color: var(--text-0);
+    border-color: var(--border-strong);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.heatmap-filter-btn.active {
+    color: var(--accent);
+    border-color: rgba(245, 159, 11, 0.28);
+    background: linear-gradient(90deg, rgba(245, 159, 11, 0.18), rgba(245, 159, 11, 0.05));
+}
+
+.heatmap-filter-btn.disabled {
+    color: var(--text-3);
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.heatmap-filter-note {
+    color: var(--text-2);
+    font-size: 0.82rem;
+}
+
+.heatmap-legend {
+    display: grid;
+    gap: 10px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.heatmap-legend-bar {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+}
+
+.heatmap-legend-bar span {
+    min-height: 32px;
+    display: grid;
+    place-items: center;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+}
+
+.heatmap-legend-bar .neg {
+    background: rgba(35, 196, 131, 0.24);
+}
+
+.heatmap-legend-bar .mid {
+    background: rgba(124, 141, 160, 0.28);
+}
+
+.heatmap-legend-bar .pos {
+    background: rgba(255, 92, 92, 0.28);
+}
+
+.heatmap-main {
+    display: grid;
+    gap: 18px;
+}
+
+.heatmap-fullscreen-shell {
+    position: relative;
+}
+
+.heatmap-header-body {
+    display: grid;
+    gap: 14px;
+}
+
+.heatmap-index-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.heatmap-index-card {
+    padding: 14px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.heatmap-index-name {
+    color: var(--text-2);
+    font-size: 0.76rem;
+}
+
+.heatmap-index-price,
+.heatmap-index-change {
+    display: block;
+    margin-top: 6px;
+    font-family: var(--font-mono);
+}
+
+.heatmap-index-price {
+    color: var(--text-0);
+    font-size: 1.05rem;
+}
+
+.heatmap-index-change.up,
+.metric-value.up {
+    color: var(--green);
+}
+
+.heatmap-index-change.down,
+.metric-value.down {
+    color: var(--red);
+}
+
+.heatmap-ticker-strip {
+    position: relative;
+    overflow: hidden;
+    min-height: 42px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.heatmap-ticker-track {
+    display: inline-flex;
+    align-items: center;
+    gap: 28px;
+    white-space: nowrap;
+    padding: 10px 18px;
+    min-width: max-content;
+    color: var(--text-1);
+    animation: heatmap-ticker-scroll 22s linear infinite;
+}
+
+@keyframes heatmap-ticker-scroll {
+    from {
+        transform: translateX(0);
+    }
+    to {
+        transform: translateX(-50%);
+    }
+}
+
+.heatmap-panel-body {
+    display: grid;
+    gap: 14px;
+    padding-right: 120px;
+}
+
+.heatmap-panel-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.heatmap-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    color: var(--text-1);
+    font-family: var(--font-mono);
+}
+
+.heatmap-chart-wrap {
+    position: relative;
+    min-height: 880px;
+    border: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(13, 18, 24, 0.96), rgba(11, 15, 21, 0.98));
+}
+
+.heatmap-loading-overlay {
+    position: absolute;
+    inset: 18px auto auto 18px;
+    z-index: 2;
+    padding: 8px 12px;
+    background: rgba(7, 10, 14, 0.78);
+    border: 1px solid var(--border);
+    color: var(--text-1);
+    display: none;
+}
+
+.heatmap-chart-wrap.loading .heatmap-loading-overlay {
+    display: block;
+}
+
+#heatmap-chart {
+    width: 100%;
+    height: 880px;
+    min-height: 880px;
+}
+
+.heatmap-fullscreen-shell:fullscreen {
+    padding: 18px;
+    background:
+        radial-gradient(circle at top right, rgba(245, 159, 11, 0.08), transparent 24%),
+        linear-gradient(180deg, #07090c 0%, #0a1017 100%);
+}
+
+.heatmap-fullscreen-shell:fullscreen .heatmap-panel {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.heatmap-fullscreen-shell:fullscreen .heatmap-panel-body {
+    flex: 1;
+    min-height: 0;
+    padding-right: 18px;
+}
+
+.heatmap-fullscreen-shell:fullscreen .heatmap-chart-wrap {
+    flex: 1;
+    min-height: 0;
+}
+
+.heatmap-fullscreen-shell:fullscreen #heatmap-chart {
+    height: calc(100vh - 220px);
+    min-height: calc(100vh - 220px);
+}
+
+.floating-controls {
     position: fixed;
     right: 24px;
-    bottom: 20px;
+    bottom: 24px;
     z-index: 40;
     display: inline-flex;
     align-items: center;
     gap: 10px;
-    min-height: 38px;
-    padding: 0 14px;
+}
+
+.floating-btn {
+    min-height: 36px;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    background: rgba(12, 18, 25, 0.94);
+    color: var(--text-0);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.26);
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+
+.update-btn {
+    min-width: 86px;
+    border-color: rgba(75, 163, 255, 0.35);
+    background: rgba(16, 32, 54, 0.94);
+    color: #d8e9ff;
+}
+
+.update-btn:hover:not(:disabled) {
+    background: rgba(37, 85, 145, 0.96);
+}
+
+.halt-btn {
+    min-width: 74px;
     background: rgba(48, 11, 11, 0.94);
     color: #ffd2d2;
-    border: 1px solid rgba(255, 92, 92, 0.44);
-    box-shadow: 0 0 0 1px rgba(255, 92, 92, 0.08), 0 12px 30px rgba(0, 0, 0, 0.26);
-    cursor: pointer;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    font-size: 0.74rem;
-    font-weight: 700;
+    border-color: rgba(255, 92, 92, 0.44);
+    letter-spacing: 0.08em;
 }
 
 .halt-btn:hover:not(:disabled) {
@@ -1479,6 +1816,109 @@ button {
     height: 10px;
     background: var(--red);
     box-shadow: 0 0 10px rgba(255, 92, 92, 0.75);
+}
+
+.update-modal-box {
+    width: min(680px, 100%);
+}
+
+.update-modal-body {
+    min-height: 260px;
+}
+
+.update-modal-step {
+    display: none;
+}
+
+.update-modal-step.active {
+    display: block;
+}
+
+.update-modal-note {
+    margin-bottom: 18px;
+    color: var(--text-1);
+}
+
+.update-provider-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.update-provider-btn {
+    min-height: 88px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-0);
+    font-size: 1rem;
+    cursor: pointer;
+}
+
+.update-provider-btn:hover {
+    border-color: rgba(245, 159, 11, 0.28);
+    background: rgba(245, 159, 11, 0.08);
+}
+
+.update-token-label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--text-2);
+}
+
+.update-token-input {
+    width: 100%;
+}
+
+.update-token-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 16px;
+}
+
+.update-progress-bar-wrap {
+    margin-bottom: 18px;
+}
+
+.update-progress-grid {
+    margin-bottom: 18px;
+}
+
+.industry-modal-box {
+    width: min(1120px, 100%);
+}
+
+.industry-modal-subtitle {
+    margin-bottom: 14px;
+    color: var(--text-1);
+}
+
+.industry-table-wrap {
+    max-height: 68vh;
+}
+
+.industry-detail-table th:nth-child(1),
+.industry-detail-table td:nth-child(1) {
+    width: 92px;
+}
+
+.industry-detail-table th:nth-child(2),
+.industry-detail-table td:nth-child(2) {
+    width: 180px;
+}
+
+.industry-detail-table th:nth-child(3),
+.industry-detail-table td:nth-child(3) {
+    width: 82px;
+}
+
+.industry-detail-table th:nth-child(4),
+.industry-detail-table td:nth-child(4),
+.industry-detail-table th:nth-child(5),
+.industry-detail-table td:nth-child(5),
+.industry-detail-table th:nth-child(6),
+.industry-detail-table td:nth-child(6) {
+    width: 110px;
 }
 
 .halt-confirm,
@@ -1585,12 +2025,17 @@ button {
     .selection-summary-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+
+    .heatmap-index-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
 }
 
 @media (max-width: 1180px) {
     .hero-grid,
     .dashboard-grid,
-    .selection-layout {
+    .selection-layout,
+    .heatmap-layout {
         grid-template-columns: 1fr;
     }
 
@@ -1604,6 +2049,14 @@ button {
 
     .progress-log-row {
         grid-template-columns: 1fr;
+    }
+
+    .heatmap-sidebar-panel {
+        position: static;
+    }
+
+    .heatmap-panel-body {
+        padding-right: 18px;
     }
 }
 
@@ -1647,9 +2100,20 @@ button {
         max-width: none;
     }
 
-    .halt-btn {
+    .floating-controls {
         right: 16px;
         bottom: 16px;
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .heatmap-index-grid,
+    .update-provider-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .heatmap-filter-list.metric {
+        grid-template-columns: 1fr;
     }
 }
 
@@ -1677,5 +2141,15 @@ button {
 
     .hero-actions {
         flex-direction: column;
+    }
+
+    .update-token-actions {
+        flex-direction: column;
+    }
+
+    .heatmap-chart-wrap,
+    #heatmap-chart {
+        min-height: 620px;
+        height: 620px;
     }
 }
