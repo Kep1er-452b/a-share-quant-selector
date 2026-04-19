@@ -44,6 +44,7 @@ const state = {
     heatmapLoading: false,
     updateModalStep: 'provider',
     updateProvider: null,
+    globalTickerText: '',
 };
 
 function escapeHtml(value) {
@@ -53,6 +54,65 @@ function escapeHtml(value) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+function flashElement(element) {
+    if (!element) {
+        return;
+    }
+    element.classList.remove('tick-flash');
+    void element.offsetWidth;
+    element.classList.add('tick-flash');
+    window.setTimeout(() => {
+        element.classList.remove('tick-flash');
+    }, 120);
+}
+
+function updateTextWithFlash(target, nextValue) {
+    const element = typeof target === 'string' ? document.getElementById(target) : target;
+    if (!element) {
+        return;
+    }
+
+    const nextText = String(nextValue ?? '--');
+    if (element.textContent === nextText) {
+        return;
+    }
+
+    element.textContent = nextText;
+    flashElement(element);
+}
+
+function setCommandOutput(message, tone = '') {
+    const output = document.getElementById('terminal-command-output');
+    if (!output) {
+        return;
+    }
+
+    output.textContent = message;
+    output.className = `command-output${tone ? ` ${tone}` : ''}`;
+    flashElement(output);
+}
+
+function updateGlobalTicker(text) {
+    const track = document.getElementById('global-ticker-track');
+    if (!track) {
+        return;
+    }
+
+    const normalized = String(text || '').trim();
+    if (!normalized) {
+        return;
+    }
+
+    const repeated = `${normalized}   •   ${normalized}`;
+    if (state.globalTickerText === repeated) {
+        return;
+    }
+
+    state.globalTickerText = repeated;
+    track.textContent = repeated;
+    flashElement(track);
 }
 
 function formatNumber(value) {
@@ -93,6 +153,27 @@ function formatPercent(value, digits = 2) {
     return `${numeric > 0 ? '+' : ''}${fixed}%`;
 }
 
+function buildDefaultTickerText(payload = {}) {
+    const boardCounts = payload.board_counts || state.boardCounts || {};
+    const statusLabel = {
+        ready: 'READY',
+        running: 'RUNNING',
+        halted: 'HALTED',
+        error: 'ERROR',
+    }[state.status] || 'READY';
+
+    return [
+        `A-SHARE ${formatNumber(payload.total_stocks || 0)}`,
+        `MAIN ${formatNumber(boardCounts.main || 0)}`,
+        `CHINEXT ${formatNumber(boardCounts.chinext || 0)}`,
+        `STAR ${formatNumber(boardCounts.star || 0)}`,
+        `STRATS ${formatNumber(payload.strategies || state.strategies.length || 0)}`,
+        `DATE ${payload.latest_date || '--'}`,
+        `SESSION ${statusLabel}`,
+        'SYS CONNECTED',
+    ].join('   ');
+}
+
 function heatmapMetricLabel(metric) {
     const mapping = {
         daily: '日线',
@@ -125,31 +206,34 @@ function signedClass(value) {
 function heatmapColor(changePct) {
     const value = Number(changePct);
     if (!Number.isFinite(value)) {
-        return '#45515d';
+        return '#1a1a1a';
     }
     const clamped = Math.max(-4, Math.min(4, value));
-    if (clamped >= 0) {
+    if (clamped === 0) {
+        return '#1a1a1a';
+    }
+    if (clamped > 0) {
         const ratio = clamped / 4;
-        const red = Math.round(79 + (201 - 79) * ratio);
-        const green = Math.round(90 - (90 - 65) * ratio);
-        const blue = Math.round(102 - (102 - 65) * ratio);
+        const red = Math.round(13 + (0 - 13) * ratio);
+        const green = Math.round(26 + (255 - 26) * ratio);
+        const blue = Math.round(13 + (65 - 13) * ratio);
         return `rgb(${red}, ${green}, ${blue})`;
     }
     const ratio = Math.abs(clamped) / 4;
-    const red = Math.round(69 - (69 - 18) * ratio);
-    const green = Math.round(81 + (156 - 81) * ratio);
-    const blue = Math.round(93 - (93 - 85) * ratio);
+    const red = Math.round(26 + (255 - 26) * ratio);
+    const green = Math.round(10 + (49 - 10) * ratio);
+    const blue = Math.round(10 + (49 - 10) * ratio);
     return `rgb(${red}, ${green}, ${blue})`;
 }
 
 function heatmapGroupPalette(index) {
     const palette = [
-        { base: 'rgba(125, 139, 156, 0.20)', hover: 'rgba(125, 139, 156, 0.06)' },
-        { base: 'rgba(111, 126, 145, 0.18)', hover: 'rgba(111, 126, 145, 0.05)' },
-        { base: 'rgba(140, 130, 150, 0.18)', hover: 'rgba(140, 130, 150, 0.05)' },
-        { base: 'rgba(138, 125, 118, 0.18)', hover: 'rgba(138, 125, 118, 0.05)' },
-        { base: 'rgba(111, 140, 136, 0.18)', hover: 'rgba(111, 140, 136, 0.05)' },
-        { base: 'rgba(118, 128, 109, 0.18)', hover: 'rgba(118, 128, 109, 0.05)' },
+        { base: '#111111', hover: '#1a1a1a' },
+        { base: '#141414', hover: '#1d1d1d' },
+        { base: '#171717', hover: '#202020' },
+        { base: '#101010', hover: '#191919' },
+        { base: '#121212', hover: '#1b1b1b' },
+        { base: '#151515', hover: '#1e1e1e' },
     ];
     return palette[index % palette.length];
 }
@@ -187,17 +271,19 @@ function setStatus(mode) {
         dot.className = `status-dot ${mode}`;
     }
     if (text) {
-        text.textContent = label;
+        updateTextWithFlash(text, label);
     }
     if (sidebar) {
-        sidebar.textContent = label;
+        updateTextWithFlash(sidebar, label);
     }
     if (hero) {
-        hero.textContent = label;
+        updateTextWithFlash(hero, label);
     }
     if (stat) {
-        stat.textContent = label;
+        updateTextWithFlash(stat, label);
     }
+    setCommandOutput(`SYS ${label}`, mode === 'error' || mode === 'halted' ? 'error' : '');
+    updateGlobalTicker(buildDefaultTickerText());
 }
 
 function classifyBoard(code) {
@@ -366,6 +452,7 @@ function switchPage(page) {
     });
 
     document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
+    setCommandOutput(`FUNC ${String(page).toUpperCase()}<GO>`, 'info');
     window.scrollTo(0, 0);
 
     if (page === 'dashboard') {
@@ -401,19 +488,26 @@ async function loadStats() {
         const data = result.data;
         const boardCounts = data.board_counts || {};
 
-        document.getElementById('stat-stocks').textContent = formatNumber(data.total_stocks);
-        document.getElementById('stat-date').textContent = escapeHtml(data.latest_date || '--');
-        document.getElementById('stat-strategies').textContent = formatNumber(data.strategies);
-        document.getElementById('hero-strategy-count').textContent = formatNumber(data.strategies);
-        document.getElementById('hero-latest-date').textContent = escapeHtml(data.latest_date || '--');
-        document.getElementById('stocks-total-label').textContent = `当前本地股票池 ${formatNumber(data.total_stocks)} 只`;
+        updateTextWithFlash('stat-stocks', formatNumber(data.total_stocks));
+        updateTextWithFlash('stat-date', data.latest_date || '--');
+        updateTextWithFlash('stat-strategies', formatNumber(data.strategies));
+        updateTextWithFlash('hero-strategy-count', formatNumber(data.strategies));
+        updateTextWithFlash('hero-latest-date', data.latest_date || '--');
+        updateTextWithFlash('stocks-total-label', `当前本地股票池 ${formatNumber(data.total_stocks)} 只`);
 
-        document.getElementById('board-count-main').textContent = formatNumber(boardCounts.main || 0);
-        document.getElementById('board-count-chinext').textContent = formatNumber(boardCounts.chinext || 0);
-        document.getElementById('board-count-star').textContent = formatNumber(boardCounts.star || 0);
+        updateTextWithFlash('board-count-main', formatNumber(boardCounts.main || 0));
+        updateTextWithFlash('board-count-chinext', formatNumber(boardCounts.chinext || 0));
+        updateTextWithFlash('board-count-star', formatNumber(boardCounts.star || 0));
 
-        document.getElementById('hero-universe').textContent = 'ALL BOARDS';
-        document.getElementById('sidebar-universe-text').textContent = 'ALL BOARDS';
+        updateTextWithFlash('hero-universe', 'ALL BOARDS');
+        updateTextWithFlash('sidebar-universe-text', 'ALL BOARDS');
+        renderDashboardSparkline([
+            Number(boardCounts.main || 0),
+            Number(boardCounts.chinext || 0),
+            Number(boardCounts.star || 0),
+            Number(data.strategies || 0),
+        ]);
+        updateGlobalTicker(buildDefaultTickerText(data));
         if (data.halted) {
             setStatus('halted');
         } else if (state.status !== 'running') {
@@ -496,14 +590,63 @@ function buildTickerText(stats, latestDate) {
     const medianText = Number.isFinite(Number(stats?.median_change_pct))
         ? `${Number(stats.median_change_pct).toFixed(2)}%`
         : '--';
-    const parts = [
+    return [
         `上涨家数 ${formatNumber(stats?.up_count ?? 0)}`,
         `下跌家数 ${formatNumber(stats?.down_count ?? 0)}`,
         `平盘家数 ${formatNumber(stats?.flat_count ?? 0)}`,
         `中位涨幅 ${medianText}`,
         `最新交易日 ${latestDate || '--'}`,
     ];
-    return `${parts.join('   •   ')}   •   ${parts.join('   •   ')}`;
+}
+
+function buildTickerLoopText(stats, latestDate) {
+    const ticker = buildTickerText(stats, latestDate).join('   •   ');
+    return `${ticker}   •   ${ticker}`;
+}
+
+function renderDashboardSparkline(values) {
+    const container = document.getElementById('dashboard-sparkline');
+    if (!container) {
+        return;
+    }
+
+    const series = Array.isArray(values)
+        ? values.map(value => Number(value)).filter(value => Number.isFinite(value))
+        : [];
+
+    if (!series.length) {
+        container.innerHTML = '<div class="state-empty">NO TREND DATA</div>';
+        return;
+    }
+
+    const width = 420;
+    const height = 84;
+    const padding = 8;
+    const min = Math.min(...series);
+    const max = Math.max(...series);
+    const span = Math.max(max - min, 1);
+    const stepX = series.length > 1 ? (width - padding * 2) / (series.length - 1) : 0;
+
+    const points = series.map((value, index) => {
+        const x = padding + (index * stepX);
+        const y = height - padding - (((value - min) / span) * (height - padding * 2));
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+    });
+
+    const lastPoint = points[points.length - 1].split(',');
+    const lineColor = series[series.length - 1] >= series[0] ? '#00FF41' : '#FF3131';
+    const fillPath = `M ${padding},${height - padding} L ${points.join(' L ')} L ${width - padding},${height - padding} Z`;
+
+    container.innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Market sparkline">
+            <line x1="${padding}" y1="${height * 0.25}" x2="${width - padding}" y2="${height * 0.25}" stroke="#1a1a1a" stroke-dasharray="3,3"></line>
+            <line x1="${padding}" y1="${height * 0.5}" x2="${width - padding}" y2="${height * 0.5}" stroke="#1a1a1a" stroke-dasharray="3,3"></line>
+            <line x1="${padding}" y1="${height * 0.75}" x2="${width - padding}" y2="${height * 0.75}" stroke="#1a1a1a" stroke-dasharray="3,3"></line>
+            <path d="${fillPath}" fill="rgba(0,255,65,0.05)"></path>
+            <polyline fill="none" stroke="${lineColor}" stroke-width="1.2" points="${points.join(' ')}"></polyline>
+            <circle cx="${lastPoint[0]}" cy="${lastPoint[1]}" r="2" fill="#FF6600"></circle>
+        </svg>
+    `;
 }
 
 function renderHeatmapIndices(indices) {
@@ -643,7 +786,7 @@ function renderHeatmapChart(groups) {
             emphasis: {
                 itemStyle: {
                     color: palette.hover,
-                    borderColor: 'rgba(255,255,255,0.26)',
+                    borderColor: '#ff6600',
                     borderWidth: 3,
                 },
             },
@@ -664,9 +807,17 @@ function renderHeatmapChart(groups) {
     });
 
     state.heatmapChart.setOption({
-        backgroundColor: 'transparent',
+        backgroundColor: '#000000',
         tooltip: {
             confine: true,
+            backgroundColor: '#000000',
+            borderColor: '#ff6600',
+            borderWidth: 1,
+            textStyle: {
+                color: '#e0e0e0',
+                fontFamily: 'IBM Plex Mono',
+                fontSize: 10,
+            },
             formatter(params) {
                 const data = params.data || {};
                 if (!data.code) {
@@ -709,29 +860,31 @@ function renderHeatmapChart(groups) {
                 formatter(params) {
                     return params.name;
                 },
-                color: '#f3f6fa',
-                fontSize: 12,
+                color: '#e0e0e0',
+                fontSize: 10,
+                fontFamily: 'IBM Plex Mono',
             },
             upperLabel: {
                 show: true,
-                color: '#f3f6fa',
-                height: 22,
-                fontSize: 16,
+                color: '#ff6600',
+                height: 20,
+                fontSize: 10,
+                fontFamily: 'IBM Plex Mono',
             },
             itemStyle: {
-                borderColor: 'rgba(255,255,255,0.08)',
+                borderColor: '#1a1a1a',
                 borderWidth: 1,
                 gapWidth: 1,
             },
             emphasis: {
                 upperLabel: {
-                    color: '#ffffff',
+                    color: '#ff6600',
                 },
             },
             levels: [
                 {
                     itemStyle: {
-                        borderColor: 'rgba(255,255,255,0.12)',
+                        borderColor: '#ff6600',
                         borderWidth: 2,
                         gapWidth: 2,
                     },
@@ -742,7 +895,7 @@ function renderHeatmapChart(groups) {
                 {
                     itemStyle: {
                         gapWidth: 1,
-                        borderColorSaturation: 0.5,
+                        borderColor: '#1a1a1a',
                     },
                 },
             ],
@@ -782,7 +935,9 @@ async function loadHeatmap(forceReload = false) {
         document.getElementById('heatmap-scope-label').textContent = heatmapScopeLabel(state.heatmapScope);
         document.getElementById('heatmap-metric-label').textContent = heatmapMetricLabel(state.heatmapMetric);
         document.getElementById('heatmap-stock-count').textContent = `${formatNumber(data.stock_count || 0)} 只股票`;
-        document.getElementById('heatmap-ticker-track').textContent = buildTickerText(data.ticker_stats, data.latest_date);
+        const tickerText = buildTickerText(data.ticker_stats, data.latest_date).join('   •   ');
+        document.getElementById('heatmap-ticker-track').textContent = buildTickerLoopText(data.ticker_stats, data.latest_date);
+        updateGlobalTicker(`${heatmapScopeLabel(state.heatmapScope)}   ${tickerText}`);
         renderHeatmapIndices(data.header_indices || []);
         renderHeatmapChart(data.groups || []);
     } catch (error) {
@@ -927,7 +1082,8 @@ function renderStockChart(data) {
         state.chartInstance.destroy();
     }
 
-    Chart.defaults.color = '#7d8c9a';
+    Chart.defaults.color = '#888888';
+    Chart.defaults.borderColor = '#1a1a1a';
 
     state.chartInstance = new Chart(ctx, {
         type: 'line',
@@ -937,8 +1093,8 @@ function renderStockChart(data) {
                 {
                     label: '收盘价',
                     data: prices,
-                    borderColor: '#f59f0b',
-                    backgroundColor: 'rgba(245, 159, 11, 0.08)',
+                    borderColor: '#ff6600',
+                    backgroundColor: 'rgba(255, 102, 0, 0.08)',
                     fill: true,
                     tension: 0.12,
                     pointRadius: 0,
@@ -948,7 +1104,7 @@ function renderStockChart(data) {
                 {
                     label: 'K',
                     data: kValues,
-                    borderColor: '#4ba3ff',
+                    borderColor: '#ffd700',
                     pointRadius: 0,
                     borderWidth: 1.1,
                     tension: 0.12,
@@ -957,7 +1113,7 @@ function renderStockChart(data) {
                 {
                     label: 'D',
                     data: dValues,
-                    borderColor: '#23c483',
+                    borderColor: '#00ff41',
                     pointRadius: 0,
                     borderWidth: 1.1,
                     tension: 0.12,
@@ -966,7 +1122,7 @@ function renderStockChart(data) {
                 {
                     label: 'J',
                     data: jValues,
-                    borderColor: '#ff5c5c',
+                    borderColor: '#ff3131',
                     pointRadius: 0,
                     borderWidth: 1.1,
                     tension: 0.12,
@@ -985,10 +1141,10 @@ function renderStockChart(data) {
             plugins: {
                 legend: {
                     labels: {
-                        color: '#b2bfcc',
+                        color: '#e0e0e0',
                         font: {
                             family: '"IBM Plex Mono", monospace',
-                            size: 11,
+                            size: 10,
                         },
                     },
                 },
@@ -996,7 +1152,7 @@ function renderStockChart(data) {
             scales: {
                 x: {
                     ticks: {
-                        color: '#7d8c9a',
+                        color: '#888888',
                         maxTicksLimit: 10,
                         font: {
                             family: '"IBM Plex Mono", monospace',
@@ -1004,21 +1160,21 @@ function renderStockChart(data) {
                         },
                     },
                     grid: {
-                        color: 'rgba(255,255,255,0.06)',
+                        color: '#1a1a1a',
                     },
                 },
                 yPrice: {
                     type: 'linear',
                     position: 'left',
                     ticks: {
-                        color: '#b2bfcc',
+                        color: '#e0e0e0',
                         font: {
                             family: '"IBM Plex Mono", monospace',
                             size: 10,
                         },
                     },
                     grid: {
-                        color: 'rgba(255,255,255,0.06)',
+                        color: '#1a1a1a',
                     },
                 },
                 yKDJ: {
@@ -1027,7 +1183,7 @@ function renderStockChart(data) {
                     min: 0,
                     max: 100,
                     ticks: {
-                        color: '#7d8c9a',
+                        color: '#888888',
                         stepSize: 20,
                         font: {
                             family: '"IBM Plex Mono", monospace',
@@ -1379,20 +1535,9 @@ function setRunButtonsLoading(isLoading) {
             return;
         }
         button.disabled = isLoading;
-        button.innerHTML = isLoading
-            ? `
-                <svg viewBox="0 0 12 12" fill="currentColor">
-                    <rect x="2" y="2" width="3" height="8"></rect>
-                    <rect x="7" y="2" width="3" height="8"></rect>
-                </svg>
-                运行中
-            `
-            : `
-                <svg viewBox="0 0 12 12" fill="currentColor">
-                    <polygon points="2,1 10,6 2,11"></polygon>
-                </svg>
-                ${button.id === 'execute-selection-btn' ? '立即执行' : '执行选股'}
-            `;
+        button.textContent = isLoading
+            ? '运行中'
+            : (button.id === 'execute-selection-btn' ? '立即执行' : 'RUN');
     });
 }
 
@@ -1972,6 +2117,8 @@ function applyHaltState(message = '全部 Web 功能已停止。重启服务器�
     document.getElementById('halt-overlay').classList.add('active');
     document.getElementById('selection-results-headline').textContent = '系统已急停';
     document.getElementById('selection-results-meta').textContent = 'HALTED';
+    setCommandOutput('SYS HALTED', 'error');
+    updateGlobalTicker('SYS HALTED   ALL FUNCTIONS DISABLED   RESTART SERVICE REQUIRED');
 }
 
 function openHaltConfirm() {
@@ -2014,6 +2161,58 @@ function updateClock() {
         second: '2-digit',
         hour12: false,
     }).format(new Date());
+}
+
+function runTerminalCommand() {
+    const input = document.getElementById('terminal-command-input');
+    if (!input) {
+        return;
+    }
+
+    const raw = input.value.trim();
+    if (!raw) {
+        setCommandOutput('INPUT REQUIRED', 'error');
+        return;
+    }
+
+    const command = raw.toUpperCase();
+    input.value = '';
+
+    if (command === 'F1' || command === 'DASH' || command === 'HOME') {
+        switchPage('dashboard');
+        return;
+    }
+    if (command === 'F2' || command === 'HEAT' || command === 'MAP') {
+        switchPage('heatmap');
+        return;
+    }
+    if (command === 'F3' || command === 'STOCK' || command === 'STOCKS' || command === 'POOL') {
+        switchPage('stocks');
+        return;
+    }
+    if (command === 'F4' || command === 'RUN' || command === 'SELECT') {
+        runSelection();
+        return;
+    }
+    if (command === 'F5' || command === 'CFG' || command === 'STRAT') {
+        switchPage('strategies');
+        return;
+    }
+    if (command === 'UPDATE') {
+        openUpdateModal();
+        return;
+    }
+    if (command === 'HALT') {
+        openHaltConfirm();
+        return;
+    }
+    if (/^\d{6}$/.test(command)) {
+        setCommandOutput(`LOADING ${command}`, 'info');
+        viewStockDetail(command, '');
+        return;
+    }
+
+    setCommandOutput(`UNKNOWN CMD ${command}`, 'error');
 }
 
 function bindEvents() {
@@ -2143,6 +2342,14 @@ function bindEvents() {
     document.getElementById('industry-modal-close-btn').addEventListener('click', closeIndustryModal);
     document.addEventListener('fullscreenchange', syncHeatmapFullscreenState);
     document.addEventListener('webkitfullscreenchange', syncHeatmapFullscreenState);
+
+    document.getElementById('terminal-command-go').addEventListener('click', runTerminalCommand);
+    document.getElementById('terminal-command-input').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            runTerminalCommand();
+        }
+    });
 }
 
 const SELECTION_STATE_KEY = 'quant_selection_state';
