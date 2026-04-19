@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#0a0d12">
+    <meta name="theme-color" content="#000000">
     <title>A股量化选股控制台</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -12,15 +12,15 @@
 <body>
 <div id="halt-confirm" class="halt-confirm">
     <div class="halt-confirm-box">
-        <div class="halt-confirm-label">Emergency Control</div>
+        <div class="halt-confirm-label">EMERGENCY CONTROL</div>
         <div class="halt-confirm-title">确认执行急停</div>
         <p class="halt-confirm-body">
             急停会立即终止当前 Web 交互与在途请求，并阻止后续所有 API 操作。<br>
             如需恢复，必须重启 Web 服务。
         </p>
         <div class="halt-confirm-actions">
-            <button class="btn btn-danger" id="confirm-halt-btn">确认急停</button>
-            <button class="btn btn-ghost" id="cancel-halt-btn">取消</button>
+            <button class="btn btn-danger" id="confirm-halt-btn" type="button">确认急停</button>
+            <button class="btn btn-ghost" id="cancel-halt-btn" type="button">取消</button>
         </div>
     </div>
 </div>
@@ -28,7 +28,7 @@
 <div id="halt-overlay" class="halt-overlay">
     <div class="halt-overlay-content">
         <div class="halt-overlay-mark">HALTED</div>
-        <div class="halt-overlay-title">System Halted</div>
+        <div class="halt-overlay-title">SYSTEM HALTED</div>
         <p class="halt-overlay-sub" id="halt-overlay-sub">
             全部 Web 功能已停止。重启服务器后方可恢复。
         </p>
@@ -36,206 +36,122 @@
 </div>
 
 <div class="shell">
-    <aside class="sidebar">
-        <div class="sidebar-brand">
-            <div class="sidebar-brand-mark">
-                <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
-                    <rect x="1" y="8" width="3" height="7"></rect>
-                    <rect x="6" y="4" width="3" height="11"></rect>
-                    <rect x="11" y="1" width="3" height="14"></rect>
-                </svg>
-            </div>
-            <div class="sidebar-brand-copy">
-                <span class="sidebar-brand-title">Quant Selector</span>
-                <span class="sidebar-brand-sub">A-Share Console</span>
-            </div>
+    <header class="topbar">
+        <div class="topbar-brand">
+            <span class="topbar-brand-code">BQS</span>
+            <span class="topbar-brand-name">A-SHARE QUANT SELECTOR</span>
         </div>
-
-        <div class="sidebar-meta">
-            <div class="sidebar-meta-label">Environment</div>
-            <div class="sidebar-meta-value">LOCAL DATA / FLASK</div>
+        <div class="topbar-center">
+            <span class="topbar-kicker">ACTIVE FUNCTION</span>
+            <span class="topbar-title" id="page-title">系统概览</span>
         </div>
+        <div class="topbar-actions">
+            <div class="status" id="status-indicator">
+                <span class="status-dot ready" id="status-dot"></span>
+                <span id="status-text">READY</span>
+            </div>
+            <div class="topbar-clock" id="topbar-clock">--:--:--</div>
+            <button class="btn btn-primary" id="run-selection-btn" type="button">RUN</button>
+        </div>
+    </header>
 
+    <div class="menubar">
         <ul class="sidebar-nav" id="sidebar-nav">
             <li class="nav-item active" data-page="dashboard">
-                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-                    <rect x="1.5" y="1.5" width="5" height="5"></rect>
-                    <rect x="9.5" y="1.5" width="5" height="5"></rect>
-                    <rect x="1.5" y="9.5" width="5" height="5"></rect>
-                    <rect x="9.5" y="9.5" width="5" height="5"></rect>
-                </svg>
-                <span>系统概览</span>
+                <span class="nav-fn">F1</span>
+                <span class="nav-label">SYSTEM</span>
             </li>
             <li class="nav-item" data-page="heatmap">
-                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-                    <rect x="1.5" y="1.5" width="13" height="13"></rect>
-                    <path d="M1.5 6h13M5.5 1.5v13"></path>
-                </svg>
-                <span>市场云图</span>
+                <span class="nav-fn">F2</span>
+                <span class="nav-label">HEATMAP</span>
             </li>
             <li class="nav-item" data-page="stocks">
-                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-                    <line x1="2" y1="4" x2="14" y2="4"></line>
-                    <line x1="2" y1="8" x2="14" y2="8"></line>
-                    <line x1="2" y1="12" x2="14" y2="12"></line>
-                </svg>
-                <span>股票列表</span>
+                <span class="nav-fn">F3</span>
+                <span class="nav-label">STOCKS</span>
             </li>
             <li class="nav-item" data-page="selection">
-                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-                    <path d="M2 3h12l-4.5 5v4.5l-3-1.4V8z"></path>
-                </svg>
-                <span>执行选股</span>
+                <span class="nav-fn">F4</span>
+                <span class="nav-label">SELECTION</span>
             </li>
             <li class="nav-item" data-page="strategies">
-                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-                    <circle cx="8" cy="8" r="2.4"></circle>
-                    <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.1 3.1l1.4 1.4M11.5 11.5l1.4 1.4M3.1 12.9l1.4-1.4M11.5 4.5l1.4-1.4"></path>
-                </svg>
-                <span>策略配置</span>
+                <span class="nav-fn">F5</span>
+                <span class="nav-label">STRATEGIES</span>
             </li>
         </ul>
-
-        <div class="sidebar-footer">
-            <div class="sidebar-footer-row">
-                <span class="sidebar-footer-label">Session</span>
-                <span class="sidebar-footer-value" id="sidebar-status-text">READY</span>
-            </div>
-            <div class="sidebar-footer-row">
-                <span class="sidebar-footer-label">Universe</span>
-                <span class="sidebar-footer-value" id="sidebar-universe-text">ALL BOARDS</span>
-            </div>
-            <div class="sidebar-footer-row">
-                <span class="sidebar-footer-label">Build</span>
-                <span class="sidebar-footer-value">WEB V2</span>
-            </div>
+        <div class="asset-tabs" aria-hidden="true">
+            <span class="asset-tab active">EQ</span>
+            <span class="asset-tab">FX</span>
+            <span class="asset-tab">FI</span>
+            <span class="asset-tab">CMDTY</span>
         </div>
-    </aside>
+    </div>
+
+    <div class="ticker-strip">
+        <div class="ticker-track" id="global-ticker-track">
+            SYS CONNECTED   MAIN --   CHINEXT --   STAR --   STRATS --   DATE --   SESSION READY
+        </div>
+    </div>
 
     <main class="main">
-        <header class="topbar">
-            <div class="topbar-left">
-                <span class="topbar-kicker">A-SHARE QUANT CONSOLE</span>
-                <span class="topbar-title" id="page-title">系统概览</span>
-            </div>
-            <div class="topbar-actions">
-                <div class="status" id="status-indicator">
-                    <span class="status-dot ready" id="status-dot"></span>
-                    <span id="status-text">READY</span>
-                </div>
-                <div class="topbar-clock" id="topbar-clock">--:--:--</div>
-                <button class="btn btn-primary" id="run-selection-btn">
-                    <svg viewBox="0 0 12 12" fill="currentColor">
-                        <polygon points="2,1 10,6 2,11"></polygon>
-                    </svg>
-                    执行选股
-                </button>
-            </div>
-        </header>
-
         <div class="content">
             <section id="dashboard-page" class="page active">
-                <div class="hero-grid">
-                    <div class="hero-panel">
-                        <div class="hero-kicker">MARKET MONITOR</div>
-                        <h1 class="hero-title">量化选股控制台</h1>
-                        <p class="hero-text">
-                            将本地数据、板块选择、策略执行与结果回看整合到同一套高信息密度界面中，
-                            保持极简，但不牺牲控制感。
-                        </p>
-                        <div class="hero-actions">
-                            <button class="btn btn-primary" id="hero-run-btn">
-                                <svg viewBox="0 0 12 12" fill="currentColor">
-                                    <polygon points="2,1 10,6 2,11"></polygon>
-                                </svg>
-                                进入执行面板
-                            </button>
-                            <button class="btn btn-secondary" id="hero-stocks-btn">
-                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
-                                    <line x1="1" y1="3" x2="11" y2="3"></line>
-                                    <line x1="1" y1="6" x2="11" y2="6"></line>
-                                    <line x1="1" y1="9" x2="11" y2="9"></line>
-                                </svg>
-                                查看股票池
-                            </button>
-                            <button class="btn btn-ghost" id="refresh-dashboard-btn">
-                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
-                                    <path d="M10 6A4 4 0 1 1 6 2"></path>
-                                    <polyline points="10,2 10,6 6,6"></polyline>
-                                </svg>
-                                刷新概览
-                            </button>
+                <div class="dashboard-terminal-grid">
+                    <section class="panel quote-panel">
+                        <div class="panel-header">
+                            <span class="panel-title">PRIMARY MONITOR</span>
+                            <span class="panel-meta">LIVE</span>
                         </div>
-                    </div>
-
-                    <div class="hero-sidecard">
-                        <div class="hero-sidecard-label">Operating Notes</div>
-                        <div class="hero-sidecard-grid">
-                            <div class="hero-sidecard-item">
-                                <span class="hero-sidecard-key">Universe</span>
-                                <span class="hero-sidecard-value" id="hero-universe">ALL BOARDS</span>
+                        <div class="panel-body quote-panel-body">
+                            <div class="quote-block">
+                                <div class="quote-label">A-SHARE UNIVERSE</div>
+                                <div class="quote-symbol">ALL BOARDS</div>
+                                <div class="quote-price positive" id="stat-stocks">--</div>
+                                <div class="quote-change" id="hero-universe">ALL BOARDS</div>
                             </div>
-                            <div class="hero-sidecard-item">
-                                <span class="hero-sidecard-key">Strategies</span>
-                                <span class="hero-sidecard-value" id="hero-strategy-count">--</span>
+                            <div class="quote-sparkline" id="dashboard-sparkline"></div>
+                            <div class="quote-strip">
+                                <div class="quote-strip-item">
+                                    <span class="quote-strip-key">LATEST DATE</span>
+                                    <span class="quote-strip-value" id="hero-latest-date">--</span>
+                                </div>
+                                <div class="quote-strip-item">
+                                    <span class="quote-strip-key">STRATEGIES</span>
+                                    <span class="quote-strip-value" id="hero-strategy-count">--</span>
+                                </div>
+                                <div class="quote-strip-item">
+                                    <span class="quote-strip-key">SESSION</span>
+                                    <span class="quote-strip-value" id="hero-session-state">READY</span>
+                                </div>
                             </div>
-                            <div class="hero-sidecard-item">
-                                <span class="hero-sidecard-key">Latest Date</span>
-                                <span class="hero-sidecard-value" id="hero-latest-date">--</span>
-                            </div>
-                            <div class="hero-sidecard-item">
-                                <span class="hero-sidecard-key">Session</span>
-                                <span class="hero-sidecard-value" id="hero-session-state">READY</span>
+                            <div class="quote-bidask">
+                                <button class="quote-action bid" id="hero-run-btn" type="button">RUN&lt;GO&gt;</button>
+                                <button class="quote-action ask" id="hero-stocks-btn" type="button">POOL&lt;GO&gt;</button>
+                                <button class="btn btn-ghost quote-refresh" id="refresh-dashboard-btn" type="button">REFRESH</button>
                             </div>
                         </div>
-                    </div>
-                </div>
+                    </section>
 
-                <div class="stats-grid">
-                    <div class="stat-block">
-                        <div class="stat-label">股票数量</div>
-                        <div class="stat-value" id="stat-stocks">--</div>
-                        <div class="stat-sub">本地 A 股数据</div>
-                    </div>
-                    <div class="stat-block">
-                        <div class="stat-label">最新数据</div>
-                        <div class="stat-value stat-value-small" id="stat-date">--</div>
-                        <div class="stat-sub">最近交易日</div>
-                    </div>
-                    <div class="stat-block">
-                        <div class="stat-label">策略数量</div>
-                        <div class="stat-value" id="stat-strategies">--</div>
-                        <div class="stat-sub">已注册策略</div>
-                    </div>
-                    <div class="stat-block">
-                        <div class="stat-label">会话状态</div>
-                        <div class="stat-value stat-value-small" id="stat-session">READY</div>
-                        <div class="stat-sub">控制台运行状态</div>
-                    </div>
-                </div>
-
-                <div class="dashboard-grid">
                     <section class="panel">
                         <div class="panel-header">
-                            <span class="panel-title">板块分布</span>
-                            <span class="panel-meta">Stock Universe</span>
+                            <span class="panel-title">BOARD DISTRIBUTION</span>
+                            <span class="panel-meta">UNIVERSE</span>
                         </div>
                         <div class="panel-body">
                             <div class="board-grid">
                                 <div class="board-card">
-                                    <div class="board-card-label">主板</div>
+                                    <div class="board-card-label">MAIN</div>
                                     <div class="board-card-value" id="board-count-main">--</div>
-                                    <div class="board-card-sub">Main Board</div>
+                                    <div class="board-card-sub">主板 STOCKS</div>
                                 </div>
                                 <div class="board-card">
-                                    <div class="board-card-label">创业板</div>
+                                    <div class="board-card-label">CHINEXT</div>
                                     <div class="board-card-value" id="board-count-chinext">--</div>
-                                    <div class="board-card-sub">ChiNext</div>
+                                    <div class="board-card-sub">创业板 STOCKS</div>
                                 </div>
                                 <div class="board-card">
-                                    <div class="board-card-label">科创板</div>
+                                    <div class="board-card-label">STAR</div>
                                     <div class="board-card-value" id="board-count-star">--</div>
-                                    <div class="board-card-sub">STAR Market</div>
+                                    <div class="board-card-sub">科创板 STOCKS</div>
                                 </div>
                             </div>
                         </div>
@@ -243,14 +159,40 @@
 
                     <section class="panel">
                         <div class="panel-header">
-                            <span class="panel-title">操作提示</span>
-                            <span class="panel-meta">Workflow</span>
+                            <span class="panel-title">SYSTEM SNAPSHOT</span>
+                            <span class="panel-meta">STATUS</span>
+                        </div>
+                        <div class="panel-body">
+                            <div class="stats-grid">
+                                <div class="stat-block">
+                                    <div class="stat-label">LATEST DATE</div>
+                                    <div class="stat-value stat-value-small" id="stat-date">--</div>
+                                    <div class="stat-sub">RECENT TRADING DAY</div>
+                                </div>
+                                <div class="stat-block">
+                                    <div class="stat-label">STRATEGIES</div>
+                                    <div class="stat-value" id="stat-strategies">--</div>
+                                    <div class="stat-sub">REGISTERED LOGIC SETS</div>
+                                </div>
+                                <div class="stat-block">
+                                    <div class="stat-label">SESSION</div>
+                                    <div class="stat-value stat-value-small" id="stat-session">READY</div>
+                                    <div class="stat-sub">CONSOLE HEALTH</div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="panel-title">OPERATOR NOTES</span>
+                            <span class="panel-meta">WORKFLOW</span>
                         </div>
                         <div class="panel-body terminal-list">
-                            <div class="terminal-row">01. 先在“执行选股”页选板块，再选策略。</div>
-                            <div class="terminal-row">02. 顶部主按钮会沿用当前筛选条件执行。</div>
-                            <div class="terminal-row">03. 急停会中止所有后续 Web API 调用，需重启服务恢复。</div>
-                            <div class="terminal-row">04. 策略配置页支持直接编辑并保存参数。</div>
+                            <div class="terminal-row">01  先进入 SELECTION 页面勾选板块与策略，再执行扫描。</div>
+                            <div class="terminal-row">02  顶部 RUN 会沿用当前筛选快照，适合重复执行同一轮扫描。</div>
+                            <div class="terminal-row">03  HEATMAP 面板用于快速观察行业与个股分布，点击即可打开细节。</div>
+                            <div class="terminal-row">04  HALT 为硬停机指令，仅在需要中止全部 Web API 时使用。</div>
                         </div>
                     </section>
                 </div>
@@ -260,10 +202,10 @@
                 <div class="panel">
                     <div class="panel-header panel-header-wrap">
                         <div>
-                            <span class="panel-title">A 股股票列表</span>
+                            <span class="panel-title">A-SHARE STOCK LIST</span>
                             <div class="panel-subtitle" id="stocks-total-label">完整股票池视图</div>
                         </div>
-                        <input type="text" id="stock-search" class="search-input" placeholder="搜索代码或名称">
+                        <input type="text" id="stock-search" class="search-input" placeholder="SEARCH CODE OR NAME">
                     </div>
                     <div class="table-wrap">
                         <table class="data-table stable-scroll-table" id="stocks-table">
@@ -274,7 +216,7 @@
                                     <th>板块</th>
                                     <th>最新价</th>
                                     <th>日期</th>
-                                    <th>市值 (亿)</th>
+                                    <th>市值(亿)</th>
                                     <th>数据量</th>
                                     <th>操作</th>
                                 </tr>
@@ -293,35 +235,28 @@
                 <div class="heatmap-layout">
                     <aside class="panel heatmap-sidebar-panel">
                         <div class="panel-header">
-                            <span class="panel-title">市场筛选</span>
-                            <span class="panel-meta">Heatmap Controls</span>
+                            <span class="panel-title">MARKET FILTER</span>
+                            <span class="panel-meta">MAP</span>
                         </div>
                         <div class="panel-body heatmap-sidebar-body">
                             <div class="heatmap-date-card">
-                                <span class="heatmap-date-label">最新交易日</span>
+                                <span class="heatmap-date-label">LATEST DATE</span>
                                 <span class="heatmap-date-value" id="heatmap-latest-date">--</span>
                             </div>
 
                             <div class="heatmap-filter-section">
-                                <div class="heatmap-filter-title">市场范围</div>
+                                <div class="heatmap-filter-title">SCOPE</div>
                                 <div class="heatmap-filter-list" id="heatmap-market-filter">
                                     <button class="heatmap-filter-btn active" data-scope="all" type="button">A股全图</button>
                                     <button class="heatmap-filter-btn" data-scope="main" type="button">上证A股</button>
                                     <button class="heatmap-filter-btn" data-scope="chinext" type="button">创业板</button>
                                     <button class="heatmap-filter-btn" data-scope="star" type="button">科创板</button>
-                                    <button
-                                        class="heatmap-filter-btn disabled"
-                                        data-scope="bse"
-                                        type="button"
-                                        disabled
-                                        title="当前系统版本并不支持北交所，敬请期待～">
-                                        北交所A股
-                                    </button>
+                                    <button class="heatmap-filter-btn disabled" data-scope="bse" type="button" disabled title="当前系统版本并不支持北交所">北交所A股</button>
                                 </div>
                             </div>
 
                             <div class="heatmap-filter-section">
-                                <div class="heatmap-filter-title">涨跌口径</div>
+                                <div class="heatmap-filter-title">METRIC</div>
                                 <div class="heatmap-filter-list metric" id="heatmap-metric-filter">
                                     <button class="heatmap-filter-btn active" data-metric="daily" type="button">日线</button>
                                     <button class="heatmap-filter-btn" data-metric="weekly" type="button">本周以来</button>
@@ -331,7 +266,7 @@
                             </div>
 
                             <div class="heatmap-legend">
-                                <div class="heatmap-legend-title">颜色参考</div>
+                                <div class="heatmap-legend-title">REFERENCE</div>
                                 <div class="heatmap-legend-bar">
                                     <span class="neg">-4%</span>
                                     <span class="mid">0%</span>
@@ -358,26 +293,14 @@
                             <section class="panel heatmap-panel">
                                 <div class="panel-header panel-header-wrap">
                                     <div>
-                                        <span class="panel-title">A股市场云图</span>
+                                        <span class="panel-title">A-SHARE HEATMAP</span>
                                         <div class="panel-subtitle" id="heatmap-subtitle">按行业聚合，面积映射总市值，颜色映射最新口径涨跌幅</div>
                                     </div>
                                     <div class="heatmap-panel-actions">
                                         <button class="btn btn-ghost" id="heatmap-fullscreen-btn" type="button" aria-pressed="false">
-                                            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
-                                                <polyline points="4,1.5 1.5,1.5 1.5,4"></polyline>
-                                                <polyline points="8,1.5 10.5,1.5 10.5,4"></polyline>
-                                                <polyline points="1.5,8 1.5,10.5 4,10.5"></polyline>
-                                                <polyline points="8,10.5 10.5,10.5 10.5,8"></polyline>
-                                            </svg>
                                             <span class="heatmap-fullscreen-label">全屏显示</span>
                                         </button>
-                                        <button class="btn btn-ghost" id="refresh-heatmap-btn" type="button">
-                                            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
-                                                <path d="M10 6A4 4 0 1 1 6 2"></path>
-                                                <polyline points="10,2 10,6 6,6"></polyline>
-                                            </svg>
-                                            刷新云图
-                                        </button>
+                                        <button class="btn btn-ghost" id="refresh-heatmap-btn" type="button">刷新云图</button>
                                     </div>
                                 </div>
                                 <div class="panel-body heatmap-panel-body">
@@ -402,21 +325,15 @@
                     <section class="panel control-panel">
                         <div class="panel-header panel-header-wrap">
                             <div>
-                                <span class="panel-title">执行控制台</span>
+                                <span class="panel-title">SELECTION CONTROL</span>
                                 <div class="panel-subtitle">选择板块范围与策略组合后执行选股</div>
                             </div>
-                            <button class="btn btn-ghost" id="refresh-selection-options-btn">
-                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
-                                    <path d="M10 6A4 4 0 1 1 6 2"></path>
-                                    <polyline points="10,2 10,6 6,6"></polyline>
-                                </svg>
-                                刷新选项
-                            </button>
+                            <button class="btn btn-ghost" id="refresh-selection-options-btn" type="button">刷新选项</button>
                         </div>
                         <div class="panel-body control-stack">
                             <div class="control-section">
                                 <div class="control-section-head">
-                                    <span class="control-section-title">股票类型</span>
+                                    <span class="control-section-title">BOARD SCOPE</span>
                                     <span class="control-section-meta" id="board-selection-meta">3 / 3 已选</span>
                                 </div>
                                 <div class="board-option-grid" id="board-filter">
@@ -426,7 +343,7 @@
 
                             <div class="control-section">
                                 <div class="control-section-head">
-                                    <span class="control-section-title">选股策略</span>
+                                    <span class="control-section-title">STRATEGY SET</span>
                                     <div class="inline-actions">
                                         <button class="text-action" id="strategy-select-all-btn" type="button">全选</button>
                                         <button class="text-action" id="strategy-clear-all-btn" type="button">清空</button>
@@ -439,30 +356,25 @@
 
                             <div class="control-section">
                                 <div class="control-section-head">
-                                    <span class="control-section-title">执行快照</span>
+                                    <span class="control-section-title">EXECUTION SNAPSHOT</span>
                                     <span class="control-section-meta" id="selection-execution-note">等待执行</span>
                                 </div>
                                 <div class="execution-grid">
                                     <div class="execution-card">
-                                        <div class="execution-card-label">板块</div>
+                                        <div class="execution-card-label">BOARDS</div>
                                         <div class="execution-card-value" id="selected-boards-count">0</div>
                                     </div>
                                     <div class="execution-card">
-                                        <div class="execution-card-label">策略</div>
+                                        <div class="execution-card-label">STRATEGIES</div>
                                         <div class="execution-card-value" id="selected-strategies-count">0</div>
                                     </div>
                                     <div class="execution-card">
-                                        <div class="execution-card-label">股票池</div>
+                                        <div class="execution-card-label">POOL</div>
                                         <div class="execution-card-value" id="selection-stock-pool">0</div>
                                     </div>
                                 </div>
                                 <div class="execution-actions">
-                                    <button class="btn btn-primary btn-wide" id="execute-selection-btn">
-                                        <svg viewBox="0 0 12 12" fill="currentColor">
-                                            <polygon points="2,1 10,6 2,11"></polygon>
-                                        </svg>
-                                        立即执行
-                                    </button>
+                                    <button class="btn btn-primary btn-wide" id="execute-selection-btn" type="button">立即执行</button>
                                 </div>
                             </div>
                         </div>
@@ -471,10 +383,10 @@
                     <section class="panel results-panel">
                         <div class="panel-header panel-header-wrap">
                             <div>
-                                <span class="panel-title">结果面板</span>
+                                <span class="panel-title">RESULT MONITOR</span>
                                 <div class="panel-subtitle" id="selection-results-headline">尚未执行选股</div>
                             </div>
-                            <span class="panel-meta" id="selection-results-meta">Awaiting Run</span>
+                            <span class="panel-meta" id="selection-results-meta">AWAITING RUN</span>
                         </div>
                         <div class="panel-body results-panel-body">
                             <div id="selection-results">
@@ -489,17 +401,10 @@
                 <div class="panel">
                     <div class="panel-header panel-header-wrap">
                         <div>
-                            <span class="panel-title">策略参数配置</span>
+                            <span class="panel-title">STRATEGY PARAMETERS</span>
                             <div class="panel-subtitle">支持嵌套参数编辑，保存后会即时重载策略注册表</div>
                         </div>
-                        <button class="btn btn-primary" id="save-config-btn">
-                            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4">
-                                <path d="M9 1H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V3L9 1z"></path>
-                                <polyline points="3,1 3,5 9,5"></polyline>
-                                <rect x="3" y="8" width="6" height="2.5"></rect>
-                            </svg>
-                            保存配置
-                        </button>
+                        <button class="btn btn-primary" id="save-config-btn" type="button">保存配置</button>
                     </div>
                     <div class="panel-body" id="strategies-config">
                         <div class="state-loading">加载中...</div>
@@ -508,16 +413,37 @@
             </section>
         </div>
     </main>
-</div>
 
-<div class="floating-controls" id="floating-controls">
-    <button class="floating-btn update-btn" id="update-data-btn" type="button">
-        <span>更新数据</span>
-    </button>
-    <button class="floating-btn halt-btn" id="halt-btn" type="button">
-        <span class="halt-btn-dot"></span>
-        <span>急停</span>
-    </button>
+    <div class="command-bar">
+        <div class="command-label">CMD</div>
+        <input class="command-input" id="terminal-command-input" type="text" autocomplete="off" placeholder="ENTER FUNCTION CODE OR TICKER&lt;GO&gt;">
+        <button class="btn btn-primary command-go" id="terminal-command-go" type="button">GO</button>
+        <button class="btn btn-secondary" id="update-data-btn" type="button">UPDATE</button>
+        <button class="btn btn-danger halt-btn" id="halt-btn" type="button">
+            <span class="halt-btn-dot"></span>
+            <span>HALT</span>
+        </button>
+        <div class="command-output" id="terminal-command-output">SYS READY</div>
+    </div>
+
+    <footer class="status-bar">
+        <div class="status-segment">
+            <span class="status-name">SYS</span>
+            <span class="status-value" id="sidebar-status-text">READY</span>
+        </div>
+        <div class="status-segment">
+            <span class="status-name">UNIVERSE</span>
+            <span class="status-value" id="sidebar-universe-text">ALL BOARDS</span>
+        </div>
+        <div class="status-segment">
+            <span class="status-name">CONN</span>
+            <span class="status-value">LOCAL / FLASK</span>
+        </div>
+        <div class="status-segment">
+            <span class="status-name">USER</span>
+            <span class="status-value">TRADING@LOCAL</span>
+        </div>
+    </footer>
 </div>
 
 <div id="update-modal" class="modal-backdrop">
@@ -527,26 +453,21 @@
                 <div class="modal-kicker">DATA UPDATE</div>
                 <span class="modal-title" id="update-modal-title">选择更新数据源</span>
             </div>
-            <button class="modal-close" id="update-modal-close-btn" type="button">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <line x1="2" y1="2" x2="14" y2="14"></line>
-                    <line x1="14" y1="2" x2="2" y2="14"></line>
-                </svg>
-            </button>
+            <button class="modal-close" id="update-modal-close-btn" type="button">X</button>
         </div>
         <div class="modal-body update-modal-body">
             <div class="update-modal-step active" id="update-provider-step">
                 <div class="update-modal-note">请选择本次更新要使用的数据源。</div>
                 <div class="update-provider-grid">
-                    <button class="update-provider-btn" data-provider="akshare" type="button">AkShare</button>
-                    <button class="update-provider-btn" data-provider="tushare" type="button">Tushare</button>
+                    <button class="update-provider-btn" data-provider="akshare" type="button">AKSHARE</button>
+                    <button class="update-provider-btn" data-provider="tushare" type="button">TUSHARE</button>
                 </div>
             </div>
 
             <div class="update-modal-step" id="update-token-step">
                 <div class="update-modal-note">选择了 Tushare。请输入 Token，若本地已配置也可留空继续。</div>
-                <label class="update-token-label" for="update-tushare-token">Tushare Token</label>
-                <input class="search-input update-token-input" id="update-tushare-token" type="password" placeholder="输入 Tushare Token，或留空使用本地配置">
+                <label class="update-token-label" for="update-tushare-token">TUSHARE TOKEN</label>
+                <input class="search-input update-token-input" id="update-tushare-token" type="password" placeholder="INPUT TOKEN OR LEAVE BLANK">
                 <div class="update-token-actions">
                     <button class="btn btn-ghost" id="update-token-back-btn" type="button">返回</button>
                     <button class="btn btn-primary" id="update-token-confirm-btn" type="button">开始更新</button>
@@ -563,25 +484,25 @@
                 </div>
                 <div class="selection-progress-grid update-progress-grid">
                     <div class="selection-summary-card">
-                        <span class="label">当前步骤</span>
+                        <span class="label">STEP</span>
                         <span class="value" id="update-current-step">等待执行</span>
                     </div>
                     <div class="selection-summary-card">
-                        <span class="label">已处理</span>
+                        <span class="label">PROCESSED</span>
                         <span class="value" id="update-processed-count">0 / 0</span>
                     </div>
                     <div class="selection-summary-card">
-                        <span class="label">数据源</span>
+                        <span class="label">PROVIDER</span>
                         <span class="value" id="update-provider-value">--</span>
                     </div>
                     <div class="selection-summary-card">
-                        <span class="label">耗时</span>
+                        <span class="label">ELAPSED</span>
                         <span class="value" id="update-elapsed-value">00:00</span>
                     </div>
                 </div>
                 <div class="progress-log-panel">
                     <div class="progress-log-header">
-                        <span>Update Feed</span>
+                        <span>UPDATE FEED</span>
                         <span id="update-progress-status">QUEUED</span>
                     </div>
                     <div class="progress-log-list" id="update-progress-logs">
@@ -600,12 +521,7 @@
                 <div class="modal-kicker">STOCK DETAIL</div>
                 <span class="modal-title" id="modal-title">--</span>
             </div>
-            <button class="modal-close" id="modal-close-btn" type="button">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <line x1="2" y1="2" x2="14" y2="14"></line>
-                    <line x1="14" y1="2" x2="2" y2="14"></line>
-                </svg>
-            </button>
+            <button class="modal-close" id="modal-close-btn" type="button">X</button>
         </div>
         <div class="modal-body">
             <canvas id="stock-chart"></canvas>
@@ -621,12 +537,7 @@
                 <div class="modal-kicker">INDUSTRY DETAIL</div>
                 <span class="modal-title" id="industry-modal-title">--</span>
             </div>
-            <button class="modal-close" id="industry-modal-close-btn" type="button">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <line x1="2" y1="2" x2="14" y2="14"></line>
-                    <line x1="14" y1="2" x2="2" y2="14"></line>
-                </svg>
-            </button>
+            <button class="modal-close" id="industry-modal-close-btn" type="button">X</button>
         </div>
         <div class="modal-body">
             <div class="industry-modal-subtitle" id="industry-modal-subtitle">--</div>
