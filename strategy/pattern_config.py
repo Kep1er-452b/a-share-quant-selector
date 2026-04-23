@@ -12,10 +12,12 @@ import os
 import yaml
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 def _load_yaml_config():
     """从YAML配置文件加载B1PatternMatch配置"""
-    config_path = Path("/root/quant-csv/config/strategy_params.yaml")
+    config_path = PROJECT_ROOT / "config" / "strategy_params.yaml"
     
     if not config_path.exists():
         return {}

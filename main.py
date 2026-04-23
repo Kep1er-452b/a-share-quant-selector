@@ -574,6 +574,8 @@ class QuantSystem:
                         'near_short_trend': '📈',
                         'b1_v242b': '🎯',
                         'b2_beta': '🚀',
+                        'b1_min_j_simple': '🔻',
+                        'b1_min_j_complex': '🧩',
                     }.get(s.get('category'), '❓')
                     print(f"  {cat_emoji} {code} {name}: 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
         
@@ -586,6 +588,8 @@ class QuantSystem:
             'near_short_trend': '📈 靠近短期趋势线',
             'b1_v242b': '🎯 B1(V2.42B)',
             'b2_beta': '🚀 B2选股Beta版',
+            'b1_min_j_simple': '🔻 B1MinJSimple',
+            'b1_min_j_complex': '🧩 B1MinJComplex',
         }
         if category_count:
             for key, count in sorted(category_count.items()):

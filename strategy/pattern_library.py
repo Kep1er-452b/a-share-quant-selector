@@ -23,7 +23,7 @@ class B1PatternLibrary:
     - 为B2、B3等扩展预留空间
     """
     
-    CACHE_FILE = Path("/root/quant-csv/data/b1_pattern_library_cache.json")
+    CACHE_FILE = Path(__file__).resolve().parent.parent / "data" / "b1_pattern_library_cache.json"
     
     def __init__(self, csv_manager):
         self.csv_manager = csv_manager
