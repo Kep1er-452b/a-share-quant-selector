@@ -136,7 +136,8 @@ def generate_kline_chart_fast(
 # 测试
 if __name__ == '__main__':
     import sys
-    sys.path.insert(0, '/root/quant-csv')
+    project_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(project_root))
     
     import time
     from utils.csv_manager import CSVManager
@@ -144,7 +145,7 @@ if __name__ == '__main__':
     
     print("测试简化版K线图生成...")
     
-    csv = CSVManager('/root/quant-csv/data')
+    csv = CSVManager(str(project_root / 'data'))
     df = csv.read_stock('000995')
     
     strategy = BowlReboundStrategy()

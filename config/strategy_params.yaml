@@ -88,6 +88,36 @@ B2BetaStrategy:
   PLRY_MIN_COUNT: 2
 
 # ============================================
+# B1MinJSimple 策略
+# ============================================
+B1MinJSimpleStrategy:
+  # 至少需要覆盖长周期 Min J 计算窗口
+  MIN_HISTORY_DAYS: 114
+
+  # 原 Min J 指标中 J 拐点的上限条件: J < 55
+  J_VALLEY_MAX: 55
+
+  # 长周期底部平均深度上移值: VAL_LONG + 10
+  LONG_OFFSET: 10
+
+# ============================================
+# B1MinJComplex 策略
+# ============================================
+B1MinJComplexStrategy:
+  # 覆盖 HMLONGYL 中最长 MA160 以及 Min J 长周期窗口
+  MIN_HISTORY_DAYS: 160
+  J_VALLEY_MAX: 55
+  LONG_OFFSET: 10
+  MV_MIN_BILLION: 50
+  YANGYIN_RATIO_57: 1.25
+  YANGYIN_RATIO_14: 2.25
+  PLRY_VOL_RATIO: 1.95
+  HALF_DOWN_VOL_RATIO: 0.5
+  TOP_RANGE_RATIO: 0.95
+  FD15_VOL_RATIO: 1.2
+  B1_TREND_TOLERANCE: 0.985
+
+# ============================================
 # B1完美图形匹配 (B1PatternMatch)
 # ============================================
 # 功能说明：

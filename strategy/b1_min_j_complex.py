@@ -1,5 +1,5 @@
 """
-B1 (V2.42B) 策略 - 通达信公式 Python 实现
+B1MinJComplex 策略 - B1(V2.42B) 条件 + 动态 Min J
 """
 import pandas as pd
 import sys
@@ -8,26 +8,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
-from utils.technical import MA, LLV, HHV, REF, SMA, KDJ, COUNT, SUM
+from strategy.b1_min_j_simple import calculate_min_j
+from utils.technical import COUNT, HHV, KDJ, LLV, MA, REF, SMA, SUM
 
 
-class B1V242BStrategy(BaseStrategy):
-    """B1 (V2.42B) 策略"""
+class B1MinJComplexStrategy(BaseStrategy):
+    """B1MinJComplex 策略"""
 
     def __init__(self, params=None):
         default_params = {
-            "J_MAX": 13,
+            "MIN_HISTORY_DAYS": 160,
+            "J_VALLEY_MAX": 55,
+            "LONG_OFFSET": 10,
             "MV_MIN_BILLION": 50,
             "YANGYIN_RATIO_57": 1.25,
             "YANGYIN_RATIO_14": 2.25,
             "PLRY_VOL_RATIO": 1.95,
             "HALF_DOWN_VOL_RATIO": 0.5,
             "TOP_RANGE_RATIO": 0.95,
+            "FD15_VOL_RATIO": 1.2,
             "B1_TREND_TOLERANCE": 0.985,
         }
         if params:
             default_params.update(params)
-        super().__init__("B1 (V2.42B)", default_params)
+        super().__init__("B1MinJComplex", default_params)
 
     def calculate_indicators(self, df) -> pd.DataFrame:
         result = df.copy()
@@ -48,7 +52,13 @@ class B1V242BStrategy(BaseStrategy):
             result["K"] = kdj_df["K"]
             result["D"] = kdj_df["D"]
             result["J"] = kdj_df["J"]
-        result["J_OK"] = result["J"] <= self.params["J_MAX"]
+
+        result["MIN_J"] = calculate_min_j(
+            result,
+            j_valley_max=self.params["J_VALLEY_MAX"],
+            long_offset=self.params["LONG_OFFSET"],
+        )
+        result["J_OK"] = result["J"] <= result["MIN_J"]
 
         result["VOL_YANG1"] = SUM(result["volume"] * result["REAL_YANG"].astype(int), 57)
         result["VOL_YIN1"] = SUM(result["volume"] * result["REAL_YIN"].astype(int), 57)
@@ -66,13 +76,13 @@ class B1V242BStrategy(BaseStrategy):
         o_llv = LLV(result["open"], 21)
         o_hhv = HHV(result["open"], 21)
         result["O85"] = o_llv + self.params["TOP_RANGE_RATIO"] * (o_hhv - o_llv)
-        result["TOP15O"] = result["open"] >= result["O85"]
+        result["TOP150"] = result["open"] >= result["O85"]
         result["FD15"] = (
             (result["close"] < ref_close_1) &
             (result["close"] <= result["open"]) &
-            (result["volume"] >= 1.2 * ref_vol_1)
+            (result["volume"] >= self.params["FD15_VOL_RATIO"] * ref_vol_1)
         )
-        result["CNT28"] = COUNT(result["TOP15O"] & result["FD15"], 21)
+        result["CNT28"] = COUNT(result["TOP150"] & result["FD15"], 21)
         result["GOOD28"] = result["CNT28"] <= 0
 
         result["AVG40"] = MA(result["volume"], 40)
@@ -132,7 +142,7 @@ class B1V242BStrategy(BaseStrategy):
         )
 
         tolerance = self.params["B1_TREND_TOLERANCE"]
-        result["B1_SIGNAL"] = (
+        result["B1_MIN_J_COMPLEX_SIGNAL"] = (
             (result["HMSHORTWL"] >= result["HMLONGYL"] * tolerance) &
             (result["close"] >= result["HMLONGYL"] * tolerance) &
             result["A1"]
@@ -142,6 +152,9 @@ class B1V242BStrategy(BaseStrategy):
 
     def select_stocks(self, df, stock_name='') -> list:
         if df.empty:
+            return []
+
+        if len(df) < self.params["MIN_HISTORY_DAYS"]:
             return []
 
         if stock_name:
@@ -155,10 +168,12 @@ class B1V242BStrategy(BaseStrategy):
         if latest.get("volume", 0) <= 0 or pd.isna(latest.get("close")):
             return []
 
-        if not bool(latest.get("B1_SIGNAL", False)):
+        if not bool(latest.get("B1_MIN_J_COMPLEX_SIGNAL", False)):
             return []
 
         reasons = []
+        if bool(latest.get("J_OK", False)):
+            reasons.append("J值跌破动态Min J")
         if bool(latest.get("PLRY_CNT", False)):
             reasons.append("批量量入成立")
         if bool(latest.get("YANGYIN_OK1", False)):
@@ -172,13 +187,14 @@ class B1V242BStrategy(BaseStrategy):
         if bool(latest.get("MAX28_OK", False)):
             reasons.append("近28日最大量非实阴")
 
-        signal_info = {
+        return [{
             "date": latest["date"],
             "close": round(float(latest["close"]), 2),
             "J": round(float(latest["J"]), 2),
+            "MIN_J": round(float(latest["MIN_J"]), 2),
             "market_cap": round(float(latest["market_cap"]) / 1e8, 2) if pd.notna(latest.get("market_cap")) else 0,
-            "reasons": reasons or ["满足 B1(V2.42B) 条件"],
-            "category": "b1_v242b",
+            "reasons": reasons or ["满足 B1MinJComplex 条件"],
+            "category": "b1_min_j_complex",
             "yangyin_ratio_57": round(
                 float(latest["VOL_YANG1"]) / float(latest["VOL_YIN1"]) if float(latest["VOL_YIN1"]) > 0 else 999.0,
                 2,
@@ -189,5 +205,4 @@ class B1V242BStrategy(BaseStrategy):
             ),
             "hm_short": round(float(latest["HMSHORTWL"]), 2),
             "hm_long": round(float(latest["HMLONGYL"]), 2),
-        }
-        return [signal_info]
+        }]

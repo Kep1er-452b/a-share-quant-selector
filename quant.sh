@@ -1,8 +1,18 @@
 #!/bin/bash
 # A股量化选股系统 - 快捷命令脚本
 
-QUANT_DIR="/root/quant-csv"
-PYTHON="/usr/bin/python3"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QUANT_DIR="$SCRIPT_DIR"
+if [ -x "$QUANT_DIR/.venv/bin/python" ]; then
+    PYTHON="${PYTHON:-$QUANT_DIR/.venv/bin/python}"
+else
+    PYTHON="${PYTHON:-$(command -v python3)}"
+fi
+
+if [ -z "$PYTHON" ]; then
+    echo "未找到 python3，请先安装或把它加入 PATH。"
+    exit 1
+fi
 
 cd "$QUANT_DIR" || exit 1
 
