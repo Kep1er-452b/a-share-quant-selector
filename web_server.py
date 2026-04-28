@@ -11,8 +11,9 @@ import uuid
 from threading import Event, Lock, Thread
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import yaml
+import pandas as pd
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
@@ -47,6 +48,14 @@ selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
 
+INDEX_KLINE_TARGETS = {
+    'sh000001': {'symbol': 'sh000001', 'name': '上证指数'},
+    'sz399001': {'symbol': 'sz399001', 'name': '深证成指'},
+    'sz399006': {'symbol': 'sz399006', 'name': '创业板指'},
+    'sh000688': {'symbol': 'sh000688', 'name': '科创50'},
+}
+INDEX_KLINE_CACHE_TTL_SECONDS = 15 * 60
+
 
 def _reload_registry():
     """重新加载策略注册器，确保参数变更立即生效。"""
@@ -66,6 +75,151 @@ def _load_config(config_path="config/config.yaml"):
         with open(config_file, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     return {}
+
+
+def _index_kline_cache_path(data_dir='data'):
+    return Path(data_dir) / 'index_kline_cache.json'
+
+
+def _load_index_kline_cache(data_dir='data'):
+    cache_path = _index_kline_cache_path(data_dir)
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as file:
+            return json.load(file) or {}
+    except Exception:
+        return {}
+
+
+def _save_index_kline_cache(cache, data_dir='data'):
+    cache_path = _index_kline_cache_path(data_dir)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, 'w', encoding='utf-8') as file:
+        json.dump(cache, file, ensure_ascii=False, indent=2)
+
+
+def _cached_index_kline(symbol, data_dir='data'):
+    cache = _load_index_kline_cache(data_dir)
+    item = cache.get(symbol) or {}
+    updated_at = item.get('updated_at')
+    if not updated_at:
+        return None, cache
+    try:
+        updated_time = datetime.strptime(updated_at, '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None, cache
+    if (datetime.now() - updated_time).total_seconds() <= INDEX_KLINE_CACHE_TTL_SECONDS:
+        return item, cache
+    return None, cache
+
+
+def _fetch_index_kline(symbol, data_dir='data', limit=30):
+    target = INDEX_KLINE_TARGETS.get(symbol) or INDEX_KLINE_TARGETS['sh000001']
+    cached_item, cache = _cached_index_kline(target['symbol'], data_dir=data_dir)
+    if cached_item:
+        return {**cached_item, 'from_cache': True}
+
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError('未安装 akshare，无法获取指数K线') from exc
+
+    source = 'akshare:stock_zh_index_daily_em'
+    end_date = datetime.now().strftime('%Y%m%d')
+    start_date = (datetime.now() - timedelta(days=180)).strftime('%Y%m%d')
+    try:
+        df = ak.stock_zh_index_daily_em(
+            symbol=target['symbol'],
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception:
+        try:
+            df = _fetch_index_kline_tencent(target['symbol'], max(limit + 5, 35))
+            source = 'tencent:appstock/fqkline'
+        except Exception:
+            df = ak.stock_zh_index_daily(symbol=target['symbol'])
+            source = 'akshare:stock_zh_index_daily'
+
+    if df is None or df.empty:
+        df = _fetch_index_kline_tencent(target['symbol'], max(limit + 5, 35))
+        source = 'tencent:appstock/fqkline'
+    if df is None or df.empty:
+        raise RuntimeError(f"{target['name']} 暂无K线数据")
+
+    df = df.copy()
+    df['date'] = df['date'].astype(str)
+    for column in ['open', 'close', 'low', 'high', 'volume', 'amount']:
+        if column in df.columns:
+            df[column] = df[column].astype(float)
+    df = df.sort_values('date').tail(limit)
+    candles = [
+        {
+            'date': row['date'],
+            'open': round(float(row['open']), 2),
+            'close': round(float(row['close']), 2),
+            'low': round(float(row['low']), 2),
+            'high': round(float(row['high']), 2),
+            'volume': round(float(row.get('volume', 0)), 2),
+            'amount': round(float(row.get('amount', 0)), 2),
+        }
+        for row in df.to_dict('records')
+    ]
+    payload = {
+        'symbol': target['symbol'],
+        'name': target['name'],
+        'period': 'daily',
+        'limit': limit,
+        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'source': source,
+        'candles': candles,
+    }
+    cache[target['symbol']] = payload
+    _save_index_kline_cache(cache, data_dir=data_dir)
+    return {**payload, 'from_cache': False}
+
+
+def _fetch_index_kline_tencent(symbol, limit):
+    import requests
+
+    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{limit},qfq'
+    response = requests.get(
+        url,
+        timeout=15,
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://stock.finance.qq.com/',
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data_level = payload.get('data', {})
+    klines = []
+
+    if isinstance(data_level, dict):
+        stock_data = data_level.get(symbol, {})
+        if isinstance(stock_data, dict):
+            klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+    elif isinstance(data_level, list):
+        for item in data_level:
+            if isinstance(item, list) and len(item) >= 2 and item[0] == symbol and isinstance(item[1], list):
+                klines = item[1]
+                break
+
+    records = []
+    for item in klines:
+        if isinstance(item, list) and len(item) >= 6:
+            records.append({
+                'date': str(item[0]),
+                'open': float(item[1]),
+                'close': float(item[2]),
+                'high': float(item[3]),
+                'low': float(item[4]),
+                'volume': float(item[5]),
+                'amount': 0.0,
+            })
+    return pd.DataFrame(records)
 
 
 def _config_value(config, *keys, default=None):
@@ -760,9 +914,15 @@ def get_stock_detail(code):
         if df.empty:
             return jsonify({'success': False, 'error': '股票不存在'})
         
-        # 计算KDJ指标
+        # 计算KDJ指标与动态 Min J
         from utils.technical import KDJ
+        from strategy.b1_min_j_simple import calculate_min_j
         kdj_df = KDJ(df, n=9, m1=3, m2=3)
+        indicator_df = df.copy()
+        indicator_df['K'] = kdj_df['K']
+        indicator_df['D'] = kdj_df['D']
+        indicator_df['J'] = kdj_df['J']
+        min_j = calculate_min_j(indicator_df)
         
         # 转换为列表格式
         data = []
@@ -779,10 +939,41 @@ def get_stock_detail(code):
                 'market_cap': round(row.get('market_cap', 0) / 1e8, 2),  # 总市值，单位：亿
                 'K': round(kdj_df.iloc[i]['K'], 2),
                 'D': round(kdj_df.iloc[i]['D'], 2),
-                'J': round(kdj_df.iloc[i]['J'], 2)
+                'J': round(kdj_df.iloc[i]['J'], 2),
+                'MIN_J': round(min_j.iloc[i], 2),
             })
         
         return jsonify({'success': True, 'code': code, 'data': data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/dashboard-pulse')
+def get_dashboard_pulse():
+    """获取首页市场强弱快照。"""
+    try:
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily')
+        groups = payload.get('groups', []) or []
+        ranked_groups = [
+            group for group in groups
+            if group.get('change_pct') is not None
+        ]
+        leaders = sorted(ranked_groups, key=lambda item: item.get('change_pct', 0), reverse=True)[:3]
+        laggards = sorted(ranked_groups, key=lambda item: item.get('change_pct', 0))[:3]
+        return jsonify({
+            'success': True,
+            'data': {
+                'latest_date': payload.get('latest_date'),
+                'stock_count': payload.get('stock_count'),
+                'group_count': payload.get('group_count'),
+                'ticker_stats': payload.get('ticker_stats', {}),
+                'leaders': leaders,
+                'laggards': laggards,
+                'header_indices': payload.get('header_indices', []),
+            }
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -1025,6 +1216,31 @@ def get_stats():
                 'halted': _is_halted(),
             }
         })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/index-kline')
+def get_index_kline():
+    """获取首页指数日K线。"""
+    try:
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        symbol = _normalize_csv_value(request.args.get('symbol')) or 'sh000001'
+        if symbol not in INDEX_KLINE_TARGETS:
+            symbol = 'sh000001'
+        limit = int(request.args.get('limit', 30))
+        limit = min(max(limit, 10), 60)
+        try:
+            payload = _fetch_index_kline(symbol, data_dir=data_dir, limit=limit)
+        except Exception as exc:
+            cache = _load_index_kline_cache(data_dir)
+            cached_payload = cache.get(symbol)
+            if cached_payload:
+                payload = {**cached_payload, 'from_cache': True, 'stale': True, 'warning': str(exc)}
+            else:
+                raise
+        return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 

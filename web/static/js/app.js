@@ -33,6 +33,8 @@ const state = {
     currentSelectionJobId: null,
     updatePollTimer: null,
     currentUpdateJobId: null,
+    indexKlineChart: null,
+    currentIndexSymbol: 'sh000001',
     localProgressTimer: null,
     jobStartTime: null,
     serverElapsedBase: 0,
@@ -501,12 +503,8 @@ async function loadStats() {
 
         updateTextWithFlash('hero-universe', 'ALL BOARDS');
         updateTextWithFlash('sidebar-universe-text', 'ALL BOARDS');
-        renderDashboardSparkline([
-            Number(boardCounts.main || 0),
-            Number(boardCounts.chinext || 0),
-            Number(boardCounts.star || 0),
-            Number(data.strategies || 0),
-        ]);
+        loadDashboardIndexKline(state.currentIndexSymbol);
+        loadDashboardPulse();
         updateGlobalTicker(buildDefaultTickerText(data));
         if (data.halted) {
             setStatus('halted');
@@ -604,49 +602,278 @@ function buildTickerLoopText(stats, latestDate) {
     return `${ticker}   •   ${ticker}`;
 }
 
-function renderDashboardSparkline(values) {
+function formatPulseGroupList(groups) {
+    if (!Array.isArray(groups) || !groups.length) {
+        return '--';
+    }
+    return groups.map(item => {
+        const pct = Number.isFinite(Number(item.change_pct)) ? formatPercent(item.change_pct) : '--';
+        return `${item.name || '--'} ${pct}`;
+    }).join(' / ');
+}
+
+function renderDashboardPulse(payload) {
+    const container = document.getElementById('dashboard-market-pulse');
+    if (!container) {
+        return;
+    }
+
+    const stats = payload?.ticker_stats || {};
+    const median = stats.median_change_pct;
+    container.innerHTML = `
+        <div class="pulse-card">
+            <div class="pulse-label">ADVANCERS</div>
+            <div class="pulse-value up">${formatNumber(stats.up_count || 0)}</div>
+            <div class="pulse-sub">上涨家数</div>
+        </div>
+        <div class="pulse-card">
+            <div class="pulse-label">DECLINERS</div>
+            <div class="pulse-value down">${formatNumber(stats.down_count || 0)}</div>
+            <div class="pulse-sub">下跌家数</div>
+        </div>
+        <div class="pulse-card">
+            <div class="pulse-label">UNCHANGED</div>
+            <div class="pulse-value">${formatNumber(stats.flat_count || 0)}</div>
+            <div class="pulse-sub">平盘家数</div>
+        </div>
+        <div class="pulse-card">
+            <div class="pulse-label">MEDIAN MOVE</div>
+            <div class="pulse-value ${signedClass(median)}">${formatPercent(median)}</div>
+            <div class="pulse-sub">全市场中位涨幅</div>
+        </div>
+        <div class="pulse-card pulse-card-wide">
+            <div class="pulse-label">STRONG GROUPS</div>
+            <div class="pulse-value up">${escapeHtml(formatPulseGroupList(payload?.leaders))}</div>
+            <div class="pulse-sub">行业涨幅前三</div>
+        </div>
+        <div class="pulse-card pulse-card-wide">
+            <div class="pulse-label">WEAK GROUPS</div>
+            <div class="pulse-value down">${escapeHtml(formatPulseGroupList(payload?.laggards))}</div>
+            <div class="pulse-sub">行业跌幅前三</div>
+        </div>
+        <div class="pulse-card pulse-card-wide">
+            <div class="pulse-label">INDEX WATCH</div>
+            <div class="pulse-value">${escapeHtml(formatPulseGroupList(payload?.header_indices))}</div>
+            <div class="pulse-sub">主要指数快照</div>
+        </div>
+        <div class="pulse-card pulse-card-wide">
+            <div class="pulse-label">COVERAGE</div>
+            <div class="pulse-value">${formatNumber(payload?.stock_count || 0)} / ${formatNumber(payload?.group_count || 0)}</div>
+            <div class="pulse-sub">股票 / 行业分组 · ${escapeHtml(payload?.latest_date || '--')}</div>
+        </div>
+    `;
+}
+
+async function loadDashboardPulse() {
+    if (state.systemHalted) {
+        return;
+    }
+    const container = document.getElementById('dashboard-market-pulse');
+    try {
+        const result = await apiFetch('/api/dashboard-pulse');
+        if (!result.success) {
+            throw new Error(result.error || '市场强弱数据加载失败');
+        }
+        renderDashboardPulse(result.data || {});
+    } catch (error) {
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        if (container) {
+            container.innerHTML = `<div class="state-empty">MARKET PULSE LOAD FAILED: ${escapeHtml(error.message)}</div>`;
+        }
+    }
+}
+
+function formatCompactAmount(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    if (numeric >= 100000000) {
+        return `${(numeric / 100000000).toFixed(1)}亿`;
+    }
+    if (numeric >= 10000) {
+        return `${(numeric / 10000).toFixed(1)}万`;
+    }
+    return numeric.toFixed(0);
+}
+
+function setDashboardIndexButtons(symbol) {
+    document.querySelectorAll('#dashboard-index-selector .index-switch-btn').forEach(button => {
+        button.classList.toggle('active', button.dataset.symbol === symbol);
+    });
+}
+
+function resizeDashboardIndexChart(delay = 0) {
+    window.setTimeout(() => {
+        if (state.indexKlineChart) {
+            state.indexKlineChart.resize();
+        }
+    }, delay);
+}
+
+function renderDashboardIndexKline(payload) {
     const container = document.getElementById('dashboard-sparkline');
     if (!container) {
         return;
     }
 
-    const series = Array.isArray(values)
-        ? values.map(value => Number(value)).filter(value => Number.isFinite(value))
+    const candles = Array.isArray(payload?.candles)
+        ? payload.candles.filter(item =>
+            Number.isFinite(Number(item.open)) &&
+            Number.isFinite(Number(item.close)) &&
+            Number.isFinite(Number(item.low)) &&
+            Number.isFinite(Number(item.high))
+        )
         : [];
 
-    if (!series.length) {
-        container.innerHTML = '<div class="state-empty">NO TREND DATA</div>';
+    if (!candles.length) {
+        if (state.indexKlineChart) {
+            state.indexKlineChart.dispose();
+            state.indexKlineChart = null;
+        }
+        container.innerHTML = '<div class="state-empty">NO KLINE DATA</div>';
         return;
     }
 
-    const width = 420;
-    const height = 84;
-    const padding = 8;
-    const min = Math.min(...series);
-    const max = Math.max(...series);
-    const span = Math.max(max - min, 1);
-    const stepX = series.length > 1 ? (width - padding * 2) / (series.length - 1) : 0;
+    if (!window.echarts) {
+        container.innerHTML = '<div class="state-empty">CHART ENGINE MISSING</div>';
+        return;
+    }
 
-    const points = series.map((value, index) => {
-        const x = padding + (index * stepX);
-        const y = height - padding - (((value - min) / span) * (height - padding * 2));
-        return `${x.toFixed(2)},${y.toFixed(2)}`;
-    });
+    if (!state.indexKlineChart) {
+        state.indexKlineChart = window.echarts.init(container);
+    }
 
-    const lastPoint = points[points.length - 1].split(',');
-    const lineColor = series[series.length - 1] >= series[0] ? '#00FF41' : '#FF3131';
-    const fillPath = `M ${padding},${height - padding} L ${points.join(' L ')} L ${width - padding},${height - padding} Z`;
+    const dates = candles.map(item => item.date.slice(5));
+    const values = candles.map(item => [
+        Number(item.open),
+        Number(item.close),
+        Number(item.low),
+        Number(item.high),
+    ]);
+    const latest = candles[candles.length - 1];
+    const previous = candles[candles.length - 2];
+    const changePct = previous && Number(previous.close)
+        ? (((Number(latest.close) / Number(previous.close)) - 1) * 100)
+        : null;
+    const meta = document.getElementById('dashboard-index-meta');
+    if (meta) {
+        const changeText = Number.isFinite(changePct) ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%` : '--';
+        meta.textContent = `${payload.name || '--'} ${latest.date} ${changeText}`;
+        meta.className = `quote-chart-meta ${Number(changePct) >= 0 ? 'positive' : 'negative'}`;
+    }
 
-    container.innerHTML = `
-        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Market sparkline">
-            <line x1="${padding}" y1="${height * 0.25}" x2="${width - padding}" y2="${height * 0.25}" stroke="#1a1a1a" stroke-dasharray="3,3"></line>
-            <line x1="${padding}" y1="${height * 0.5}" x2="${width - padding}" y2="${height * 0.5}" stroke="#1a1a1a" stroke-dasharray="3,3"></line>
-            <line x1="${padding}" y1="${height * 0.75}" x2="${width - padding}" y2="${height * 0.75}" stroke="#1a1a1a" stroke-dasharray="3,3"></line>
-            <path d="${fillPath}" fill="rgba(0,255,65,0.05)"></path>
-            <polyline fill="none" stroke="${lineColor}" stroke-width="1.2" points="${points.join(' ')}"></polyline>
-            <circle cx="${lastPoint[0]}" cy="${lastPoint[1]}" r="2" fill="#FF6600"></circle>
-        </svg>
-    `;
+    state.indexKlineChart.setOption({
+        animation: false,
+        backgroundColor: '#000000',
+        grid: {
+            left: 44,
+            right: 12,
+            top: 14,
+            bottom: 26,
+        },
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            backgroundColor: '#050505',
+            borderColor: '#333333',
+            borderWidth: 1,
+            textStyle: {
+                color: '#f0f0f0',
+                fontFamily: 'IBM Plex Mono, Menlo, monospace',
+                fontSize: 10,
+            },
+            formatter(params) {
+                const point = params && params[0];
+                if (!point) {
+                    return '';
+                }
+                const item = candles[point.dataIndex];
+                return [
+                    `${payload.name || ''} ${item.date}`,
+                    `O ${item.open}  H ${item.high}`,
+                    `L ${item.low}  C ${item.close}`,
+                    `VOL ${formatCompactAmount(item.volume)}`,
+                ].join('<br>');
+            },
+        },
+        xAxis: {
+            type: 'category',
+            data: dates,
+            boundaryGap: true,
+            axisLine: { lineStyle: { color: '#333333' } },
+            axisTick: { show: false },
+            axisLabel: {
+                color: '#777777',
+                fontSize: 9,
+                interval: 4,
+            },
+            splitLine: { show: false },
+        },
+        yAxis: {
+            scale: true,
+            position: 'right',
+            axisLine: { show: false },
+            axisTick: { show: false },
+            axisLabel: {
+                color: '#777777',
+                fontSize: 9,
+            },
+            splitLine: {
+                lineStyle: {
+                    color: '#1f1f1f',
+                    type: 'dashed',
+                },
+            },
+        },
+        series: [{
+            name: payload.name || 'INDEX',
+            type: 'candlestick',
+            data: values,
+            barWidth: '56%',
+            itemStyle: {
+                color: '#ff3131',
+                color0: '#00c853',
+                borderColor: '#ff3131',
+                borderColor0: '#00c853',
+            },
+        }],
+    }, true);
+    resizeDashboardIndexChart(30);
+}
+
+async function loadDashboardIndexKline(symbol = 'sh000001') {
+    if (state.systemHalted) {
+        return;
+    }
+    state.currentIndexSymbol = symbol;
+    setDashboardIndexButtons(symbol);
+
+    const container = document.getElementById('dashboard-sparkline');
+    if (container && !state.indexKlineChart) {
+        container.innerHTML = '<div class="state-loading">LOADING INDEX KLINE...</div>';
+    }
+
+    try {
+        const result = await apiFetch(`/api/index-kline?symbol=${encodeURIComponent(symbol)}&limit=30`);
+        if (!result.success) {
+            throw new Error(result.error || '指数K线加载失败');
+        }
+        renderDashboardIndexKline(result.data || {});
+    } catch (error) {
+        if (error.name === 'AbortError' && state.systemHalted) {
+            return;
+        }
+        if (state.indexKlineChart) {
+            state.indexKlineChart.dispose();
+            state.indexKlineChart = null;
+        }
+        if (container) {
+            container.innerHTML = `<div class="state-empty">KLINE LOAD FAILED: ${escapeHtml(error.message)}</div>`;
+        }
+    }
 }
 
 function renderHeatmapIndices(indices) {
@@ -1069,134 +1296,245 @@ function renderStockChart(data) {
     }
 
     const reversed = [...data].reverse();
-    const labels = reversed.map(item => item.date);
-    const prices = reversed.map(item => item.close);
-    const kValues = reversed.map(item => item.K);
-    const dValues = reversed.map(item => item.D);
-    const jValues = reversed.map(item => item.J);
+    const dates = reversed.map(item => item.date);
+    const candleValues = reversed.map(item => [
+        Number(item.open),
+        Number(item.close),
+        Number(item.low),
+        Number(item.high),
+    ]);
+    const volumeValues = reversed.map((item, index) => ({
+        value: Number(item.volume) || 0,
+        itemStyle: {
+            color: Number(item.close) >= Number(item.open) ? '#ff3131' : '#00c853',
+        },
+        rawIndex: index,
+    }));
+    const kValues = reversed.map(item => Number(item.K));
+    const dValues = reversed.map(item => Number(item.D));
+    const jValues = reversed.map(item => Number(item.J));
+    const minJValues = reversed.map(item => Number(item.MIN_J));
 
-    const canvas = document.getElementById('stock-chart');
-    const ctx = canvas.getContext('2d');
-
-    if (state.chartInstance) {
-        state.chartInstance.destroy();
+    const chartEl = document.getElementById('stock-chart');
+    if (!chartEl) {
+        return;
     }
 
-    Chart.defaults.color = '#888888';
-    Chart.defaults.borderColor = '#1a1a1a';
+    if (state.chartInstance) {
+        if (typeof state.chartInstance.dispose === 'function') {
+            state.chartInstance.dispose();
+        } else if (typeof state.chartInstance.destroy === 'function') {
+            state.chartInstance.destroy();
+        }
+        state.chartInstance = null;
+    }
 
-    state.chartInstance = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels,
-            datasets: [
-                {
-                    label: '收盘价',
-                    data: prices,
-                    borderColor: '#ff6600',
-                    backgroundColor: 'rgba(255, 102, 0, 0.08)',
-                    fill: true,
-                    tension: 0.12,
-                    pointRadius: 0,
-                    borderWidth: 1.6,
-                    yAxisID: 'yPrice',
+    if (!window.echarts) {
+        document.getElementById('stock-info').innerHTML = '<div class="state-empty">ECharts 加载失败，无法渲染个股走势。</div>';
+        return;
+    }
+
+    state.chartInstance = window.echarts.init(chartEl);
+    state.chartInstance.setOption({
+        animation: false,
+        backgroundColor: '#0a0a0a',
+        legend: {
+            top: 6,
+            right: 12,
+            itemWidth: 12,
+            itemHeight: 8,
+            textStyle: {
+                color: '#e0e0e0',
+                fontFamily: 'IBM Plex Mono, Menlo, monospace',
+                fontSize: 10,
+            },
+        },
+        axisPointer: {
+            link: [{ xAxisIndex: 'all' }],
+            label: {
+                backgroundColor: '#222222',
+            },
+        },
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            backgroundColor: '#050505',
+            borderColor: '#333333',
+            borderWidth: 1,
+            textStyle: {
+                color: '#f0f0f0',
+                fontFamily: 'IBM Plex Mono, Menlo, monospace',
+                fontSize: 10,
+            },
+            formatter(params) {
+                const point = params && params[0];
+                if (!point) {
+                    return '';
+                }
+                const item = reversed[point.dataIndex];
+                return [
+                    `${item.date}`,
+                    `O ${item.open}  H ${item.high}  L ${item.low}  C ${item.close}`,
+                    `VOL ${formatCompactAmount(item.volume)}`,
+                    `K ${item.K}  D ${item.D}  J ${item.J}`,
+                    `MIN_J ${item.MIN_J}`,
+                ].join('<br>');
+            },
+        },
+        grid: [
+            { left: 52, right: 48, top: 34, height: 250 },
+            { left: 52, right: 48, top: 306, height: 62 },
+            { left: 52, right: 48, top: 390, height: 92 },
+        ],
+        xAxis: [
+            {
+                type: 'category',
+                data: dates,
+                boundaryGap: true,
+                axisLine: { lineStyle: { color: '#333333' } },
+                axisTick: { show: false },
+                axisLabel: { show: false },
+                splitLine: { show: false },
+            },
+            {
+                type: 'category',
+                gridIndex: 1,
+                data: dates,
+                boundaryGap: true,
+                axisLine: { lineStyle: { color: '#333333' } },
+                axisTick: { show: false },
+                axisLabel: { show: false },
+                splitLine: { show: false },
+            },
+            {
+                type: 'category',
+                gridIndex: 2,
+                data: dates,
+                boundaryGap: true,
+                axisLine: { lineStyle: { color: '#333333' } },
+                axisTick: { show: false },
+                axisLabel: {
+                    color: '#888888',
+                    fontSize: 10,
+                    interval: 12,
                 },
-                {
-                    label: 'K',
-                    data: kValues,
-                    borderColor: '#ffd700',
-                    pointRadius: 0,
-                    borderWidth: 1.1,
-                    tension: 0.12,
-                    yAxisID: 'yKDJ',
+                splitLine: { show: false },
+            },
+        ],
+        yAxis: [
+            {
+                scale: true,
+                axisLine: { show: false },
+                axisTick: { show: false },
+                axisLabel: { color: '#e0e0e0', fontSize: 10 },
+                splitLine: {
+                    lineStyle: { color: '#1f1f1f' },
                 },
-                {
-                    label: 'D',
-                    data: dValues,
-                    borderColor: '#00ff41',
-                    pointRadius: 0,
-                    borderWidth: 1.1,
-                    tension: 0.12,
-                    yAxisID: 'yKDJ',
+            },
+            {
+                gridIndex: 1,
+                scale: true,
+                axisLine: { show: false },
+                axisTick: { show: false },
+                axisLabel: {
+                    color: '#777777',
+                    fontSize: 9,
+                    formatter: value => formatCompactAmount(value),
                 },
-                {
-                    label: 'J',
-                    data: jValues,
+                splitLine: {
+                    lineStyle: { color: '#1f1f1f' },
+                },
+            },
+            {
+                gridIndex: 2,
+                min: value => Math.min(0, Math.floor(value.min / 10) * 10),
+                max: value => Math.max(100, Math.ceil(value.max / 10) * 10),
+                axisLine: { show: false },
+                axisTick: { show: false },
+                axisLabel: { color: '#888888', fontSize: 9 },
+                splitLine: {
+                    lineStyle: { color: '#1f1f1f', type: 'dashed' },
+                },
+            },
+        ],
+        dataZoom: [
+            { type: 'inside', xAxisIndex: [0, 1, 2], start: 0, end: 100 },
+            {
+                type: 'slider',
+                xAxisIndex: [0, 1, 2],
+                bottom: 4,
+                height: 18,
+                borderColor: '#333333',
+                backgroundColor: '#0d0d0d',
+                fillerColor: 'rgba(255, 102, 0, 0.12)',
+                handleStyle: { color: '#ff6600' },
+                textStyle: { color: '#777777', fontSize: 9 },
+            },
+        ],
+        series: [
+            {
+                name: 'K线',
+                type: 'candlestick',
+                data: candleValues,
+                barWidth: '56%',
+                itemStyle: {
+                    color: '#ff3131',
+                    color0: '#00c853',
                     borderColor: '#ff3131',
-                    pointRadius: 0,
-                    borderWidth: 1.1,
-                    tension: 0.12,
-                    yAxisID: 'yKDJ',
-                },
-            ],
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: true,
-            animation: false,
-            interaction: {
-                mode: 'index',
-                intersect: false,
-            },
-            plugins: {
-                legend: {
-                    labels: {
-                        color: '#e0e0e0',
-                        font: {
-                            family: '"IBM Plex Mono", monospace',
-                            size: 10,
-                        },
-                    },
+                    borderColor0: '#00c853',
                 },
             },
-            scales: {
-                x: {
-                    ticks: {
-                        color: '#888888',
-                        maxTicksLimit: 10,
-                        font: {
-                            family: '"IBM Plex Mono", monospace',
-                            size: 10,
-                        },
-                    },
-                    grid: {
-                        color: '#1a1a1a',
-                    },
-                },
-                yPrice: {
-                    type: 'linear',
-                    position: 'left',
-                    ticks: {
-                        color: '#e0e0e0',
-                        font: {
-                            family: '"IBM Plex Mono", monospace',
-                            size: 10,
-                        },
-                    },
-                    grid: {
-                        color: '#1a1a1a',
-                    },
-                },
-                yKDJ: {
-                    type: 'linear',
-                    position: 'right',
-                    min: 0,
-                    max: 100,
-                    ticks: {
-                        color: '#888888',
-                        stepSize: 20,
-                        font: {
-                            family: '"IBM Plex Mono", monospace',
-                            size: 10,
-                        },
-                    },
-                    grid: {
-                        drawOnChartArea: false,
-                    },
-                },
+            {
+                name: '成交量',
+                type: 'bar',
+                xAxisIndex: 1,
+                yAxisIndex: 1,
+                data: volumeValues,
+                barWidth: '58%',
             },
-        },
+            {
+                name: 'K',
+                type: 'line',
+                xAxisIndex: 2,
+                yAxisIndex: 2,
+                data: kValues,
+                showSymbol: false,
+                lineStyle: { color: '#ffd700', width: 1.1 },
+            },
+            {
+                name: 'D',
+                type: 'line',
+                xAxisIndex: 2,
+                yAxisIndex: 2,
+                data: dValues,
+                showSymbol: false,
+                lineStyle: { color: '#00ff41', width: 1.1 },
+            },
+            {
+                name: 'J',
+                type: 'line',
+                xAxisIndex: 2,
+                yAxisIndex: 2,
+                data: jValues,
+                showSymbol: false,
+                lineStyle: { color: '#ff4dff', width: 1.1 },
+            },
+            {
+                name: 'MIN_J',
+                type: 'line',
+                xAxisIndex: 2,
+                yAxisIndex: 2,
+                data: minJValues,
+                showSymbol: false,
+                lineStyle: { color: '#ff3131', width: 1.3 },
+            },
+        ],
     });
+    window.setTimeout(() => {
+        if (state.chartInstance && typeof state.chartInstance.resize === 'function') {
+            state.chartInstance.resize();
+        }
+    }, 30);
 
     const latest = data[0];
     const jClass = Number(latest.J) > 80 ? 'down' : (Number(latest.J) < 20 ? 'up' : '');
@@ -1235,12 +1573,24 @@ function renderStockChart(data) {
                 <div class="kv-label">J</div>
                 <div class="kv-value ${jClass}">${escapeHtml(latest.J)}</div>
             </div>
+            <div class="kv-item">
+                <div class="kv-label">MIN_J</div>
+                <div class="kv-value down">${escapeHtml(latest.MIN_J)}</div>
+            </div>
         </div>
     `;
 }
 
 function closeModal() {
     document.getElementById('stock-modal').classList.remove('active');
+    if (state.chartInstance) {
+        if (typeof state.chartInstance.dispose === 'function') {
+            state.chartInstance.dispose();
+        } else if (typeof state.chartInstance.destroy === 'function') {
+            state.chartInstance.destroy();
+        }
+        state.chartInstance = null;
+    }
 }
 
 function closeIndustryModal() {
@@ -2276,6 +2626,13 @@ function bindEvents() {
     document.getElementById('hero-run-btn').addEventListener('click', () => switchPage('selection'));
     document.getElementById('hero-stocks-btn').addEventListener('click', () => switchPage('stocks'));
     document.getElementById('refresh-dashboard-btn').addEventListener('click', loadStats);
+    document.getElementById('dashboard-index-selector').addEventListener('click', event => {
+        const button = event.target.closest('[data-symbol]');
+        if (!button || button.classList.contains('active')) {
+            return;
+        }
+        loadDashboardIndexKline(button.dataset.symbol);
+    });
     document.getElementById('refresh-selection-options-btn').addEventListener('click', () => loadSelectionOptions(true));
     document.getElementById('save-config-btn').addEventListener('click', saveConfig);
     document.getElementById('refresh-heatmap-btn').addEventListener('click', () => loadHeatmap(true));
@@ -2404,6 +2761,12 @@ async function init() {
     window.setInterval(updateClock, 1000);
 
     window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('resize', () => resizeDashboardIndexChart());
+    window.addEventListener('resize', () => {
+        if (state.chartInstance && typeof state.chartInstance.resize === 'function') {
+            state.chartInstance.resize();
+        }
+    });
 
     try {
         const result = await apiFetch('/api/system_status', {}, {
@@ -2436,7 +2799,11 @@ function handleBeforeUnload() {
 
     if (state.chartInstance) {
         try {
-            state.chartInstance.destroy();
+            if (typeof state.chartInstance.dispose === 'function') {
+                state.chartInstance.dispose();
+            } else if (typeof state.chartInstance.destroy === 'function') {
+                state.chartInstance.destroy();
+            }
         } catch (e) {}
         state.chartInstance = null;
     }

@@ -292,7 +292,8 @@ select {
     grid-template-columns: 1.45fr 0.9fr 0.85fr;
     grid-template-areas:
         "quote boards snapshot"
-        "quote notes notes";
+        "quote notes notes"
+        "pulse pulse pulse";
 }
 
 .quote-panel {
@@ -309,6 +310,10 @@ select {
 
 .dashboard-terminal-grid > .panel:nth-child(4) {
     grid-area: notes;
+}
+
+.dashboard-terminal-grid > .panel:nth-child(5) {
+    grid-area: pulse;
 }
 
 .selection-layout {
@@ -438,17 +443,69 @@ select {
     color: var(--neutral);
 }
 
-.quote-sparkline {
-    min-height: 94px;
+.quote-chart-shell {
+    display: grid;
+    gap: 1px;
     border: 1px solid var(--verydim);
-    background: var(--bg-panel);
-    padding: 4px;
+    background: var(--grid-line);
 }
 
-.quote-sparkline svg {
-    width: 100%;
-    height: 84px;
-    display: block;
+.quote-chart-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 28px;
+    padding: 3px 4px;
+    background: var(--bg-raised);
+}
+
+.index-switcher {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+}
+
+.index-switch-btn {
+    min-height: 20px;
+    padding: 0 7px;
+    border: 1px solid var(--verydim);
+    background: var(--bg-panel);
+    color: var(--neutral);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+}
+
+.index-switch-btn:hover,
+.index-switch-btn.active {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--bg-void);
+}
+
+.quote-chart-meta {
+    color: var(--dim);
+    font-size: 9px;
+    white-space: nowrap;
+}
+
+.quote-chart-meta.positive {
+    color: var(--down);
+}
+
+.quote-chart-meta.negative {
+    color: var(--up);
+}
+
+.quote-sparkline {
+    min-height: 178px;
+    background: var(--bg-panel);
+}
+
+.quote-kline {
+    height: 178px;
 }
 
 .quote-strip {
@@ -514,6 +571,7 @@ select {
 .board-grid,
 .execution-grid,
 .stats-grid,
+.market-pulse-grid,
 .selection-progress-grid,
 .selection-summary-grid {
     display: grid;
@@ -535,9 +593,14 @@ select {
     grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.market-pulse-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
 .board-card,
 .execution-card,
 .stat-block,
+.pulse-card,
 .selection-summary-card,
 .selection-progress-head,
 .selection-summary-strip,
@@ -553,6 +616,7 @@ select {
 .board-card,
 .execution-card,
 .stat-block,
+.pulse-card,
 .selection-summary-card {
     padding: 8px;
 }
@@ -569,6 +633,42 @@ select {
 
 .stat-value-small {
     font-size: 12px;
+}
+
+.pulse-card {
+    min-height: 64px;
+}
+
+.pulse-card-wide {
+    grid-column: span 2;
+}
+
+.pulse-label {
+    color: var(--dim);
+    font-size: 9px;
+    line-height: 1.35;
+    text-transform: uppercase;
+}
+
+.pulse-value {
+    color: var(--white);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.3;
+}
+
+.pulse-value.up {
+    color: var(--down);
+}
+
+.pulse-value.down {
+    color: var(--up);
+}
+
+.pulse-sub {
+    color: var(--dim);
+    font-size: 9px;
+    line-height: 1.35;
 }
 
 .terminal-list {
@@ -1418,6 +1518,10 @@ select {
     width: min(1200px, 100%);
 }
 
+.stock-modal-box {
+    width: min(1400px, 100%);
+}
+
 .update-modal-box {
     width: min(980px, 100%);
 }
@@ -1458,8 +1562,7 @@ select {
 
 #stock-chart {
     width: 100%;
-    height: 300px;
-    max-height: 300px;
+    height: 520px;
     background: var(--bg-input);
     border: 1px solid var(--verydim);
 }

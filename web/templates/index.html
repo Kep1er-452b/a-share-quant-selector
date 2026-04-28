@@ -108,7 +108,18 @@
                                 <div class="quote-price positive" id="stat-stocks">--</div>
                                 <div class="quote-change" id="hero-universe">ALL BOARDS</div>
                             </div>
-                            <div class="quote-sparkline" id="dashboard-sparkline"></div>
+                            <div class="quote-chart-shell">
+                                <div class="quote-chart-toolbar">
+                                    <div class="index-switcher" id="dashboard-index-selector" aria-label="指数切换">
+                                        <button class="index-switch-btn active" data-symbol="sh000001" type="button">上证</button>
+                                        <button class="index-switch-btn" data-symbol="sz399006" type="button">创业板</button>
+                                        <button class="index-switch-btn" data-symbol="sh000688" type="button">科创</button>
+                                        <button class="index-switch-btn" data-symbol="sz399001" type="button">深成指</button>
+                                    </div>
+                                    <span class="quote-chart-meta" id="dashboard-index-meta">D1 / 30T</span>
+                                </div>
+                                <div class="quote-sparkline quote-kline" id="dashboard-sparkline"></div>
+                            </div>
                             <div class="quote-strip">
                                 <div class="quote-strip-item">
                                     <span class="quote-strip-key">LATEST DATE</span>
@@ -193,6 +204,16 @@
                             <div class="terminal-row">02  顶部 RUN 会沿用当前筛选快照，适合重复执行同一轮扫描。</div>
                             <div class="terminal-row">03  HEATMAP 面板用于快速观察行业与个股分布，点击即可打开细节。</div>
                             <div class="terminal-row">04  HALT 为硬停机指令，仅在需要中止全部 Web API 时使用。</div>
+                        </div>
+                    </section>
+
+                    <section class="panel market-pulse-panel">
+                        <div class="panel-header">
+                            <span class="panel-title">MARKET PULSE</span>
+                            <span class="panel-meta">BREADTH</span>
+                        </div>
+                        <div class="panel-body market-pulse-grid" id="dashboard-market-pulse">
+                            <div class="state-loading">加载市场强弱数据...</div>
                         </div>
                     </section>
                 </div>
@@ -515,7 +536,7 @@
 </div>
 
 <div id="stock-modal" class="modal-backdrop">
-    <div class="modal-box">
+    <div class="modal-box stock-modal-box">
         <div class="modal-header">
             <div>
                 <div class="modal-kicker">STOCK DETAIL</div>
@@ -524,7 +545,7 @@
             <button class="modal-close" id="modal-close-btn" type="button">X</button>
         </div>
         <div class="modal-body">
-            <canvas id="stock-chart"></canvas>
+            <div id="stock-chart"></div>
             <div id="stock-info"></div>
         </div>
     </div>
