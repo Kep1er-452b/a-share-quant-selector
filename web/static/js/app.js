@@ -1314,6 +1314,32 @@ function renderStockChart(data) {
     const dValues = reversed.map(item => Number(item.D));
     const jValues = reversed.map(item => Number(item.J));
     const minJValues = reversed.map(item => Number(item.MIN_J));
+    const zxShortValues = reversed.map(item => Number(item.ZX_SHORT));
+    const zxLongValues = reversed.map(item => Number(item.ZX_LONG));
+    const buildSequenceMarks = (field, yField, minValue, maxValue) => reversed
+        .map((item, index) => {
+            const value = Number(item[field]);
+            return {
+                value,
+                data: [dates[index], Number(item[yField]), value],
+            };
+        })
+        .filter(item =>
+            Number.isFinite(item.value) &&
+            item.value >= minValue &&
+            item.value <= maxValue &&
+            Number.isFinite(item.data[1])
+        );
+    const upSeqEarlyMarks = buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 1, 8);
+    const upSeqLateMarks = buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 9, 13);
+    const downSeqEarlyMarks = buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 1, 8);
+    const downSeqLateMarks = buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 9, 13);
+    const violentKMarks = reversed
+        .map((item, index) => ({
+            value: item.VIOLENT_K ? 1 : 0,
+            data: [dates[index], Number(item.VIOLENT_K_Y), '★'],
+        }))
+        .filter(item => item.value && Number.isFinite(item.data[1]));
 
     const chartEl = document.getElementById('stock-chart');
     if (!chartEl) {
@@ -1341,6 +1367,7 @@ function renderStockChart(data) {
         legend: {
             top: 6,
             right: 12,
+            data: ['K线', '知行短期趋势线', '知行多空线', '大暴力K', '成交量', 'K', 'D', 'J', 'MIN_J'],
             itemWidth: 12,
             itemHeight: 8,
             textStyle: {
@@ -1375,6 +1402,7 @@ function renderStockChart(data) {
                 return [
                     `${item.date}`,
                     `O ${item.open}  H ${item.high}  L ${item.low}  C ${item.close}`,
+                    `知行短期 ${item.ZX_SHORT ?? '--'}  多空 ${item.ZX_LONG ?? '--'}`,
                     `VOL ${formatCompactAmount(item.volume)}`,
                     `K ${item.K}  D ${item.D}  J ${item.J}`,
                     `MIN_J ${item.MIN_J}`,
@@ -1485,6 +1513,99 @@ function renderStockChart(data) {
                 },
             },
             {
+                name: '知行短期趋势线',
+                type: 'line',
+                data: zxShortValues,
+                showSymbol: false,
+                smooth: true,
+                lineStyle: { color: '#ffffff', width: 1.1 },
+            },
+            {
+                name: '知行多空线',
+                type: 'line',
+                data: zxLongValues,
+                showSymbol: false,
+                smooth: true,
+                lineStyle: { color: '#d7df3f', width: 1.1 },
+            },
+            {
+                name: '上涨序列1-8',
+                type: 'scatter',
+                data: upSeqEarlyMarks.map(item => item.data),
+                symbolSize: 0,
+                tooltip: { show: false },
+                label: {
+                    show: true,
+                    formatter: params => String(params.data[2]),
+                    color: '#ff4dff',
+                    fontSize: 13,
+                    fontWeight: 700,
+                    position: 'top',
+                },
+            },
+            {
+                name: '上涨序列9-13',
+                type: 'scatter',
+                data: upSeqLateMarks.map(item => item.data),
+                symbolSize: 0,
+                tooltip: { show: false },
+                label: {
+                    show: true,
+                    formatter: params => String(params.data[2]),
+                    color: '#00ff41',
+                    fontSize: 13,
+                    fontWeight: 700,
+                    position: 'top',
+                },
+            },
+            {
+                name: '下跌序列1-8',
+                type: 'scatter',
+                data: downSeqEarlyMarks.map(item => item.data),
+                symbolSize: 0,
+                tooltip: { show: false },
+                label: {
+                    show: true,
+                    formatter: params => String(params.data[2]),
+                    color: '#00ff41',
+                    fontSize: 13,
+                    fontWeight: 700,
+                    position: 'bottom',
+                },
+            },
+            {
+                name: '下跌序列9-13',
+                type: 'scatter',
+                data: downSeqLateMarks.map(item => item.data),
+                symbolSize: 0,
+                tooltip: { show: false },
+                label: {
+                    show: true,
+                    formatter: params => String(params.data[2]),
+                    color: '#ff4dff',
+                    fontSize: 13,
+                    fontWeight: 700,
+                    position: 'bottom',
+                },
+            },
+            {
+                name: '大暴力K',
+                type: 'scatter',
+                data: violentKMarks.map(item => item.data),
+                symbolSize: 0,
+                tooltip: { show: false },
+                label: {
+                    show: true,
+                    formatter: '★',
+                    color: '#ffffff',
+                    fontSize: 12,
+                    fontWeight: 700,
+                    textBorderColor: '#000000',
+                    textBorderWidth: 2,
+                    position: 'top',
+                },
+            },
+            {
                 name: '成交量',
                 type: 'bar',
                 xAxisIndex: 1,
@@ -1576,6 +1697,14 @@ function renderStockChart(data) {
             <div class="kv-item">
                 <div class="kv-label">MIN_J</div>
                 <div class="kv-value down">${escapeHtml(latest.MIN_J)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">知行短期</div>
+                <div class="kv-value">${escapeHtml(latest.ZX_SHORT)}</div>
+            </div>
+            <div class="kv-item">
+                <div class="kv-label">知行多空</div>
+                <div class="kv-value">${escapeHtml(latest.ZX_LONG)}</div>
             </div>
         </div>
     `;
