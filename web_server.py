@@ -915,9 +915,10 @@ def get_stock_detail(code):
             return jsonify({'success': False, 'error': '股票不存在'})
         
         # 计算KDJ指标与动态 Min J
-        from utils.technical import KDJ
+        from utils.technical import KDJ, calculate_zhixing_main_overlay
         from strategy.b1_min_j_simple import calculate_min_j
         kdj_df = KDJ(df, n=9, m1=3, m2=3)
+        overlay_df = calculate_zhixing_main_overlay(df)
         indicator_df = df.copy()
         indicator_df['K'] = kdj_df['K']
         indicator_df['D'] = kdj_df['D']
@@ -941,6 +942,14 @@ def get_stock_detail(code):
                 'D': round(kdj_df.iloc[i]['D'], 2),
                 'J': round(kdj_df.iloc[i]['J'], 2),
                 'MIN_J': round(min_j.iloc[i], 2),
+                'ZX_SHORT': round(overlay_df.iloc[i]['ZX_SHORT'], 2),
+                'ZX_LONG': round(overlay_df.iloc[i]['ZX_LONG'], 2),
+                'UP_SEQ': None if pd.isna(overlay_df.iloc[i]['UP_SEQ']) else int(overlay_df.iloc[i]['UP_SEQ']),
+                'UP_SEQ_Y': None if pd.isna(overlay_df.iloc[i]['UP_SEQ_Y']) else round(overlay_df.iloc[i]['UP_SEQ_Y'], 2),
+                'DOWN_SEQ': None if pd.isna(overlay_df.iloc[i]['DOWN_SEQ']) else int(overlay_df.iloc[i]['DOWN_SEQ']),
+                'DOWN_SEQ_Y': None if pd.isna(overlay_df.iloc[i]['DOWN_SEQ_Y']) else round(overlay_df.iloc[i]['DOWN_SEQ_Y'], 2),
+                'VIOLENT_K': bool(overlay_df.iloc[i]['VIOLENT_K']),
+                'VIOLENT_K_Y': round(overlay_df.iloc[i]['VIOLENT_K_Y'], 2),
             })
         
         return jsonify({'success': True, 'code': code, 'data': data})
