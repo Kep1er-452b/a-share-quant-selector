@@ -186,10 +186,58 @@ def load_index_cache(data_dir: str = "data") -> dict:
     return _load_json(index_cache_path(data_dir), {})
 
 
+def _stock_csv_files(data_dir: str = "data") -> List[Path]:
+    return sorted(Path(data_dir).glob("[0-9][0-9]/*.csv"))
+
+
+def _local_stock_data_status(data_dir: str = "data") -> dict:
+    data_path = Path(data_dir)
+    stock_names = _load_json(data_path / "stock_names.json", {})
+    latest_date = None
+    readable_count = 0
+    for csv_path in _stock_csv_files(data_dir):
+        code = csv_path.stem
+        if is_hidden_market_stock(code, stock_names.get(code, "")):
+            continue
+        try:
+            df = pd.read_csv(csv_path, usecols=["date"], nrows=1)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        date_value = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
+        if pd.isna(date_value):
+            continue
+        readable_count += 1
+        date_text = date_value.strftime("%Y-%m-%d")
+        if latest_date is None or date_text > latest_date:
+            latest_date = date_text
+    return {
+        "latest_date": latest_date,
+        "stock_count": readable_count,
+    }
+
+
+def snapshot_cache_needs_refresh(data_dir: str = "data") -> bool:
+    snapshot = load_snapshot_cache(data_dir)
+    if not snapshot:
+        return True
+    local_status = _local_stock_data_status(data_dir)
+    local_latest = local_status.get("latest_date")
+    snapshot_latest = snapshot.get("latest_date")
+    if local_latest and (not snapshot_latest or local_latest > snapshot_latest):
+        return True
+    local_count = local_status.get("stock_count") or 0
+    snapshot_count = int(snapshot.get("stock_count") or 0)
+    if local_count and local_count != snapshot_count:
+        return True
+    return False
+
+
 def build_snapshot_cache(data_dir: str = "data", progress_callback: Optional[Callable] = None) -> dict:
     data_path = Path(data_dir)
     stock_names = _load_json(data_path / "stock_names.json", {})
-    csv_files = sorted(data_path.rglob("*.csv"))
+    csv_files = _stock_csv_files(data_dir)
     records = []
     total_files = len(csv_files)
 
@@ -410,17 +458,39 @@ def ensure_market_caches(data_dir: str = "data") -> dict:
     snapshot = load_snapshot_cache(data_dir)
     industry = load_industry_cache(data_dir)
     indices = load_index_cache(data_dir)
-    if snapshot and industry and indices:
+    errors = {}
+
+    if snapshot_cache_needs_refresh(data_dir):
+        try:
+            snapshot = build_snapshot_cache(data_dir=data_dir)
+        except Exception as exc:
+            errors["snapshot"] = str(exc)
+
+    if not industry:
+        try:
+            industry = build_industry_cache(data_dir=data_dir)
+        except Exception as exc:
+            errors["industry"] = str(exc)
+
+    if not indices:
+        try:
+            indices = build_index_cache(data_dir=data_dir)
+        except Exception as exc:
+            errors["indices"] = str(exc)
+
+    if snapshot or industry or indices:
         return {
             "snapshot": snapshot,
             "industry": industry,
             "indices": indices,
-            "errors": {},
+            "errors": errors,
         }
     return rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
 
 
 def market_cache_needs_refresh(data_dir: str = "data") -> bool:
+    if snapshot_cache_needs_refresh(data_dir):
+        return True
     industry = load_industry_cache(data_dir)
     if not industry:
         return True
