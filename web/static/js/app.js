@@ -46,6 +46,8 @@ const state = {
     heatmapLoading: false,
     updateModalStep: 'provider',
     updateProvider: null,
+    updateHasTushareToken: false,
+    updateDefaultProvider: 'akshare',
     globalTickerText: '',
 };
 
@@ -406,8 +408,18 @@ async function apiFetch(url, fetchOptions = {}, config = {}) {
     state.activeControllers.add(controller);
 
     try {
+        const method = String(fetchOptions.method || 'GET').toUpperCase();
+        const headers = {
+            ...(fetchOptions.headers || {}),
+        };
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+            const token = document.querySelector('meta[name="quant-session-token"]')?.content || '';
+            headers['X-Quant-Session'] = token;
+        }
+
         const response = await fetch(url, {
             ...fetchOptions,
+            headers,
             signal: controller.signal,
         });
 
@@ -1763,9 +1775,46 @@ function setUpdateModalStep(step) {
     if (step === 'provider') {
         title.textContent = '选择更新数据源';
     } else if (step === 'token') {
-        title.textContent = '输入 Tushare Token';
+        title.textContent = '选择 Tushare Token';
     } else {
         title.textContent = '更新任务执行中';
+    }
+}
+
+function renderUpdateTokenPrompt() {
+    const note = document.getElementById('update-token-note');
+    const defaultButton = document.getElementById('update-token-default-btn');
+    const input = document.getElementById('update-tushare-token');
+    const confirmButton = document.getElementById('update-token-confirm-btn');
+    if (!note || !defaultButton || !input || !confirmButton) {
+        return;
+    }
+
+    if (state.updateHasTushareToken) {
+        note.textContent = '选择了 Tushare。可直接使用本机默认 Token，也可在下方手动输入临时 Token。';
+        defaultButton.style.display = '';
+        input.placeholder = 'MANUAL TOKEN OPTIONAL';
+        confirmButton.textContent = '使用输入 Token 更新';
+    } else {
+        note.textContent = '选择了 Tushare。当前未检测到本机默认 Token，请手动输入。';
+        defaultButton.style.display = 'none';
+        input.placeholder = 'INPUT TUSHARE TOKEN';
+        confirmButton.textContent = '开始更新';
+    }
+}
+
+async function loadUpdateOptions() {
+    try {
+        const result = await apiFetch('/api/update/options');
+        if (!result.success) {
+            return;
+        }
+        const data = result.data || {};
+        state.updateHasTushareToken = Boolean(data.has_tushare_token);
+        state.updateDefaultProvider = data.default_provider || 'akshare';
+        renderUpdateTokenPrompt();
+    } catch (error) {
+        console.error('loadUpdateOptions failed:', error);
     }
 }
 
@@ -1776,8 +1825,10 @@ function openUpdateModal() {
     }
     state.updateProvider = null;
     document.getElementById('update-tushare-token').value = '';
+    renderUpdateTokenPrompt();
     setUpdateModalStep('provider');
     document.getElementById('update-modal').classList.add('active');
+    loadUpdateOptions();
 }
 
 function closeUpdateModal() {
@@ -2803,6 +2854,9 @@ function bindEvents() {
         });
     });
     document.getElementById('update-token-back-btn').addEventListener('click', () => setUpdateModalStep('provider'));
+    document.getElementById('update-token-default-btn').addEventListener('click', async () => {
+        await startUpdateJob('tushare', '');
+    });
     document.getElementById('update-token-confirm-btn').addEventListener('click', async () => {
         await startUpdateJob('tushare', document.getElementById('update-tushare-token').value.trim());
     });

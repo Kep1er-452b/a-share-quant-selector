@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#000000">
+    <meta name="quant-session-token" content="{{ session_token }}">
     <title>A股量化选股控制台</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -486,11 +487,12 @@
             </div>
 
             <div class="update-modal-step" id="update-token-step">
-                <div class="update-modal-note">选择了 Tushare。请输入 Token，若本地已配置也可留空继续。</div>
+                <div class="update-modal-note" id="update-token-note">选择了 Tushare。可使用本机默认 Token，也可手动输入。</div>
                 <label class="update-token-label" for="update-tushare-token">TUSHARE TOKEN</label>
                 <input class="search-input update-token-input" id="update-tushare-token" type="password" placeholder="INPUT TOKEN OR LEAVE BLANK">
                 <div class="update-token-actions">
                     <button class="btn btn-ghost" id="update-token-back-btn" type="button">返回</button>
+                    <button class="btn btn-secondary" id="update-token-default-btn" type="button">使用默认 Token</button>
                     <button class="btn btn-primary" id="update-token-confirm-btn" type="button">开始更新</button>
                 </div>
             </div>

@@ -47,8 +47,9 @@ def setup_logging() -> None:
 def load_config() -> dict:
     if yaml is None or not DEFAULT_CONFIG.exists():
         return {}
-    with DEFAULT_CONFIG.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    from utils.local_config import load_config_file
+
+    return load_config_file(DEFAULT_CONFIG)
 
 
 def validate_environment(require_webview: bool = False) -> list[str]:

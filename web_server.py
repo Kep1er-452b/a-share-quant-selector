@@ -6,6 +6,7 @@ import json
 import sys
 import socket
 import os
+import secrets
 import time
 import uuid
 from threading import Event, Lock, Thread
@@ -21,6 +22,8 @@ sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
+from utils.config_schema import atomic_write_yaml, validate_strategy_params
+from utils.local_config import load_config_file
 from utils.market_overview import (
     build_heatmap_payload,
     rebuild_market_caches,
@@ -33,6 +36,7 @@ from utils.selection_worker import (
     initialize_selection_worker,
     process_selection_chunk,
 )
+from utils.strategy_labels import fallback_stock_name, is_invalid_stock_name
 import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
 
@@ -43,6 +47,7 @@ app = Flask(__name__,
 # 全局实例
 csv_manager = CSVManager("data")
 halt_event = Event()
+WEB_SESSION_TOKEN = secrets.token_urlsafe(32)
 selection_jobs = {}
 selection_jobs_lock = Lock()
 update_jobs = {}
@@ -70,11 +75,7 @@ registry = _reload_registry()
 
 
 def _load_config(config_path="config/config.yaml"):
-    config_file = Path(config_path)
-    if config_file.exists():
-        with open(config_file, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
+    return load_config_file(config_path)
 
 
 def _index_kline_cache_path(data_dir='data'):
@@ -285,9 +286,13 @@ def _normalize_csv_value(raw_value):
 
 def _parse_requested_boards(raw_value):
     allowed = set(BOARD_LABELS.keys()) - {"all"}
+    if raw_value is None or str(raw_value).strip() == "":
+        return ["main", "chinext", "star"]
     values = [_normalize_csv_value(item) for item in str(raw_value or "").split(",")]
     selected = [item for item in values if item in allowed]
-    return selected or ["main", "chinext", "star"]
+    if not selected:
+        raise ValueError("未选择有效板块")
+    return selected
 
 
 def _parse_requested_strategies(raw_value):
@@ -296,12 +301,19 @@ def _parse_requested_strategies(raw_value):
         return available
 
     requested = []
+    invalid = []
     for item in str(raw_value).split(","):
         strategy_name = item.strip()
         if strategy_name and strategy_name in registry.strategies:
             requested.append(strategy_name)
+        elif strategy_name:
+            invalid.append(strategy_name)
 
-    return requested or available
+    if invalid:
+        raise ValueError(f"无效策略: {', '.join(invalid)}")
+    if not requested:
+        raise ValueError("未选择有效策略")
+    return requested
 
 
 def _load_stock_names():
@@ -311,6 +323,10 @@ def _load_stock_names():
 
     with open(names_file, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+def _stock_display_name(code, stock_names):
+    return stock_names.get(code) or fallback_stock_name(code)
 
 
 def _build_board_counts(stock_codes):
@@ -329,10 +345,26 @@ def _filter_hidden_stock_codes(stock_codes, stock_names=None):
 
 
 def _is_invalid_stock_name(name):
-    invalid_keywords = ['退', '未知', '退市', '已退']
-    if any(keyword in name for keyword in invalid_keywords):
-        return True
-    return name.startswith('ST') or name.startswith('*ST')
+    return is_invalid_stock_name(name)
+
+
+def _safe_int_arg(name, default, minimum=1, maximum=1000):
+    raw_value = request.args.get(name, default)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _require_session_token():
+    token = request.headers.get("X-Quant-Session", "")
+    if token != WEB_SESSION_TOKEN:
+        return jsonify({
+            'success': False,
+            'error': '本地会话令牌无效，请刷新页面后重试',
+        }), 403
+    return None
 
 
 def _chunk_candidates(candidates, chunk_size):
@@ -545,6 +577,11 @@ def _create_selection_job(requested_boards, requested_strategies):
 
 @app.before_request
 def block_requests_after_halt():
+    if request.path.startswith('/api/') and request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+        token_error = _require_session_token()
+        if token_error:
+            return token_error
+
     allowed_endpoints = {
         'index',
         'static',
@@ -576,11 +613,12 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
             if _classify_board(code) in requested_boards
         ]
         stock_names = _load_stock_names()
+        stock_codes = _filter_hidden_stock_codes(stock_codes, stock_names)
 
         candidates = []
         invalid_name_count = 0
         for code in stock_codes:
-            name = stock_names.get(code, '未知')
+            name = _stock_display_name(code, stock_names)
             if _is_invalid_stock_name(name):
                 invalid_name_count += 1
                 continue
@@ -856,7 +894,7 @@ def _warm_market_caches_background():
 @app.route('/')
 def index():
     """主页"""
-    return render_template('index.html')
+    return render_template('index.html', session_token=WEB_SESSION_TOKEN)
 
 
 @app.route('/api/stocks')
@@ -872,8 +910,8 @@ def get_stocks():
             stocks = [code for code in stocks if _classify_board(code) == requested_board]
         
         # 获取每只股票的基本信息 - 支持分页
-        page = int(request.args.get('page', 1))
-        per_page = int(request.args.get('per_page', 500))  # 默认每页500只
+        page = _safe_int_arg('page', 1, minimum=1, maximum=100000)
+        per_page = _safe_int_arg('per_page', 500, minimum=1, maximum=1000)  # 默认每页500只
         
         start_idx = (page - 1) * per_page
         end_idx = start_idx + per_page
@@ -886,7 +924,7 @@ def get_stocks():
                 latest = df.iloc[0]
                 stock_list.append({
                     'code': code,
-                    'name': stock_names.get(code, '未知'),
+                    'name': _stock_display_name(code, stock_names),
                     'board': _classify_board(code),
                     'latest_price': round(latest['close'], 2),
                     'latest_date': latest['date'].strftime('%Y-%m-%d'),
@@ -910,6 +948,7 @@ def get_stocks():
 def get_stock_detail(code):
     """获取单只股票详情"""
     try:
+        code = CSVManager.validate_stock_code(code)
         df = csv_manager.read_stock(code)
         if df.empty:
             return jsonify({'success': False, 'error': '股票不存在'})
@@ -1003,7 +1042,7 @@ def run_selection():
         candidates = []
         invalid_name_count = 0
         for code in stock_codes:
-            name = stock_names.get(code, '未知')
+            name = _stock_display_name(code, stock_names)
             if _is_invalid_stock_name(name):
                 invalid_name_count += 1
                 continue
@@ -1444,16 +1483,25 @@ def get_config():
 def update_config():
     """更新配置"""
     try:
-        new_config = request.json
+        new_config = request.get_json(silent=True)
+        if not isinstance(new_config, dict):
+            return jsonify({'success': False, 'error': '配置必须是 JSON/YAML 对象'}), 400
+
+        validation_errors = validate_strategy_params(new_config)
+        if validation_errors:
+            return jsonify({
+                'success': False,
+                'error': '配置校验失败',
+                'details': validation_errors,
+            }), 400
         
         config_file = Path("config/strategy_params.yaml")
-        with open(config_file, 'w', encoding='utf-8') as f:
-            yaml.dump(new_config, f, allow_unicode=True)
+        backup_path = atomic_write_yaml(config_file, new_config)
         
         # 重新加载策略
         _reload_registry()
         
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'backup': str(backup_path) if backup_path else None})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -1484,6 +1532,9 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
     """启动Web服务器"""
     config = config or _load_config()
     host, port = _resolve_web_address(host=host, port=port, auto_port=auto_port, config=config)
+    allow_lan = bool(_config_value(config, "web", "allow_lan", default=False))
+    if host not in {"127.0.0.1", "localhost", "::1"} and not allow_lan:
+        raise OSError("Web 默认只允许本机访问；如需局域网访问，请在配置中设置 web.allow_lan: true")
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"🌐 启动Web服务器: http://{display_host}:{port}")
     Thread(target=_warm_market_caches_background, daemon=True).start()
@@ -1491,4 +1542,4 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
 
 
 if __name__ == '__main__':
-    run_web_server(debug=True, config=_load_config())
+    run_web_server(debug=False, config=_load_config())

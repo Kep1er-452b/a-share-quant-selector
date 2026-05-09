@@ -6,6 +6,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import sys
+import os
 from pathlib import Path
 import json
 import requests
@@ -87,11 +88,17 @@ class AKShareFetcher(BaseDataProvider):
 
     provider_name = "akshare"
     
-    def __init__(self, data_dir="data"):
+    def __init__(self, data_dir="data", config=None):
         super().__init__(data_dir)
         self.csv_manager = CSVManager(data_dir)
         self.full_data_dir = Path(data_dir)
         self.stock_names_file = Path(data_dir) / 'stock_names.json'
+        data_source_config = (config or {}).get('data_source', {}) if isinstance(config, dict) else {}
+        akshare_config = data_source_config.get('akshare', {}) if isinstance(data_source_config, dict) else {}
+        self.allow_mock_data = bool(
+            akshare_config.get('allow_mock_data', False)
+            or str(os.getenv('ASHARE_ALLOW_MOCK_DATA', '')).strip().lower() in {'1', 'true', 'yes'}
+        )
     
     def _load_local_stock_names(self):
         """从本地文件加载股票名称"""
@@ -486,12 +493,9 @@ class AKShareFetcher(BaseDataProvider):
                     df['date'] = pd.to_datetime(df['date'])
                     # 从实时数据获取总市值
                     market_cap = self._get_realtime_market_cap(stock_code)
-                    if market_cap:
-                        df['market_cap'] = market_cap
-                    else:
-                        df['market_cap'] = abs(hash(stock_code)) % 500 * 100000000 + 5000000000
+                    df['market_cap'] = market_cap if market_cap else 0
                     df = df.sort_values('date', ascending=False)
-                    return df
+                    return self._mark_data_source(df, 'tencent:fqkline')
             
             return None
         except Exception as e:
@@ -516,12 +520,41 @@ class AKShareFetcher(BaseDataProvider):
         except Exception as e:
             print(f"  获取总市值失败: {e}")
         return None
+
+    @staticmethod
+    def _mark_data_source(df, source):
+        if df is None or df.empty:
+            return df
+        result = df.copy()
+        result['data_source'] = source
+        return result
+
+    @staticmethod
+    def _history_coverage_report(df, years=6):
+        if df is None or df.empty or 'date' not in df.columns:
+            return {'ok': False, 'strict_ok': False, 'rows': 0, 'span_days': 0}
+
+        dates = pd.to_datetime(df['date'], errors='coerce').dropna()
+        if dates.empty:
+            return {'ok': False, 'strict_ok': False, 'rows': len(df), 'span_days': 0}
+
+        rows = len(df)
+        span_days = int((dates.max() - dates.min()).days)
+        minimum_rows = 120
+        minimum_span_days = 180
+        preferred_span_days = int(years * 365 * 0.75)
+        return {
+            'ok': rows >= minimum_rows and span_days >= minimum_span_days,
+            'strict_ok': rows >= minimum_rows and span_days >= preferred_span_days,
+            'rows': rows,
+            'span_days': span_days,
+        }
     
     def _generate_mock_data(self, stock_code, years=6):
         """生成模拟数据（当网络不可用时使用）"""
         import numpy as np
         
-        np.random.seed(hash(stock_code) % 2**32)
+        np.random.seed(int(str(stock_code).zfill(6)) % 2**32)
         
         days = int(365 * years)
         end_date = datetime.now()
@@ -553,8 +586,8 @@ class AKShareFetcher(BaseDataProvider):
         if market_cap:
             df['market_cap'] = market_cap
         else:
-            # 如果获取失败，使用估算值（ but this is still wrong, just a fallback ）
-            df['market_cap'] = np.random.uniform(5000000000, 50000000000)
+            df['market_cap'] = 0
+        df['data_source'] = 'mock'
         
         # 按日期倒序排列
         df = df.sort_values('date', ascending=False)
@@ -566,12 +599,24 @@ class AKShareFetcher(BaseDataProvider):
         抓取单只股票历史数据
         前复权，按日期倒序排列
         """
+        partial_http_df = None
+
         # 方法1: 直接HTTP请求
         try:
             df = self._fetch_stock_history_http(stock_code, years)
             if df is not None and not df.empty:
-                print(f"✓ (HTTP获取 {len(df)}条)")
-                return df
+                coverage = self._history_coverage_report(df, years=years)
+                if coverage['strict_ok']:
+                    print(f"✓ (HTTP获取 {len(df)}条)")
+                    return df
+                if coverage['ok']:
+                    partial_http_df = df
+                    print(
+                        f"  HTTP覆盖不足({coverage['rows']}条/{coverage['span_days']}天)，"
+                        "继续尝试akshare..."
+                    )
+                else:
+                    print(f"  HTTP历史数据不足，尝试akshare...")
             else:
                 print(f"  HTTP返回空数据，尝试akshare...")
         except Exception as e:
@@ -600,18 +645,27 @@ class AKShareFetcher(BaseDataProvider):
                 df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turnover']]
                 # 从实时数据获取总市值
                 market_cap = self._get_realtime_market_cap(stock_code)
-                if market_cap:
-                    df['market_cap'] = market_cap
-                else:
-                    df['market_cap'] = (hash(stock_code) % 100 + 50) * 1000000000
+                df['market_cap'] = market_cap if market_cap else 0
                 df['date'] = pd.to_datetime(df['date'])
                 df = df.sort_values('date', ascending=False)
-                return df
+                df = self._mark_data_source(df, 'akshare:stock_zh_a_hist')
+                coverage = self._history_coverage_report(df, years=years)
+                if coverage['ok']:
+                    return df
+                print(f"  akshare历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
         except Exception as e:
-            print(f"  akshare获取失败，使用模拟数据...")
-        
-        # 降级: 使用模拟数据
-        return self._generate_mock_data(stock_code, years)
+            print(f"  akshare获取失败: {e}")
+
+        if partial_http_df is not None:
+            print("  使用真实但覆盖不足的腾讯历史数据")
+            return partial_http_df
+
+        if self.allow_mock_data:
+            print("  ⚠️ 已显式启用模拟数据，将生成 demo 行情")
+            return self._generate_mock_data(stock_code, years)
+
+        print("  ✗ 真实历史数据不可用，已拒绝写入模拟行情")
+        return None
     
     def fetch_stock_update(self, stock_code, days=10):
         """
@@ -675,12 +729,9 @@ class AKShareFetcher(BaseDataProvider):
                     df['date'] = pd.to_datetime(df['date'])
                     # 从实时数据获取总市值
                     market_cap = self._get_realtime_market_cap(stock_code)
-                    if market_cap:
-                        df['market_cap'] = market_cap
-                    else:
-                        df['market_cap'] = abs(hash(stock_code)) % 500 * 100000000 + 5000000000
+                    df['market_cap'] = market_cap if market_cap else 0
                     df = df.sort_values('date', ascending=False)
-                    return df
+                    return self._mark_data_source(df, 'tencent:fqkline:update')
             
             return None
         except Exception as e:

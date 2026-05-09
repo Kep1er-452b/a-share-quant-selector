@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import os
+from utils.strategy_labels import category_label
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'SimHei', 'Arial Unicode MS', 'WenQuanYi Micro Hei']
@@ -100,13 +101,7 @@ def generate_kline_chart(
     # 创建输出目录
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
-    # 分类名称映射
-    category_names = {
-        'bowl_center': 'Bowl Center',
-        'near_duokong': 'Near DuoKong',
-        'near_short_trend': 'Near Short Trend'
-    }
-    category_name = category_names.get(category, category)
+    category_name = category_label(category)
     
     # 准备数据 - 确保按日期正序排列（从早到晚）
     df = df.copy()

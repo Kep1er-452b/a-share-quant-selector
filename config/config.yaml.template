@@ -11,8 +11,10 @@ data_dir: data
 # 数据源配置
 data_source:
   default_provider: "akshare"  # 可选: akshare / tushare
+  akshare:
+    allow_mock_data: false  # 仅演示/开发时可显式改为 true，真实选股请保持 false
   tushare:
-    token: ""  # 推荐优先使用环境变量 TUSHARE_TOKEN
+    token: ""  # 推荐优先使用环境变量 TUSHARE_TOKEN 或本机 config/config_local.yaml
 
 # 钉钉机器人配置
 # 1. 在钉钉群中添加自定义机器人
@@ -32,6 +34,7 @@ web:
   host: "127.0.0.1"
   port: 5080
   auto_port: true
+  allow_lan: false  # 如需局域网访问才改为 true
 
 # 数据更新配置
 update:

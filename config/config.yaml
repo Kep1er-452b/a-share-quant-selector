@@ -7,8 +7,22 @@
 data_dir: data
 
 dingtalk:
-  webhook_url: ”“
+  enabled: false
+  webhook_url: ""
   secret: ""
+
+data_source:
+  default_provider: "akshare"
+  akshare:
+    allow_mock_data: false
+  tushare:
+    token: ""  # 本机默认 Token 放在 config/config_local.yaml（已忽略）
+
+web:
+  host: "127.0.0.1"
+  port: 5080
+  auto_port: true
+  allow_lan: false
 
 schedule:
   time: "17:00"

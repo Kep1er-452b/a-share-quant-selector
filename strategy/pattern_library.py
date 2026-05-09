@@ -2,6 +2,7 @@
 完美图形库管理 - 预计算案例特征，支持动态扩展
 """
 import json
+import hashlib
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -220,7 +221,11 @@ class B1PatternLibrary:
     def _save_to_cache(self):
         """序列化案例库到缓存"""
         try:
-            cache_data = {}
+            cache_data = {
+                "_meta": {
+                    "signature": self._cache_signature(),
+                }
+            }
             for case_id, case_data in self.cases.items():
                 cache_data[case_id] = {
                     "meta": case_data["meta"],
@@ -241,8 +246,15 @@ class B1PatternLibrary:
         try:
             with open(self.CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
+
+            meta = cache_data.get("_meta") or {}
+            if meta.get("signature") != self._cache_signature():
+                print("⚠️ 案例库缓存配置已变化，将重新构建")
+                return False
             
             for case_id, data in cache_data.items():
+                if case_id == "_meta":
+                    continue
                 self.cases[case_id] = {
                     "meta": data["meta"],
                     "features": self._deserialize_features(data["features"]),
@@ -254,6 +266,15 @@ class B1PatternLibrary:
         except Exception as e:
             print(f"⚠️ 缓存加载失败: {e}，将重新构建")
             return False
+
+    def _cache_signature(self) -> str:
+        payload = {
+            "cases": B1_PERFECT_CASES,
+            "weights": SIMILARITY_WEIGHTS,
+            "tolerances": self.matcher.tolerances,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     
     def _serialize_features(self, features: dict) -> dict:
         """序列化特征（处理numpy数组）"""
