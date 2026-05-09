@@ -26,8 +26,8 @@ class TushareFetcher(BaseDataProvider):
         self.token = (token or "").strip()
         if not self.token:
             raise DataProviderError(
-                "未找到 Tushare Token。请先设置环境变量 TUSHARE_TOKEN，或在 config/config.yaml 中配置 "
-                "data_source.tushare.token，或在交互模式下输入 token。"
+                "未找到 Tushare Token。请先设置环境变量 TUSHARE_TOKEN，或在 config/config_local.yaml / "
+                "config/config.yaml 中配置 data_source.tushare.token，或在交互模式下输入 token。"
             )
 
         try:
@@ -42,6 +42,13 @@ class TushareFetcher(BaseDataProvider):
         self.daily_basic_calls = deque()
         self.daily_basic_limit_per_minute = 180
         self.daily_basic_rate_limit_wait = 62
+        self.daily_basic_by_date_cache = {}
+        self.daily_basic_by_date_failures = set()
+        self.daily_basic_date_cache_max_days = 40
+        self.daily_basic_api_calls = 0
+        self.daily_basic_cache_hits = 0
+        self._latest_trade_date_cache = None
+        self._latest_trade_date_daily_basic_cache = pd.DataFrame()
         self.trade_calendar_cache_file = Path(data_dir) / "trade_calendar_cache.json"
         self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
         self.trade_calendar_cache = {}
@@ -222,14 +229,16 @@ class TushareFetcher(BaseDataProvider):
 
     def _get_latest_trade_date(self, max_lookback_days=10):
         """获取最近一个可用交易日"""
+        if self._latest_trade_date_cache:
+            return self._latest_trade_date_cache, self._latest_trade_date_daily_basic_cache.copy()
+
         for delta in range(max_lookback_days):
             trade_date = (datetime.now() - timedelta(days=delta)).strftime("%Y%m%d")
             try:
-                df = self._call_daily_basic(
-                    trade_date=trade_date,
-                    fields="ts_code,trade_date,total_mv"
-                )
+                df = self._fetch_daily_basic_trade_date(trade_date)
                 if df is not None and not df.empty:
+                    self._latest_trade_date_cache = trade_date
+                    self._latest_trade_date_daily_basic_cache = df.copy()
                     return trade_date, df
             except Exception:
                 continue
@@ -329,6 +338,7 @@ class TushareFetcher(BaseDataProvider):
 
     def _call_daily_basic(self, **kwargs):
         self._throttle_daily_basic()
+        self.daily_basic_api_calls += 1
         return self.pro.daily_basic(**kwargs)
 
     def _fetch_daily_basic_range(self, ts_code: str, start_date: str, end_date: str):
@@ -357,6 +367,111 @@ class TushareFetcher(BaseDataProvider):
         if last_error is not None:
             print(f"  获取 daily_basic 失败: {last_error}")
         return pd.DataFrame()
+
+    @staticmethod
+    def _trade_date_key(trade_date) -> str:
+        return pd.to_datetime(trade_date).strftime("%Y%m%d")
+
+    def _fetch_daily_basic_trade_date(self, trade_date):
+        date_key = self._trade_date_key(trade_date)
+        if date_key in self.daily_basic_by_date_cache:
+            self.daily_basic_cache_hits += 1
+            return self.daily_basic_by_date_cache[date_key].copy()
+
+        last_error = None
+        for attempt in range(4):
+            try:
+                df = self._call_daily_basic(
+                    trade_date=date_key,
+                    fields="ts_code,trade_date,turnover_rate,total_mv"
+                )
+                if not isinstance(df, pd.DataFrame):
+                    df = pd.DataFrame()
+                self.daily_basic_by_date_cache[date_key] = df.copy()
+                return df
+            except Exception as e:
+                last_error = e
+                if self._is_rate_limit_error(e) and attempt < 3:
+                    wait_seconds = self.daily_basic_rate_limit_wait
+                    print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
+                    time.sleep(wait_seconds)
+                    self.daily_basic_calls.clear()
+                    continue
+                if attempt < 3:
+                    time.sleep(0.5 * (attempt + 1))
+
+        self.daily_basic_by_date_failures.add(date_key)
+        if last_error is not None:
+            print(f"  获取 {date_key} daily_basic 失败: {last_error}")
+        return pd.DataFrame()
+
+    def _fetch_daily_basic_from_trade_date_cache(self, ts_code: str, start_date: str, end_date: str):
+        start = pd.to_datetime(start_date).date()
+        end = pd.to_datetime(end_date).date()
+        trade_dates = self.get_trade_dates_between(start, end)
+        if not trade_dates:
+            return pd.DataFrame(columns=["ts_code", "trade_date", "turnover_rate", "total_mv"])
+        if len(trade_dates) > self.daily_basic_date_cache_max_days:
+            return None
+
+        frames = []
+        for trade_date in trade_dates:
+            date_key = self._trade_date_key(trade_date)
+            date_df = self._fetch_daily_basic_trade_date(date_key)
+            if date_key in self.daily_basic_by_date_failures:
+                return None
+            if date_df.empty or "ts_code" not in date_df.columns:
+                continue
+            stock_df = date_df[date_df["ts_code"].astype(str) == ts_code]
+            if not stock_df.empty:
+                frames.append(stock_df)
+
+        if frames:
+            return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(columns=["ts_code", "trade_date", "turnover_rate", "total_mv"])
+
+    def prefetch_incremental_aux_data(self, trade_dates) -> None:
+        normalized_dates = sorted({
+            pd.to_datetime(trade_date).date()
+            for trade_date in trade_dates
+            if trade_date is not None
+        })
+        if not normalized_dates:
+            return
+
+        end_date = max(normalized_dates)
+        start_probe = min(normalized_dates) - timedelta(days=max(len(normalized_dates) * 4 + 10, 20))
+        window_dates = self.get_trade_dates_between(start_probe, end_date)
+        target_count = min(max(len(normalized_dates) + 1, 2), len(window_dates))
+        target_dates = window_dates[-target_count:] if window_dates else normalized_dates
+
+        if len(target_dates) > self.daily_basic_date_cache_max_days:
+            print(
+                f"  Tushare daily_basic 跨度 {len(target_dates)} 个交易日，"
+                "保守回退为按股票查询。"
+            )
+            return
+
+        missing_dates = [
+            trade_date for trade_date in target_dates
+            if self._trade_date_key(trade_date) not in self.daily_basic_by_date_cache
+        ]
+        if not missing_dates:
+            return
+
+        print(
+            f"  Tushare 优化: 预取 daily_basic {len(missing_dates)} 个交易日，"
+            "避免全市场按股票重复请求。"
+        )
+        for trade_date in missing_dates:
+            self._fetch_daily_basic_trade_date(trade_date)
+
+    def get_runtime_stats(self) -> dict:
+        return {
+            "daily_basic实际请求": self.daily_basic_api_calls,
+            "daily_basic缓存命中": self.daily_basic_cache_hits,
+            "daily_basic缓存交易日": len(self.daily_basic_by_date_cache),
+        }
 
     @staticmethod
     def _numeric_column(frame: pd.DataFrame, column_name: str, default=0):
@@ -541,7 +656,9 @@ class TushareFetcher(BaseDataProvider):
             if price_df is None or price_df.empty:
                 return None
 
-            basic_df = self._fetch_daily_basic_range(ts_code, start_str, end_str)
+            basic_df = self._fetch_daily_basic_from_trade_date_cache(ts_code, start_str, end_str)
+            if basic_df is None:
+                basic_df = self._fetch_daily_basic_range(ts_code, start_str, end_str)
             return self._normalize_history_dataframe(price_df, basic_df)
         except Exception as e:
             print(f"  Tushare 获取增量数据失败: {e}")

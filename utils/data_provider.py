@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from utils.csv_manager import CSVManager
+from utils.local_config import load_config_file
 from utils.progress import ProgressTracker
 
 
@@ -39,6 +40,50 @@ class BaseDataProvider:
         self.full_data_dir = Path(data_dir)
         self.stock_names_file = self.full_data_dir / "stock_names.json"
         self.fetch_state_file = self.full_data_dir / "fetch_state.json"
+        self.trade_calendar_cache_file = self.full_data_dir / "trade_calendar_cache.json"
+        self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
+        self._local_trade_calendar_cache = None
+
+    def _load_local_trade_calendar(self) -> dict:
+        """Load seed/user trade calendar caches for providers without a live calendar API."""
+        if self._local_trade_calendar_cache is not None:
+            return self._local_trade_calendar_cache
+
+        merged = {"years": {}, "updated_at": None}
+        for path in [self.trade_calendar_seed_file, self.trade_calendar_cache_file]:
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f) or {}
+                for year, info in (payload.get("years") or {}).items():
+                    merged["years"][str(year)] = info
+                if payload.get("updated_at"):
+                    merged["updated_at"] = payload.get("updated_at")
+            except Exception:
+                continue
+
+        self._local_trade_calendar_cache = merged
+        return merged
+
+    def _cached_trade_dates_between(self, start_date, end_date) -> List:
+        start = pd.to_datetime(start_date).date() if start_date else None
+        end = pd.to_datetime(end_date).date() if end_date else None
+        if not start or not end or start > end:
+            return []
+
+        cache = self._load_local_trade_calendar()
+        dates = []
+        for year in range(start.year, end.year + 1):
+            info = cache.get("years", {}).get(str(year), {})
+            for text in info.get("open_dates", []):
+                try:
+                    value = pd.to_datetime(str(text)).date()
+                except Exception:
+                    continue
+                if start <= value <= end:
+                    dates.append(value)
+        return sorted(set(dates))
 
     def _load_local_stock_names(self) -> Dict[str, str]:
         """从本地文件加载股票名称"""
@@ -93,14 +138,24 @@ class BaseDataProvider:
 
     def get_trade_calendar_status(self) -> dict:
         """
-        返回交易日历缓存状态。基类默认只提供占位信息。
+        返回交易日历缓存状态。基类优先报告本地种子/缓存。
         """
+        cache = self._load_local_trade_calendar()
+        years = sorted(cache.get("years", {}).keys())
+        latest_cached_date = None
+        for info in cache.get("years", {}).values():
+            open_dates = info.get("open_dates", [])
+            if not open_dates:
+                continue
+            year_latest = max(open_dates)
+            if latest_cached_date is None or year_latest > latest_cached_date:
+                latest_cached_date = year_latest
         return {
             "provider": self.provider_name,
-            "cache_available": False,
-            "latest_cached_date": None,
-            "years": [],
-            "source": "fallback",
+            "cache_available": bool(years),
+            "latest_cached_date": latest_cached_date,
+            "years": years,
+            "source": "local_cache" if years else "fallback",
         }
 
     def update_trade_calendar_cache(self, years=None) -> dict:
@@ -108,6 +163,14 @@ class BaseDataProvider:
         更新本地交易日历缓存。默认数据源不支持。
         """
         raise DataProviderError(f"{self.provider_name} 数据源暂不支持交易日历缓存更新")
+
+    def prefetch_incremental_aux_data(self, trade_dates) -> None:
+        """Provider hook for warming batch auxiliary data before per-stock updates."""
+        return None
+
+    def get_runtime_stats(self) -> dict:
+        """Provider hook for exposing lightweight sync diagnostics."""
+        return {}
 
     def classify_board(self, stock_code: str, metadata: Optional[dict] = None) -> str:
         """按元数据优先、代码前缀回退的方式划分板块"""
@@ -161,6 +224,11 @@ class BaseDataProvider:
         latest = now.date()
         if now.time() < datetime.strptime("15:00", "%H:%M").time():
             latest -= timedelta(days=1)
+
+        cached_dates = self._cached_trade_dates_between(latest - timedelta(days=30), latest)
+        if cached_dates:
+            return cached_dates[-1]
+
         while latest.weekday() >= 5:
             latest -= timedelta(days=1)
         return latest
@@ -174,6 +242,9 @@ class BaseDataProvider:
         end = pd.to_datetime(end_date).date() if end_date else None
         if not start or not end or start > end:
             return []
+        cached_dates = self._cached_trade_dates_between(start, end)
+        if cached_dates:
+            return cached_dates
         return list(pd.bdate_range(start=start, end=end).date)
 
     def get_missing_trade_dates(self, latest_local_date, latest_trade_date) -> List:
@@ -410,6 +481,13 @@ class BaseDataProvider:
 
         market_cap_targets = [item["code"] for item in incremental + full_refresh]
         market_cap_map = self.get_market_caps(market_cap_targets) if market_cap_targets else {}
+        incremental_missing_dates = []
+        for item in incremental:
+            latest_local = status_map[item["code"]].get("latest_date")
+            latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
+            incremental_missing_dates.extend(self.get_missing_trade_dates(latest_local_date, latest_trade_date))
+        if incremental_missing_dates:
+            self.prefetch_incremental_aux_data(incremental_missing_dates)
 
         processed = 0
         total_work = len(incremental) + len(full_refresh)
@@ -552,6 +630,10 @@ class BaseDataProvider:
             final_summary[info["status"]] = final_summary.get(info["status"], 0) + 1
         summary_text = " | ".join(f"{k}: {v}" for k, v in sorted(final_summary.items()))
         print(f"同步完成: {summary_text} | 总耗时 {tracker.elapsed_text()}")
+        runtime_stats = self.get_runtime_stats()
+        if runtime_stats:
+            stats_text = " | ".join(f"{key}: {value}" for key, value in runtime_stats.items())
+            print(f"Provider 运行统计: {stats_text}")
         emit_progress(
             stage="completed",
             current_step="目标股票池同步完成",
@@ -598,7 +680,7 @@ def create_data_provider(provider_name: str, data_dir: str = "data", config: Opt
     if normalized == "akshare":
         from utils.akshare_fetcher import AKShareFetcher
 
-        return AKShareFetcher(data_dir)
+        return AKShareFetcher(data_dir=data_dir, config=config)
 
     if normalized == "tushare":
         from utils.tushare_fetcher import TushareFetcher
@@ -608,6 +690,9 @@ def create_data_provider(provider_name: str, data_dir: str = "data", config: Opt
             or os.getenv("TUSHARE_TOKEN")
             or get_config_value(config, "data_source", "tushare", "token")
         )
+        if not resolved_token:
+            local_config = load_config_file()
+            resolved_token = get_config_value(local_config, "data_source", "tushare", "token")
         return TushareFetcher(data_dir=data_dir, token=resolved_token)
 
     raise DataProviderError(f"不支持的数据源: {provider_name}")

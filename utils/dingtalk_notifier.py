@@ -12,6 +12,11 @@ import urllib.parse
 import multiprocessing
 from datetime import datetime
 from pathlib import Path
+from utils.strategy_labels import (
+    CATEGORY_DISPLAY_ORDER,
+    category_label,
+    iter_categories_with_unknowns,
+)
 
 
 def _should_print_import_message():
@@ -372,15 +377,8 @@ class DingTalkNotifier:
         
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         
-        # 分类名称映射
-        category_names = {
-            'bowl_center': '🥣 回落碗中',
-            'near_duokong': '📊 靠近多空线',
-            'near_short_trend': '📈 靠近短期趋势线'
-        }
-        
         # 筛选标签
-        filter_label = "全部" if category_filter == 'all' else category_names.get(category_filter, category_filter)
+        filter_label = "全部" if category_filter == 'all' else category_label(category_filter)
         
         content = f"📊 A股量化选股结果\n\n"
         content += f"⏰ 时间: {now}\n"
@@ -389,7 +387,7 @@ class DingTalkNotifier:
         
         total_signals = 0
         # 按分类统计
-        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
+        category_count = {category: 0 for category in CATEGORY_DISPLAY_ORDER}
         
         for strategy_name, signals in results.items():
             content += f"🎯 {strategy_name}\n\n"
@@ -413,16 +411,12 @@ class DingTalkNotifier:
             
             total_signals += sum(len(group) for group in category_groups.values())
             
-            # 按优先级顺序显示分类
-            display_order = ['bowl_center', 'near_duokong', 'near_short_trend']
-            # 如果指定了分类，只显示该分类
-            if category_filter != 'all' and category_filter in display_order:
-                display_order = [category_filter]
-            
+            display_order = [category_filter] if category_filter != 'all' else list(iter_categories_with_unknowns(category_groups=category_groups))
+
             for cat in display_order:
                 if cat in category_groups:
                     group_signals = category_groups[cat]
-                    cat_name = category_names.get(cat, cat)
+                    cat_name = category_label(cat)
                     content += f"{cat_name} ({len(group_signals)}只)\n"
                     content += "-" * 20 + "\n"
                     
@@ -448,9 +442,10 @@ class DingTalkNotifier:
         
         # 显示分类统计
         content += "📊 分类统计:\n"
-        content += f"   🥣 回落碗中: {category_count.get('bowl_center', 0)} 只\n"
-        content += f"   📊 靠近多空线: {category_count.get('near_duokong', 0)} 只\n"
-        content += f"   📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只\n"
+        for cat in iter_categories_with_unknowns(category_counts=category_count):
+            count = category_count.get(cat, 0)
+            if count:
+                content += f"   {category_label(cat)}: {count} 只\n"
         content += f"   📈 共选出: {total_signals} 只\n\n"
         content += "⚠️ 提示: 以上结果仅供参考，不构成投资建议"
         
@@ -642,23 +637,17 @@ class DingTalkNotifier:
             stock_names = {}
         
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        category_names = {
-            'bowl_center': '🥣 回落碗中',
-            'near_duokong': '📊 靠近多空线',
-            'near_short_trend': '📈 靠近短期趋势线'
-        }
-        
         total_sent = 0
         total_failed = 0
         
         # 先发送汇总消息
         summary = f"📊 A股量化选股结果\n⏰ {now}\n"
         if category_filter != 'all':
-            summary += f"🔍 筛选: {category_names.get(category_filter, category_filter)}\n"
+            summary += f"🔍 筛选: {category_label(category_filter)}\n"
         summary += "━" * 20 + "\n\n"
         
         # 统计各分类数量
-        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
+        category_count = {category: 0 for category in CATEGORY_DISPLAY_ORDER}
         for strategy_name, signals in results.items():
             for signal in signals:
                 for s in signal['signals']:
@@ -666,9 +655,10 @@ class DingTalkNotifier:
                     if category_filter == 'all' or cat == category_filter:
                         category_count[cat] = category_count.get(cat, 0) + 1
         
-        summary += f"🥣 回落碗中: {category_count.get('bowl_center', 0)} 只\n"
-        summary += f"📊 靠近多空线: {category_count.get('near_duokong', 0)} 只\n"
-        summary += f"📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只\n"
+        for cat in iter_categories_with_unknowns(category_counts=category_count):
+            count = category_count.get(cat, 0)
+            if count:
+                summary += f"{category_label(cat)}: {count} 只\n"
         total = sum(category_count.values())
         summary += f"📈 共选出: {total} 只\n\n"
         summary += "详细列表见下方消息 👇"
@@ -694,12 +684,12 @@ class DingTalkNotifier:
                     category_groups[cat].append((signal, s))
             
             # 按优先级顺序发送
-            for cat in ['bowl_center', 'near_duokong', 'near_short_trend']:
+            for cat in iter_categories_with_unknowns(category_groups=category_groups):
                 if cat not in category_groups or not category_groups[cat]:
                     continue
                 
                 group = category_groups[cat]
-                cat_name = category_names.get(cat, cat)
+                cat_name = category_label(cat)
                 
                 # 构建该分类的消息
                 content = f"{cat_name} ({len(group)}只)\n"
@@ -817,12 +807,7 @@ class DingTalkNotifier:
         Returns:
             str: 格式化的Markdown消息
         """
-        category_names = {
-            'bowl_center': '🥣 回落碗中',
-            'near_duokong': '📊 靠近多空线',
-            'near_short_trend': '📈 靠近短期趋势线'
-        }
-        category_name = category_names.get(category, category)
+        category_name = category_label(category)
         
         # 格式化参数
         cap = params.get('CAP', 4000000000)
@@ -889,17 +874,11 @@ class DingTalkNotifier:
         
         # 先发送汇总消息
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        category_names = {
-            'bowl_center': '🥣 回落碗中',
-            'near_duokong': '📊 靠近多空线',
-            'near_short_trend': '📈 靠近短期趋势线'
-        }
-        
         total_sent = 0
         total_failed = 0
         
         # 统计各分类数量
-        category_count = {'bowl_center': 0, 'near_duokong': 0, 'near_short_trend': 0}
+        category_count = {category: 0 for category in CATEGORY_DISPLAY_ORDER}
         chart_count = 0
 
         for strategy_name, signals in results.items():
@@ -924,11 +903,12 @@ class DingTalkNotifier:
         
         summary += f"⏰ {now}\n"
         if category_filter != 'all':
-            summary += f"🔍 筛选: {category_names.get(category_filter, category_filter)}\n"
+            summary += f"🔍 筛选: {category_label(category_filter)}\n"
         summary += "━" * 20 + "\n\n"
-        summary += f"🥣 回落碗中: {category_count.get('bowl_center', 0)} 只\n"
-        summary += f"📊 靠近多空线: {category_count.get('near_duokong', 0)} 只\n"
-        summary += f"📈 靠近短期趋势线: {category_count.get('near_short_trend', 0)} 只\n"
+        for cat in iter_categories_with_unknowns(category_counts=category_count):
+            count = category_count.get(cat, 0)
+            if count:
+                summary += f"{category_label(cat)}: {count} 只\n"
         total = sum(category_count.values())
         summary += f"📈 共选出: {total} 只\n\n"
         
@@ -981,7 +961,6 @@ class DingTalkNotifier:
                                 info_message = self._format_stock_info_message(
                                     code, name, cat, params, s
                                 )
-                                cat_name = category_names.get(cat, cat)
                                 title = f"{code} {name}"
                                 print(f"    发送文字...")
                                 self.send_markdown(title, info_message)
@@ -1026,7 +1005,7 @@ class DingTalkNotifier:
                                 )
                                 
                                 # 发送图片信息
-                                cat_name = category_names.get(cat, cat)
+                                cat_name = category_label(cat)
                                 title = f"{code} {name} - {cat_name}"
                                 if self.send_image(chart_path, title):
                                     chart_count += 1
@@ -1059,13 +1038,6 @@ class DingTalkNotifier:
         from datetime import datetime
         from strategy.pattern_config import TOP_N_RESULTS
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        # 分类名称映射 (纯文本版，避免表情符号乱码)
-        category_names = {
-            'bowl_center': '[回落碗中]',
-            'near_duokong': '[靠近多空线]',
-            'near_short_trend': '[靠近短期趋势线]'
-        }
         
         # 构建Markdown消息
         lines = [
@@ -1103,7 +1075,7 @@ class DingTalkNotifier:
             shape_score = breakdown.get('price_shape', 0)
             lines.append(f"   分项: 趋势{trend_score}% | KDJ{kdj_score}% | 量能{vol_score}% | 形态{shape_score}%")
             
-            cat_name = category_names.get(category, category)
+            cat_name = category_label(category)
             lines.append(f"   策略: {cat_name} | 价格: {close} | J值: {j_val}")
             lines.append("")  # 空行分隔
         

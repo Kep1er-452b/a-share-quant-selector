@@ -14,6 +14,7 @@ class StrategyRegistry:
         self.strategies = {}
         self.params_file = Path(params_file)
         self.params = self._load_params()
+        self.load_errors = []
     
     def _load_params(self):
         """加载策略参数配置"""
@@ -60,6 +61,8 @@ class StrategyRegistry:
         if str(strategy_path) not in sys.path:
             sys.path.insert(0, str(strategy_path))
         
+        self.load_errors = []
+
         # 遍历策略文件
         for py_file in strategy_path.glob("*.py"):
             if py_file.name.startswith("_"):
@@ -88,7 +91,18 @@ class StrategyRegistry:
                         print(f"  ✓ 注册策略: {attr_name}")
                         
             except Exception as e:
+                error = {
+                    "module": module_name,
+                    "file": str(py_file),
+                    "error": str(e),
+                    "type": type(e).__name__,
+                }
+                self.load_errors.append(error)
                 print(f"  ✗ 加载 {module_name} 失败: {e}")
+
+    def get_load_errors(self):
+        """返回最近一次自动注册时的结构化加载错误。"""
+        return list(self.load_errors)
     
     def run_strategy(self, strategy_name, stock_data_dict):
         """

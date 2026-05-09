@@ -2,45 +2,93 @@
 CSV 数据管理工具
 """
 import os
+import re
 import pandas as pd
 from pathlib import Path
 
 
 class CSVManager:
     """CSV文件管理器"""
+
+    STOCK_CODE_PATTERN = re.compile(r"^\d{6}$")
+    REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"}
+    NUMERIC_COLUMNS = ["open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"]
     
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
     
-    def get_stock_path(self, stock_code):
+    @classmethod
+    def validate_stock_code(cls, stock_code):
+        """Validate and normalize a local A-share stock code."""
+        code = str(stock_code or "").strip()
+        if not cls.STOCK_CODE_PATTERN.match(code):
+            raise ValueError(f"非法股票代码: {stock_code}")
+        return code
+
+    def get_stock_path(self, stock_code, create_dirs=True):
         """获取股票CSV文件路径"""
+        stock_code = self.validate_stock_code(stock_code)
         # 按股票代码前两位分目录，避免单目录文件过多
         prefix = stock_code[:2] if len(stock_code) >= 2 else stock_code
         subdir = self.data_dir / prefix
-        subdir.mkdir(exist_ok=True)
+        if create_dirs:
+            subdir.mkdir(exist_ok=True)
         return subdir / f"{stock_code}.csv"
     
     def read_stock(self, stock_code):
         """读取股票数据"""
-        path = self.get_stock_path(stock_code)
-        if not path.exists():
-            return pd.DataFrame()
-        
-        # 检查文件是否为空
-        if path.stat().st_size == 0:
-            return pd.DataFrame()
-        
         try:
+            path = self.get_stock_path(stock_code, create_dirs=False)
+            if not path.exists():
+                return pd.DataFrame()
+
+            # 检查文件是否为空
+            if path.stat().st_size == 0:
+                return pd.DataFrame()
+
             df = pd.read_csv(path, parse_dates=['date'])
             return df
         except Exception as e:
             print(f"  读取 {stock_code} 数据失败: {e}")
             return pd.DataFrame()
+
+    def _validate_stock_dataframe(self, df):
+        """Validate and normalize stock OHLCV data before writing."""
+        if df is None or df.empty:
+            raise ValueError("股票数据为空，拒绝写入")
+
+        missing_columns = self.REQUIRED_COLUMNS - set(df.columns)
+        if missing_columns:
+            raise ValueError(f"股票数据缺少字段: {', '.join(sorted(missing_columns))}")
+
+        result = df.copy()
+        result['date'] = pd.to_datetime(result['date'], errors='coerce')
+        if result['date'].isna().any():
+            raise ValueError("股票数据包含无法解析的日期")
+
+        for column in self.NUMERIC_COLUMNS:
+            result[column] = pd.to_numeric(result[column], errors='coerce')
+
+        required_price_columns = ["open", "high", "low", "close", "volume"]
+        if result[required_price_columns].isna().any().any():
+            raise ValueError("股票数据包含无法解析的价格/成交量字段")
+
+        if (result[["open", "high", "low", "close"]] <= 0).any().any():
+            raise ValueError("股票数据包含非正价格")
+
+        if (result["volume"] < 0).any():
+            raise ValueError("股票数据包含负成交量")
+
+        result["amount"] = result["amount"].fillna(0)
+        result["turnover"] = result["turnover"].fillna(0)
+        result["market_cap"] = result["market_cap"].fillna(0)
+        return result
     
     def write_stock(self, stock_code, df):
         """写入股票数据（自动去重排序）"""
         path = self.get_stock_path(stock_code)
+        df = self._validate_stock_dataframe(df)
         
         # 去重：按日期去重，保留最后出现的
         df = df.drop_duplicates(subset=['date'], keep='last')
@@ -103,7 +151,8 @@ class CSVManager:
         stocks = []
         for csv_file in self.data_dir.rglob("*.csv"):
             stock_code = csv_file.stem
-            stocks.append(stock_code)
+            if self.STOCK_CODE_PATTERN.match(stock_code):
+                stocks.append(stock_code)
         return sorted(stocks)
     
     def get_stock_count(self):

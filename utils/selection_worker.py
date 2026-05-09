@@ -64,6 +64,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     indicators_dict = {}
     category_count = {}
     error_counts = {strategy_name: 0 for strategy_name in strategies}
+    error_details = []
     processed_count = len(candidates)
     valid_count = 0
     skipped_count = 0
@@ -86,8 +87,16 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
             try:
                 df_with_indicators = strategy.calculate_indicators(prepared_df)
                 signal_list = strategy.select_stocks(df_with_indicators, name)
-            except Exception:
+            except Exception as exc:
                 error_counts[strategy_name] += 1
+                if len(error_details) < 20:
+                    error_details.append({
+                        "code": code,
+                        "name": name,
+                        "strategy": strategy_name,
+                        "error": str(exc),
+                        "type": type(exc).__name__,
+                    })
                 continue
 
             filtered_signals = []
@@ -117,6 +126,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
         "indicators_dict": indicators_dict,
         "category_count": category_count,
         "error_counts": error_counts,
+        "error_details": error_details,
         "last_processed_code": last_processed_code,
         "last_processed_name": last_processed_name,
     }

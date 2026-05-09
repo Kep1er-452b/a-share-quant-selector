@@ -33,16 +33,8 @@ from utils.kline_chart import generate_kline_chart
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.progress import ProgressTracker
 from utils.selection_worker import build_worker_context, process_selection_chunk, initialize_selection_worker
-import yaml
-
-
-def load_config_file(config_file="config/config.yaml"):
-    """加载配置文件"""
-    config_path = Path(config_file)
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
+from utils.strategy_labels import CATEGORY_DISPLAY_ORDER, category_label, is_invalid_stock_name
+from utils.local_config import load_config_file
 
 
 def prompt_for_provider(default_provider="akshare"):
@@ -109,15 +101,40 @@ def resolve_provider_name(args, config):
     return configured_provider
 
 
-def resolve_tushare_token(config, interactive_prompt=False):
-    """解析 Tushare Token，优先环境变量，其次本地配置，最后交互输入"""
+def _default_tushare_token(config):
     token = os.getenv("TUSHARE_TOKEN")
     if token:
-        return token.strip()
+        return token.strip(), "环境变量 TUSHARE_TOKEN"
 
     token = get_config_value(config, "data_source", "tushare", "token")
     if token:
-        return str(token).strip()
+        return str(token).strip(), "本机配置"
+
+    return None, None
+
+
+def resolve_tushare_token(config, interactive_prompt=False):
+    """解析 Tushare Token，交互模式可选择默认 Token 或手动输入"""
+    default_token, default_source = _default_tushare_token(config)
+
+    if interactive_prompt and default_token:
+        print("\n请选择 Tushare Token：")
+        print(f"  1. 使用默认 Token（{default_source}，内容已隐藏）")
+        print("  2. 手动输入 Token")
+        while True:
+            choice = input("输入 1 或 2 (默认: 1): ").strip() or "1"
+            if choice == "1":
+                return default_token
+            if choice == "2":
+                manual_token = getpass.getpass("请输入 Tushare Token: ").strip()
+                if manual_token:
+                    return manual_token
+                print("Token 不能为空。")
+                continue
+            print("请输入 1 或 2。")
+
+    if default_token:
+        return default_token
 
     if interactive_prompt:
         token = getpass.getpass("请输入 Tushare Token: ").strip()
@@ -281,10 +298,7 @@ class QuantSystem:
     @staticmethod
     def _is_invalid_stock_name(name):
         """统一处理退市/ST 股票过滤规则。"""
-        invalid_keywords = ['退', '未知', '退市', '已退']
-        if any(kw in name for kw in invalid_keywords):
-            return True
-        return name.startswith('ST') or name.startswith('*ST')
+        return is_invalid_stock_name(name)
 
     @staticmethod
     def _merge_indicator_frames(base_df, frames):
@@ -568,32 +582,17 @@ class QuantSystem:
                 code = signal['code']
                 name = signal.get('name', stock_names.get(code, '未知'))
                 for s in signal['signals']:
-                    cat_emoji = {
-                        'bowl_center': '🥣',
-                        'near_duokong': '📊',
-                        'near_short_trend': '📈',
-                        'b1_v242b': '🎯',
-                        'b2_beta': '🚀',
-                        'b1_min_j_simple': '🔻',
-                        'b1_min_j_complex': '🧩',
-                    }.get(s.get('category'), '❓')
+                    cat_emoji = category_label(s.get('category')).split(' ', 1)[0]
                     print(f"  {cat_emoji} {code} {name}: 价格={s['close']}, J={s['J']}, 理由={s['reasons']}")
         
         # 显示分类统计
         print("\n" + "-" * 60)
         print("分类统计:")
-        category_labels = {
-            'bowl_center': '🥣 回落碗中',
-            'near_duokong': '📊 靠近多空线',
-            'near_short_trend': '📈 靠近短期趋势线',
-            'b1_v242b': '🎯 B1(V2.42B)',
-            'b2_beta': '🚀 B2选股Beta版',
-            'b1_min_j_simple': '🔻 B1MinJSimple',
-            'b1_min_j_complex': '🧩 B1MinJComplex',
-        }
         if category_count:
-            for key, count in sorted(category_count.items()):
-                print(f"  {category_labels.get(key, key)}: {count} 只")
+            known = [key for key in CATEGORY_DISPLAY_ORDER if key in category_count]
+            extras = sorted(key for key in category_count if key not in CATEGORY_DISPLAY_ORDER)
+            for key in known + extras:
+                print(f"  {category_label(key)}: {category_count[key]} 只")
         else:
             print("  无分类结果")
         print("-" * 60)
@@ -993,9 +992,9 @@ B1完美图形匹配:
 
     parser.add_argument(
         'command',
-        choices=['init', 'select', 'run', 'web', 'calendar'],
+        choices=['init', 'select', 'run', 'web', 'calendar', 'doctor'],
         nargs='?',
-        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器), calendar(查看/更新交易日历缓存)'
+        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器), calendar(查看/更新交易日历缓存), doctor(健康检查)'
     )
 
     parser.add_argument(
@@ -1067,9 +1066,9 @@ B1完美图形匹配:
     parser.add_argument(
         '--category',
         type=str,
-        choices=['all', 'bowl_center', 'near_duokong', 'near_short_trend'],
+        choices=['all'] + CATEGORY_DISPLAY_ORDER,
         default='all',
-        help='筛选股票分类: all(全部), bowl_center(回落碗中), near_duokong(靠近多空线), near_short_trend(靠近短期趋势线)'
+        help='筛选股票分类: all(全部) 或具体策略分类'
     )
     
     # 从配置读取B1PatternMatch默认值
@@ -1101,6 +1100,39 @@ B1完美图形匹配:
         help=f'B1完美图形匹配的回看天数 (默认: {default_lookback_days})'
     )
 
+    parser.add_argument(
+        '--offline',
+        action='store_true',
+        help='doctor 命令默认离线运行；保留该参数用于显式表达'
+    )
+
+    parser.add_argument(
+        '--full-local',
+        action='store_true',
+        help='doctor 命令执行本地全量 CSV 选股验证'
+    )
+
+    parser.add_argument(
+        '--provider-smoke',
+        choices=['akshare', 'tushare'],
+        default=None,
+        help='doctor 命令执行小批联网数据源验证'
+    )
+
+    parser.add_argument(
+        '--max-network-stocks',
+        type=int,
+        default=3,
+        help='doctor 联网 smoke 最多抽样股票数'
+    )
+
+    parser.add_argument(
+        '--doctor-timeout',
+        type=int,
+        default=600,
+        help='doctor --full-local 超时时间（秒）'
+    )
+
     args = parser.parse_args()
 
     # 处理 --version 参数
@@ -1126,11 +1158,22 @@ B1完美图形匹配:
         )
         if not provider_token:
             print("✗ 未提供 Tushare Token，无法使用 tushare 数据源")
-            print("  可通过环境变量 TUSHARE_TOKEN 或 config/config.yaml 的 data_source.tushare.token 配置")
+            print("  可通过环境变量 TUSHARE_TOKEN、config/config_local.yaml 或 config/config.yaml 配置")
             sys.exit(1)
     
     # 执行命令
     try:
+        if args.command == 'doctor':
+            from utils.doctor import run_doctor
+            return_code = run_doctor(
+                project_root=project_root,
+                full_local=args.full_local,
+                provider_smoke=args.provider_smoke,
+                max_network_stocks=args.max_network_stocks,
+                timeout_seconds=args.doctor_timeout,
+            )
+            sys.exit(return_code)
+
         if args.command == 'calendar':
             if provider_name != 'tushare':
                 print("⚠️ 当前只有 tushare provider 支持交易日历缓存。")
