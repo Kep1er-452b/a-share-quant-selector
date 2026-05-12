@@ -8,6 +8,7 @@ A股量化选股系统 - 主程序
     python main.py run       # 完整流程（更新+选股+通知）
     python main.py web       # 启动 Web 界面
     python main.py calendar  # 查看或更新交易日历缓存
+    python main.py export    # 导出单只股票 CSV 到 Downloads
 """
 import sys
 import os
@@ -951,6 +952,34 @@ def print_calendar_status(status):
     print("=" * 60)
 
 
+def print_export_result(result):
+    code = result.get("code", "--")
+    name = result.get("name", "")
+    print("=" * 60)
+    print("📤 股票 CSV 导出")
+    print(f"   股票: {code} {name}".rstrip())
+    if result.get("freshness"):
+        freshness = result["freshness"]
+        print(f"   本地最新: {freshness.get('local_latest_date') or '无'}")
+        print(f"   目标交易日: {freshness.get('latest_trade_date') or '未知'}")
+    print(f"   文件: {result.get('path')}")
+    print("=" * 60)
+
+
+def prompt_export_stale_choice(result):
+    """过期数据导出时的终端选择。"""
+    print("⚠️ 检测到本地 CSV 不是最新。")
+    print(f"   {result.get('message')}")
+    print("\n请选择：")
+    print("  1. 先用 Tushare 单独更新这只股票，再导出")
+    print("  2. 直接导出当前本地 CSV，不管是否最新")
+    while True:
+        choice = input("输入 1 或 2 (默认: 1): ").strip() or "1"
+        if choice in {"1", "2"}:
+            return choice
+        print("请输入 1 或 2。")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='A股量化选股系统',
@@ -969,6 +998,8 @@ def main():
   python main.py web                           # 启动Web界面
   python main.py calendar --provider tushare   # 查看交易日历缓存状态
   python main.py calendar --provider tushare --update --years 2026 2027
+  python main.py export 300888                 # 导出单只股票 CSV 到 Downloads
+  python main.py export tqly --update-first     # 先用 tushare 更新匹配股票再导出
   python main.py --version                     # 显示版本信息
 
 分类说明:
@@ -992,9 +1023,15 @@ B1完美图形匹配:
 
     parser.add_argument(
         'command',
-        choices=['init', 'select', 'run', 'web', 'calendar', 'doctor'],
+        choices=['init', 'select', 'run', 'web', 'calendar', 'doctor', 'export'],
         nargs='?',
-        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器), calendar(查看/更新交易日历缓存), doctor(健康检查)'
+        help='要执行的命令: init(初始化数据), select(仅筛选), run(更新+筛选), web(启动Web服务器), calendar(查看/更新交易日历缓存), doctor(健康检查), export(导出单股CSV)'
+    )
+
+    parser.add_argument(
+        'stock_query',
+        nargs='?',
+        help='export 命令使用：股票代码、名称或拼音首字母，例如 300888 或 tqly'
     )
 
     parser.add_argument(
@@ -1034,6 +1071,18 @@ B1完美图形匹配:
         '--force-select',
         action='store_true',
         help='在 select 命令中强制使用当前本地数据筛选，即使数据不是最新'
+    )
+
+    parser.add_argument(
+        '--update-first',
+        action='store_true',
+        help='在 export 命令中先用 Tushare 单独更新该股票，再导出 CSV'
+    )
+
+    parser.add_argument(
+        '--force-export',
+        action='store_true',
+        help='在 export 命令中忽略数据是否最新，直接导出当前本地 CSV'
     )
 
     parser.add_argument(
@@ -1173,6 +1222,43 @@ B1完美图形匹配:
                 timeout_seconds=args.doctor_timeout,
             )
             sys.exit(return_code)
+
+        if args.command == 'export':
+            if not args.stock_query:
+                print("✗ export 命令需要股票代码、名称或拼音首字母，例如: python main.py export tqly")
+                sys.exit(1)
+            if args.update_first and args.force_export:
+                print("✗ --update-first 与 --force-export 不能同时使用")
+                sys.exit(1)
+
+            from utils.stock_exporter import StockExportService
+
+            service = StockExportService(
+                data_dir=str(config.get('data_dir', 'data')),
+                config=config,
+            )
+            result = service.export_stock(
+                args.stock_query,
+                update_first=args.update_first,
+                force_export=args.force_export,
+            )
+            if result.get("needs_update"):
+                is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
+                if is_interactive:
+                    choice = prompt_export_stale_choice(result)
+                    result = service.export_stock(
+                        args.stock_query,
+                        update_first=(choice == "1"),
+                        force_export=(choice == "2"),
+                    )
+                else:
+                    print(f"⚠️ {result.get('message')}")
+                    print("  可运行：")
+                    print(f"  python main.py export {args.stock_query} --update-first")
+                    print(f"  python main.py export {args.stock_query} --force-export")
+                    sys.exit(2)
+            print_export_result(result)
+            return
 
         if args.command == 'calendar':
             if provider_name != 'tushare':

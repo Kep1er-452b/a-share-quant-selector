@@ -38,6 +38,11 @@ from utils.selection_worker import (
     process_selection_chunk,
 )
 from utils.strategy_labels import fallback_stock_name, is_invalid_stock_name
+from utils.stock_exporter import (
+    StockExportService,
+    resolve_stock_query,
+    search_stocks,
+)
 import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
 
@@ -54,6 +59,7 @@ selection_jobs = {}
 selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
+watchlist_lock = Lock()
 
 INDEX_KLINE_TARGETS = {
     'sh000001': {'symbol': 'sh000001', 'name': '上证指数'},
@@ -327,6 +333,34 @@ def _load_stock_names():
         return json.load(f)
 
 
+def _watchlist_path():
+    return Path(csv_manager.data_dir) / 'watchlist.json'
+
+
+def _load_watchlist():
+    path = _watchlist_path()
+    if not path.exists():
+        return {'items': {}}
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            payload = json.load(file) or {}
+        items = payload.get('items') if isinstance(payload, dict) else {}
+        if not isinstance(items, dict):
+            items = {}
+        return {'items': items}
+    except Exception:
+        return {'items': {}}
+
+
+def _save_watchlist(payload):
+    path = _watchlist_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix('.json.tmp')
+    with open(temp_path, 'w', encoding='utf-8') as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    temp_path.replace(path)
+
+
 def _stock_display_name(code, stock_names):
     return stock_names.get(code) or fallback_stock_name(code)
 
@@ -357,6 +391,42 @@ def _safe_int_arg(name, default, minimum=1, maximum=1000):
     except (TypeError, ValueError):
         return default
     return min(max(value, minimum), maximum)
+
+
+def _stock_table_row(code, stock_names=None):
+    stock_names = stock_names or _load_stock_names()
+    df = csv_manager.read_stock(code)
+    if df.empty:
+        return {
+            'code': code,
+            'name': _stock_display_name(code, stock_names),
+            'board': _classify_board(code),
+            'latest_price': None,
+            'latest_date': None,
+            'market_cap': None,
+            'data_count': 0,
+        }
+    latest = df.iloc[0]
+    latest_date = latest['date']
+    if hasattr(latest_date, 'strftime'):
+        latest_date = latest_date.strftime('%Y-%m-%d')
+    return {
+        'code': code,
+        'name': _stock_display_name(code, stock_names),
+        'board': _classify_board(code),
+        'latest_price': round(float(latest['close']), 2),
+        'latest_date': latest_date,
+        'market_cap': round(float(latest.get('market_cap', 0)) / 1e8, 2),
+        'data_count': len(df),
+    }
+
+
+def _export_service():
+    config = _load_config()
+    return StockExportService(
+        data_dir=str(_config_value(config, 'data_dir', default='data')),
+        config=config,
+    )
 
 
 def _require_session_token():
@@ -922,18 +992,9 @@ def get_stocks():
         
         stock_list = []
         for code in paginated_stocks:
-            df = csv_manager.read_stock(code)
-            if not df.empty:
-                latest = df.iloc[0]
-                stock_list.append({
-                    'code': code,
-                    'name': _stock_display_name(code, stock_names),
-                    'board': _classify_board(code),
-                    'latest_price': round(latest['close'], 2),
-                    'latest_date': latest['date'].strftime('%Y-%m-%d'),
-                    'market_cap': round(latest.get('market_cap', 0) / 1e8, 2),  # 总市值，单位：亿
-                    'data_count': len(df)
-                })
+            row = _stock_table_row(code, stock_names)
+            if row['data_count']:
+                stock_list.append(row)
         
         return jsonify({
             'success': True, 
@@ -947,11 +1008,29 @@ def get_stocks():
         return jsonify({'success': False, 'error': str(e)})
 
 
+@app.route('/api/stocks/search')
+def search_stock_api():
+    """按代码、名称、拼音或首字母搜索股票。"""
+    try:
+        query = request.args.get('q', '')
+        limit = _safe_int_arg('limit', 20, minimum=1, maximum=50)
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        return jsonify({
+            'success': True,
+            'data': search_stocks(query, data_dir=data_dir, limit=limit),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
 @app.route('/api/stock/<code>')
 def get_stock_detail(code):
     """获取单只股票详情"""
     try:
         code = CSVManager.validate_stock_code(code)
+        stock_names = _load_stock_names()
+        stock_name = _stock_display_name(code, stock_names)
         df = csv_manager.read_stock(code)
         if df.empty:
             return jsonify({'success': False, 'error': '股票不存在'})
@@ -994,9 +1073,33 @@ def get_stock_detail(code):
                 'VIOLENT_K_Y': round(overlay_df.iloc[i]['VIOLENT_K_Y'], 2),
             })
         
-        return jsonify({'success': True, 'code': code, 'data': data})
+        return jsonify({'success': True, 'code': code, 'name': stock_name, 'data': data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/stock/<code>/export', methods=['POST'])
+def export_stock_csv(code):
+    """检查/更新/导出单只股票 CSV 到 Downloads。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        code = CSVManager.validate_stock_code(code)
+        payload = request.get_json(silent=True) or {}
+        mode = _normalize_csv_value(payload.get('mode')) or 'check'
+        if mode not in {'check', 'update', 'force'}:
+            return jsonify({'success': False, 'error': '不支持的导出模式'}), 400
+
+        service = _export_service()
+        result = service.export_stock(
+            code,
+            update_first=(mode == 'update'),
+            force_export=(mode == 'force'),
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/dashboard-pulse')
@@ -1465,6 +1568,101 @@ def get_update_job_status(job_id):
             'success': True,
             'data': _serialize_job(job),
         })
+
+
+@app.route('/api/watchlist', methods=['GET'])
+def get_watchlist():
+    """获取自选股列表。"""
+    try:
+        stock_names = _load_stock_names()
+        with watchlist_lock:
+            payload = _load_watchlist()
+            items = payload.get('items', {})
+
+        rows = []
+        for code, meta in sorted(items.items(), key=lambda entry: entry[1].get('created_at', '')):
+            try:
+                code = CSVManager.validate_stock_code(code)
+            except ValueError:
+                continue
+            row = _stock_table_row(code, stock_names)
+            row.update({
+                'note': str(meta.get('note') or ''),
+                'created_at': meta.get('created_at'),
+                'updated_at': meta.get('updated_at'),
+            })
+            rows.append(row)
+
+        return jsonify({'success': True, 'data': rows})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/watchlist', methods=['POST'])
+def add_watchlist_item():
+    """添加或更新自选股。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        payload = request.get_json(silent=True) or {}
+        query = str(payload.get('query') or payload.get('code') or '').strip()
+        note = str(payload.get('note') or '').strip()
+        if not query:
+            return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音首字母'}), 400
+
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        match = resolve_stock_query(query, data_dir=data_dir)
+        if not match:
+            return jsonify({'success': False, 'error': f'未找到匹配股票: {query}'}), 404
+
+        code = CSVManager.validate_stock_code(match['code'])
+        now = _job_timestamp()
+        with watchlist_lock:
+            watchlist = _load_watchlist()
+            items = watchlist.setdefault('items', {})
+            existing = items.get(code, {})
+            items[code] = {
+                'code': code,
+                'name': match.get('name') or fallback_stock_name(code),
+                'note': note if note else existing.get('note', ''),
+                'created_at': existing.get('created_at') or now,
+                'updated_at': now,
+            }
+            _save_watchlist(watchlist)
+
+        stock_names = _load_stock_names()
+        row = _stock_table_row(code, stock_names)
+        row.update({
+            'note': items[code].get('note', ''),
+            'created_at': items[code].get('created_at'),
+            'updated_at': items[code].get('updated_at'),
+        })
+        return jsonify({'success': True, 'data': row})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/watchlist/<code>', methods=['DELETE'])
+def remove_watchlist_item(code):
+    """移除自选股。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        code = CSVManager.validate_stock_code(code)
+        with watchlist_lock:
+            watchlist = _load_watchlist()
+            removed = watchlist.setdefault('items', {}).pop(code, None)
+            _save_watchlist(watchlist)
+        return jsonify({
+            'success': True,
+            'removed': bool(removed),
+            'code': code,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/config', methods=['GET'])

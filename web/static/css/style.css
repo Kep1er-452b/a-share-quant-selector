@@ -788,6 +788,34 @@ select {
     max-width: 280px;
 }
 
+.watchlist-actions,
+.modal-header-actions,
+.export-confirm-actions,
+.watchlist-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.watchlist-actions {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+}
+
+.watchlist-note-input {
+    max-width: 180px;
+}
+
+.watchlist-row-actions {
+    gap: 4px;
+}
+
+.watchlist-row-actions .btn {
+    min-height: 22px;
+    padding: 0 6px;
+    font-size: 9px;
+}
+
 .update-token-input {
     max-width: none;
 }
@@ -800,6 +828,7 @@ select {
 }
 
 #stocks-page .table-wrap,
+#watchlist-page .table-wrap,
 .results-panel-body {
     max-height: calc(100vh - 210px);
 }
@@ -850,6 +879,14 @@ select {
 
 .data-table tbody tr:hover td {
     background: var(--hover-green);
+}
+
+#watchlist-table {
+    min-width: 1180px;
+}
+
+#watchlist-table td:last-child {
+    overflow: visible;
 }
 
 .stable-scroll-table {
@@ -1526,6 +1563,10 @@ select {
     width: min(980px, 100%);
 }
 
+.export-confirm-box {
+    width: min(620px, 100%);
+}
+
 .modal-header {
     display: flex;
     align-items: center;
@@ -1551,6 +1592,36 @@ select {
     border: 1px solid var(--verydim);
     background: var(--bg-panel);
     color: var(--accent);
+}
+
+.stock-export-status {
+    display: none;
+    min-height: 28px;
+    padding: 6px 8px;
+    border: 1px solid var(--verydim);
+    color: var(--neutral);
+    background: var(--bg-input);
+    font-size: 10px;
+}
+
+.stock-export-status.active {
+    display: block;
+}
+
+.stock-export-status.success {
+    border-color: var(--up);
+    color: var(--up);
+}
+
+.stock-export-status.warning,
+.stock-export-status.info {
+    border-color: var(--gold);
+    color: var(--gold);
+}
+
+.stock-export-status.error {
+    border-color: var(--down);
+    color: var(--down);
 }
 
 .modal-body,
@@ -1586,11 +1657,16 @@ select {
 }
 
 .update-token-actions,
+.export-confirm-actions,
 .halt-confirm-actions {
     display: flex;
     align-items: center;
     gap: 8px;
     justify-content: flex-end;
+}
+
+.export-confirm-body {
+    gap: 14px;
 }
 
 .update-token-label,
