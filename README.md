@@ -27,6 +27,8 @@
 - 🎯 **B1完美图形匹配** - 基于10个历史成功案例的三维相似度匹配排序（双线+量比+形态）
 - 🥣 **智能分类** - 自动将选股结果分类为：回落碗中、靠近多空线、靠近短期趋势线
 - 📊 **K线图可视化** - 为每只入选股票生成K线图（含趋势线和成交量），发送到钉钉
+- 📤 **单股 CSV 导出** - 支持按代码、名称或拼音首字母查找股票，校验数据新鲜度后导出到 Downloads
+- ⭐ **Web 自选股** - Web 端提供自选股票页，本地持久保存常看的股票
 - 🔔 **自动通知** - 选股结果和K线图自动推送到钉钉群
 - 🌐 **Web管理** - 可视化查看股票数据、K线图、KDJ指标
 - 🔄 **智能更新** - 自动判断是否需要更新数据（3点前不更新，检查当天数据）
@@ -74,6 +76,11 @@ python3 main.py select --strategy BowlReboundStrategy --force-select
 
 # 12. 启动Web界面（默认 http://127.0.0.1:5080）
 python3 main.py web
+
+# 13. 导出单只股票 CSV 到 ~/Downloads
+python3 main.py export 300888
+python3 main.py export tqly --update-first
+python3 main.py export 天齐锂业 --force-export
 ```
 
 默认情况下，选股会使用“激进提速”模式：优先进程批处理，一次读取单只股票数据后复用给多个策略，适合 32G 内存机器跑几千只股票。若你想手动调整后端，可在 `config/config.yaml` 中加入：
@@ -89,6 +96,24 @@ selection:
 将 `backend` 改为 `thread` 或将 `mode` 改为 `sequential` 即可回退到更保守的执行方式。
 
 抓取和选股过程中，终端现在会显示百分比进度条与“已耗时”，方便你观察当前跑到哪一步。
+
+## 📤 单股 CSV 导出与自选股
+
+终端可用 `export` 命令导出单只股票 CSV：
+
+```bash
+python3 main.py export <股票代码/名称/拼音首字母>
+python3 main.py export tqly --update-first
+python3 main.py export 300888 --force-export
+```
+
+- 默认会先用 Tushare 判断本地 CSV 是否达到最新交易日。
+- 若数据不是最新，交互式终端会让你选择“先更新后导出”或“直接导出”。
+- `--update-first` 会先用默认 Tushare Token 单独补齐该股票，再导出。
+- `--force-export` 会忽略新鲜度，直接导出当前本地 CSV。
+- 导出文件固定放在 `/Users/chenxingyu/Downloads`，文件名格式为 `股票代码_股票名称.csv`。
+
+Web 端可在 F3 股票列表搜索代码、名称或拼音首字母，回车打开 K 线详情。K 线详情里有 `EXPORT CSV` 按钮，数据过期时会弹出“先更新后导出 / 直接导出”的选择。F6 是自选股票页，可添加、删除、查看 K 线并导出 CSV，自选列表保存在 `data/watchlist.json`。
 
 ## 📊 策略说明
 
@@ -206,6 +231,7 @@ EMA(EMA(CLOSE, 10), 10)
 │   ├── tushare_fetcher.py  # tushare 数据获取
 │   ├── data_provider.py    # 数据源工厂与公共工具
 │   ├── csv_manager.py      # CSV数据管理
+│   ├── stock_exporter.py   # 股票搜索与单股 CSV 导出
 │   ├── technical.py        # 技术指标(KDJ/EMA/MA等)
 │   ├── kline_chart.py      # K线图生成（标准版）
 │   ├── kline_chart_fast.py # K线图生成（快速版）

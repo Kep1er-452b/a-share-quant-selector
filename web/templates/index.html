@@ -93,6 +93,10 @@
                 <span class="nav-fn">F5</span>
                 <span class="nav-label">STRATEGIES</span>
             </li>
+            <li class="nav-item" data-page="watchlist">
+                <span class="nav-fn">F6</span>
+                <span class="nav-label">WATCHLIST</span>
+            </li>
         </ul>
         <div class="asset-tabs" aria-hidden="true">
             <span class="asset-tab active">EQ</span>
@@ -261,6 +265,45 @@
                             <tbody id="stocks-tbody">
                                 <tr>
                                     <td colspan="8" class="state-loading">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <section id="watchlist-page" class="page">
+                <div class="panel">
+                    <div class="panel-header panel-header-wrap">
+                        <div>
+                            <span class="panel-title">CUSTOM WATCHLIST</span>
+                            <div class="panel-subtitle" id="watchlist-total-label">自选股票，本地持久保存</div>
+                        </div>
+                        <div class="watchlist-actions">
+                            <input type="text" id="watchlist-query" class="search-input" placeholder="CODE / NAME / PINYIN">
+                            <input type="text" id="watchlist-note" class="search-input watchlist-note-input" placeholder="NOTE">
+                            <button class="btn btn-primary" id="watchlist-add-btn" type="button">ADD</button>
+                            <button class="btn btn-ghost" id="watchlist-refresh-btn" type="button">REFRESH</button>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table class="data-table stable-scroll-table" id="watchlist-table">
+                            <thead>
+                                <tr>
+                                    <th>代码</th>
+                                    <th>名称</th>
+                                    <th>板块</th>
+                                    <th>最新价</th>
+                                    <th>日期</th>
+                                    <th>市值(亿)</th>
+                                    <th>备注</th>
+                                    <th>加入时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="watchlist-tbody">
+                                <tr>
+                                    <td colspan="9" class="state-loading">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -560,11 +603,34 @@
                 <div class="modal-kicker">STOCK DETAIL</div>
                 <span class="modal-title" id="modal-title">--</span>
             </div>
-            <button class="modal-close" id="modal-close-btn" type="button">X</button>
+            <div class="modal-header-actions">
+                <button class="btn btn-secondary" id="stock-export-btn" type="button">EXPORT CSV</button>
+                <button class="modal-close" id="modal-close-btn" type="button">X</button>
+            </div>
         </div>
         <div class="modal-body">
+            <div id="stock-export-status"></div>
             <div id="stock-chart"></div>
             <div id="stock-info"></div>
+        </div>
+    </div>
+</div>
+
+<div id="export-confirm" class="modal-backdrop">
+    <div class="modal-box export-confirm-box">
+        <div class="modal-header">
+            <div>
+                <div class="modal-kicker">CSV EXPORT</div>
+                <span class="modal-title">本地数据不是最新</span>
+            </div>
+            <button class="modal-close" id="export-confirm-close-btn" type="button">X</button>
+        </div>
+        <div class="modal-body export-confirm-body">
+            <div class="modal-note" id="export-confirm-message">--</div>
+            <div class="export-confirm-actions">
+                <button class="btn btn-primary" id="export-update-first-btn" type="button">先更新后导出</button>
+                <button class="btn btn-secondary" id="export-force-btn" type="button">直接导出</button>
+            </div>
         </div>
     </div>
 </div>

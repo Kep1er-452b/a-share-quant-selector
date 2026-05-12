@@ -6,6 +6,7 @@ const PAGE_TITLES = {
     stocks: '股票列表',
     selection: '执行选股',
     strategies: '策略配置',
+    watchlist: '自选股票',
 };
 
 const BOARD_LABELS = {
@@ -21,6 +22,7 @@ const state = {
     allStocksCache: [],
     stocksLoaded: false,
     stocksLoadingPromise: null,
+    stockSearchTimer: null,
     strategies: [],
     boardOptions: [],
     boardCounts: {},
@@ -49,6 +51,10 @@ const state = {
     updateHasTushareToken: false,
     updateDefaultProvider: 'akshare',
     globalTickerText: '',
+    currentStockDetail: null,
+    pendingExportStock: null,
+    watchlistLoaded: false,
+    watchlistCache: [],
 };
 
 function escapeHtml(value) {
@@ -351,6 +357,36 @@ function queueStocksScrollReset() {
     window.setTimeout(scrollStocksToTop, 0);
 }
 
+function findCachedStock(code) {
+    return state.allStocksCache.find(stock => String(stock.code) === String(code));
+}
+
+function formatStockTitle(code, name) {
+    return `${code || '--'} ${name || ''}`.trim();
+}
+
+function setStockExportStatus(message = '', tone = '') {
+    const status = document.getElementById('stock-export-status');
+    if (!status) {
+        return;
+    }
+    status.textContent = message;
+    status.className = `stock-export-status${message ? ' active' : ''}${tone ? ` ${tone}` : ''}`;
+}
+
+function openExportConfirm(payload) {
+    state.pendingExportStock = payload || state.currentStockDetail;
+    const message = document.getElementById('export-confirm-message');
+    if (message) {
+        message.textContent = payload?.message || '本地 CSV 不是最新，请选择导出方式。';
+    }
+    document.getElementById('export-confirm').classList.add('active');
+}
+
+function closeExportConfirm() {
+    document.getElementById('export-confirm').classList.remove('active');
+}
+
 function startLocalProgressTimer(serverElapsed) {
     stopLocalProgressTimer();
     state.jobStartTime = Date.now();
@@ -485,6 +521,9 @@ function switchPage(page) {
     }
     if (page === 'strategies') {
         loadStrategies();
+    }
+    if (page === 'watchlist') {
+        loadWatchlist();
     }
 }
 
@@ -1278,12 +1317,88 @@ function renderStocks(stocks) {
     queueStocksScrollReset();
 }
 
+async function searchStocks(keyword, limit = 20) {
+    const result = await apiFetch(`/api/stocks/search?q=${encodeURIComponent(keyword)}&limit=${limit}`);
+    if (!result.success) {
+        throw new Error(result.error || '股票搜索失败');
+    }
+    return result.data || [];
+}
+
+async function applyStockSearch(keyword) {
+    const normalized = String(keyword || '').trim().toLowerCase();
+    if (!normalized) {
+        renderStocks(state.allStocksCache);
+        return;
+    }
+
+    let filtered = state.allStocksCache.filter(stock =>
+        String(stock.code).toLowerCase().includes(normalized) ||
+        String(stock.name || '').toLowerCase().includes(normalized)
+    );
+
+    try {
+        const searchResults = await searchStocks(normalized, 80);
+        const orderedCodes = searchResults.map(item => String(item.code));
+        const fromCache = orderedCodes
+            .map(code => findCachedStock(code))
+            .filter(Boolean);
+        const cacheCodes = new Set(filtered.map(item => String(item.code)));
+        fromCache.forEach(item => {
+            if (!cacheCodes.has(String(item.code))) {
+                filtered.push(item);
+            }
+        });
+        filtered = filtered.sort((a, b) => {
+            const aIndex = orderedCodes.indexOf(String(a.code));
+            const bIndex = orderedCodes.indexOf(String(b.code));
+            if (aIndex === -1 && bIndex === -1) {
+                return String(a.code).localeCompare(String(b.code));
+            }
+            if (aIndex === -1) return 1;
+            if (bIndex === -1) return -1;
+            return aIndex - bIndex;
+        });
+    } catch (error) {
+        console.warn('stock search failed:', error);
+    }
+
+    renderStocks(filtered);
+}
+
+async function openStockByQuery(query) {
+    const keyword = String(query || '').trim();
+    if (!keyword) {
+        setCommandOutput('INPUT REQUIRED', 'error');
+        return;
+    }
+    try {
+        let match = null;
+        if (/^\d{6}$/.test(keyword)) {
+            match = findCachedStock(keyword) || { code: keyword, name: '' };
+        } else {
+            const results = await searchStocks(keyword, 1);
+            match = results[0] || null;
+        }
+        if (!match) {
+            throw new Error(`未找到匹配股票: ${keyword}`);
+        }
+        setCommandOutput(`LOADING ${match.code}`, 'info');
+        viewStockDetail(match.code, match.name || '');
+    } catch (error) {
+        setCommandOutput(error.message, 'error');
+        toast(error.message, 'error');
+    }
+}
+
 async function viewStockDetail(code, name) {
     if (state.systemHalted) {
         return;
     }
 
-    document.getElementById('modal-title').textContent = `${code} ${name || ''}`.trim();
+    state.currentStockDetail = { code, name: name || '' };
+    document.getElementById('modal-title').textContent = formatStockTitle(code, name);
+    setStockExportStatus('');
     document.getElementById('stock-info').innerHTML = '<div class="state-loading">加载个股详情...</div>';
     document.getElementById('stock-modal').classList.add('active');
 
@@ -1292,6 +1407,9 @@ async function viewStockDetail(code, name) {
         if (!result.success) {
             throw new Error(result.error || '个股详情加载失败');
         }
+        const resolvedName = result.name || name || findCachedStock(code)?.name || '';
+        state.currentStockDetail = { code: result.code || code, name: resolvedName };
+        document.getElementById('modal-title').textContent = formatStockTitle(result.code || code, resolvedName);
         renderStockChart(result.data || []);
     } catch (error) {
         if (error.name === 'AbortError' && state.systemHalted) {
@@ -1722,8 +1840,65 @@ function renderStockChart(data) {
     `;
 }
 
+async function exportCurrentStock(mode = 'check') {
+    if (state.systemHalted) {
+        toast('系统已急停，无法导出 CSV', 'error');
+        return;
+    }
+    const stock = state.currentStockDetail || state.pendingExportStock;
+    if (!stock || !stock.code) {
+        toast('当前没有打开的股票', 'error');
+        return;
+    }
+
+    const exportButton = document.getElementById('stock-export-btn');
+    const updateButton = document.getElementById('export-update-first-btn');
+    const forceButton = document.getElementById('export-force-btn');
+    [exportButton, updateButton, forceButton].forEach(button => {
+        if (button) {
+            button.disabled = true;
+        }
+    });
+    setStockExportStatus(mode === 'update' ? '正在用 Tushare 更新并导出...' : '正在检查并导出 CSV...', 'info');
+
+    try {
+        const result = await apiFetch(`/api/stock/${encodeURIComponent(stock.code)}/export`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ mode }),
+        });
+
+        if (result.needs_update) {
+            setStockExportStatus(result.message || '本地数据不是最新，请选择导出方式。', 'warning');
+            openExportConfirm({
+                ...stock,
+                message: result.message,
+                freshness: result.freshness,
+            });
+            return;
+        }
+
+        closeExportConfirm();
+        setStockExportStatus(result.message || 'CSV 已导出', 'success');
+        toast(result.message || 'CSV 已导出', 'success', 4200);
+    } catch (error) {
+        setStockExportStatus(`导出失败: ${error.message}`, 'error');
+        toast(`导出失败: ${error.message}`, 'error');
+    } finally {
+        [exportButton, updateButton, forceButton].forEach(button => {
+            if (button) {
+                button.disabled = false;
+            }
+        });
+    }
+}
+
 function closeModal() {
     document.getElementById('stock-modal').classList.remove('active');
+    setStockExportStatus('');
+    closeExportConfirm();
     if (state.chartInstance) {
         if (typeof state.chartInstance.dispose === 'function') {
             state.chartInstance.dispose();
@@ -1736,6 +1911,144 @@ function closeModal() {
 
 function closeIndustryModal() {
     document.getElementById('industry-modal').classList.remove('active');
+}
+
+function formatWatchlistDate(value) {
+    if (!value) {
+        return '--';
+    }
+    return String(value).replace(' ', '<br>');
+}
+
+function renderWatchlist(items) {
+    const tbody = document.getElementById('watchlist-tbody');
+    const totalLabel = document.getElementById('watchlist-total-label');
+    if (totalLabel) {
+        totalLabel.textContent = `已添加 ${formatNumber(items.length)} 只自选股票`;
+    }
+    if (!items.length) {
+        tbody.innerHTML = '<tr><td colspan="9" class="state-empty">暂无自选股，可输入代码、名称或拼音首字母添加。</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = items.map(stock => `
+        <tr>
+            <td class="code-cell">${escapeHtml(stock.code)}</td>
+            <td>${escapeHtml(stock.name || '未知')}</td>
+            <td>${boardBadge(stock.board || stock.code)}</td>
+            <td class="mono">${escapeHtml(stock.latest_price ?? '--')}</td>
+            <td class="mono">${escapeHtml(stock.latest_date ?? '--')}</td>
+            <td class="mono">${escapeHtml(stock.market_cap ?? '--')}</td>
+            <td>${escapeHtml(stock.note || '--')}</td>
+            <td class="mono">${formatWatchlistDate(escapeHtml(stock.created_at || '--'))}</td>
+            <td>
+                <div class="watchlist-row-actions">
+                    <button class="btn btn-ghost view-detail-btn" type="button"
+                        data-code="${escapeHtml(stock.code)}"
+                        data-name="${escapeHtml(stock.name || '')}">
+                        K线
+                    </button>
+                    <button class="btn btn-secondary export-watchlist-btn" type="button"
+                        data-code="${escapeHtml(stock.code)}"
+                        data-name="${escapeHtml(stock.name || '')}">
+                        导出
+                    </button>
+                    <button class="btn btn-danger remove-watchlist-btn" type="button"
+                        data-code="${escapeHtml(stock.code)}">
+                        删除
+                    </button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function filterWatchlist(keyword) {
+    const normalized = String(keyword || '').trim().toLowerCase();
+    if (!normalized) {
+        renderWatchlist(state.watchlistCache);
+        return;
+    }
+    renderWatchlist(state.watchlistCache.filter(stock =>
+        String(stock.code).toLowerCase().includes(normalized) ||
+        String(stock.name || '').toLowerCase().includes(normalized) ||
+        String(stock.note || '').toLowerCase().includes(normalized)
+    ));
+}
+
+async function loadWatchlist(forceReload = false) {
+    if (state.systemHalted) {
+        return;
+    }
+    if (state.watchlistLoaded && !forceReload) {
+        filterWatchlist(document.getElementById('watchlist-query')?.value || '');
+        return;
+    }
+
+    const tbody = document.getElementById('watchlist-tbody');
+    tbody.innerHTML = '<tr><td colspan="9" class="state-loading">正在加载自选股...</td></tr>';
+    try {
+        const result = await apiFetch('/api/watchlist');
+        if (!result.success) {
+            throw new Error(result.error || '自选股加载失败');
+        }
+        state.watchlistCache = result.data || [];
+        state.watchlistLoaded = true;
+        filterWatchlist(document.getElementById('watchlist-query')?.value || '');
+    } catch (error) {
+        tbody.innerHTML = `<tr><td colspan="9" class="state-empty">加载失败: ${escapeHtml(error.message)}</td></tr>`;
+    }
+}
+
+async function addWatchlistItem() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法添加自选股', 'error');
+        return;
+    }
+    const queryInput = document.getElementById('watchlist-query');
+    const noteInput = document.getElementById('watchlist-note');
+    const query = queryInput.value.trim();
+    const note = noteInput.value.trim();
+    if (!query) {
+        toast('请输入股票代码、名称或拼音首字母', 'error');
+        return;
+    }
+
+    try {
+        const result = await apiFetch('/api/watchlist', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ query, note }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '添加失败');
+        }
+        queryInput.value = '';
+        noteInput.value = '';
+        state.watchlistLoaded = false;
+        await loadWatchlist(true);
+        toast(`已加入自选: ${result.data.code} ${result.data.name || ''}`.trim(), 'success');
+    } catch (error) {
+        toast(`添加失败: ${error.message}`, 'error');
+    }
+}
+
+async function removeWatchlistItem(code) {
+    try {
+        const result = await apiFetch(`/api/watchlist/${encodeURIComponent(code)}`, {
+            method: 'DELETE',
+        });
+        if (!result.success) {
+            throw new Error(result.error || '删除失败');
+        }
+        state.watchlistLoaded = false;
+        await loadWatchlist(true);
+        toast(`已移除自选: ${code}`, 'success');
+    } catch (error) {
+        toast(`删除失败: ${error.message}`, 'error');
+    }
 }
 
 function openIndustryModal(group) {
@@ -2773,6 +3086,10 @@ function runTerminalCommand() {
         switchPage('strategies');
         return;
     }
+    if (command === 'F6' || command === 'WATCH' || command === 'WATCHLIST' || command === 'ZX') {
+        switchPage('watchlist');
+        return;
+    }
     if (command === 'UPDATE') {
         openUpdateModal();
         return;
@@ -2785,13 +3102,7 @@ function runTerminalCommand() {
         openShutdownConfirm();
         return;
     }
-    if (/^\d{6}$/.test(command)) {
-        setCommandOutput(`LOADING ${command}`, 'info');
-        viewStockDetail(command, '');
-        return;
-    }
-
-    setCommandOutput(`UNKNOWN CMD ${command}`, 'error');
+    openStockByQuery(raw);
 }
 
 function bindEvents() {
@@ -2804,17 +3115,17 @@ function bindEvents() {
     });
 
     document.getElementById('stock-search').addEventListener('input', event => {
-        const keyword = event.target.value.trim().toLowerCase();
-        if (!keyword) {
-            renderStocks(state.allStocksCache);
-            return;
+        const keyword = event.target.value.trim();
+        window.clearTimeout(state.stockSearchTimer);
+        state.stockSearchTimer = window.setTimeout(() => {
+            applyStockSearch(keyword);
+        }, 160);
+    });
+    document.getElementById('stock-search').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            openStockByQuery(event.target.value);
         }
-
-        const filtered = state.allStocksCache.filter(stock =>
-            String(stock.code).toLowerCase().includes(keyword) ||
-            String(stock.name || '').toLowerCase().includes(keyword)
-        );
-        renderStocks(filtered);
     });
 
     document.getElementById('stocks-tbody').addEventListener('click', event => {
@@ -2831,6 +3142,27 @@ function bindEvents() {
             return;
         }
         viewStockDetail(button.dataset.code, button.dataset.name);
+    });
+
+    document.getElementById('watchlist-tbody').addEventListener('click', event => {
+        const detailButton = event.target.closest('.view-detail-btn');
+        if (detailButton) {
+            viewStockDetail(detailButton.dataset.code, detailButton.dataset.name);
+            return;
+        }
+        const exportButton = event.target.closest('.export-watchlist-btn');
+        if (exportButton) {
+            state.currentStockDetail = {
+                code: exportButton.dataset.code,
+                name: exportButton.dataset.name || '',
+            };
+            exportCurrentStock('check');
+            return;
+        }
+        const removeButton = event.target.closest('.remove-watchlist-btn');
+        if (removeButton) {
+            removeWatchlistItem(removeButton.dataset.code);
+        }
     });
 
     document.getElementById('board-filter').addEventListener('change', updateSelectionSnapshot);
@@ -2863,6 +3195,21 @@ function bindEvents() {
         loadDashboardIndexKline(button.dataset.symbol);
     });
     document.getElementById('refresh-selection-options-btn').addEventListener('click', () => loadSelectionOptions(true));
+    document.getElementById('watchlist-add-btn').addEventListener('click', addWatchlistItem);
+    document.getElementById('watchlist-refresh-btn').addEventListener('click', () => loadWatchlist(true));
+    document.getElementById('watchlist-query').addEventListener('input', event => filterWatchlist(event.target.value));
+    document.getElementById('watchlist-query').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            addWatchlistItem();
+        }
+    });
+    document.getElementById('watchlist-note').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            addWatchlistItem();
+        }
+    });
     document.getElementById('save-config-btn').addEventListener('click', saveConfig);
     document.getElementById('refresh-heatmap-btn').addEventListener('click', () => loadHeatmap(true));
     document.getElementById('heatmap-fullscreen-btn').addEventListener('click', toggleHeatmapFullscreen);
@@ -2925,6 +3272,15 @@ function bindEvents() {
         }
     });
     document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+    document.getElementById('stock-export-btn').addEventListener('click', () => exportCurrentStock('check'));
+    document.getElementById('export-confirm-close-btn').addEventListener('click', closeExportConfirm);
+    document.getElementById('export-update-first-btn').addEventListener('click', () => exportCurrentStock('update'));
+    document.getElementById('export-force-btn').addEventListener('click', () => exportCurrentStock('force'));
+    document.getElementById('export-confirm').addEventListener('click', event => {
+        if (event.target.id === 'export-confirm') {
+            closeExportConfirm();
+        }
+    });
 
     document.getElementById('industry-modal').addEventListener('click', event => {
         if (event.target.id === 'industry-modal') {
