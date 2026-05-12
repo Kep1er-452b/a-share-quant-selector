@@ -26,10 +26,25 @@
     </div>
 </div>
 
+<div id="shutdown-confirm" class="halt-confirm">
+    <div class="halt-confirm-box">
+        <div class="halt-confirm-label">SYSTEM EXIT</div>
+        <div class="halt-confirm-title">确认退出系统</div>
+        <p class="halt-confirm-body">
+            退出会关闭当前 Web 服务进程。<br>
+            关闭后浏览器页面将断开连接，下次使用需要重新启动 Web。
+        </p>
+        <div class="halt-confirm-actions">
+            <button class="btn btn-danger" id="confirm-shutdown-btn" type="button">确认退出</button>
+            <button class="btn btn-ghost" id="cancel-shutdown-btn" type="button">取消</button>
+        </div>
+    </div>
+</div>
+
 <div id="halt-overlay" class="halt-overlay">
     <div class="halt-overlay-content">
-        <div class="halt-overlay-mark">HALTED</div>
-        <div class="halt-overlay-title">SYSTEM HALTED</div>
+        <div class="halt-overlay-mark" id="halt-overlay-mark">HALTED</div>
+        <div class="halt-overlay-title" id="halt-overlay-title">SYSTEM HALTED</div>
         <p class="halt-overlay-sub" id="halt-overlay-sub">
             全部 Web 功能已停止。重启服务器后方可恢复。
         </p>
@@ -441,6 +456,7 @@
         <input class="command-input" id="terminal-command-input" type="text" autocomplete="off" placeholder="ENTER FUNCTION CODE OR TICKER&lt;GO&gt;">
         <button class="btn btn-primary command-go" id="terminal-command-go" type="button">GO</button>
         <button class="btn btn-secondary" id="update-data-btn" type="button">UPDATE</button>
+        <button class="btn btn-secondary" id="shutdown-btn" type="button">EXIT</button>
         <button class="btn btn-danger halt-btn" id="halt-btn" type="button">
             <span class="halt-btn-dot"></span>
             <span>HALT</span>

@@ -7,9 +7,10 @@ import sys
 import socket
 import os
 import secrets
+import signal
 import time
 import uuid
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, Timer
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -47,6 +48,7 @@ app = Flask(__name__,
 # 全局实例
 csv_manager = CSVManager("data")
 halt_event = Event()
+shutdown_event = Event()
 WEB_SESSION_TOKEN = secrets.token_urlsafe(32)
 selection_jobs = {}
 selection_jobs_lock = Lock()
@@ -587,6 +589,7 @@ def block_requests_after_halt():
         'static',
         'get_system_status',
         'emergency_stop',
+        'system_shutdown',
         'get_selection_job_status',
         'get_update_job_status',
     }
@@ -1512,6 +1515,7 @@ def get_system_status():
     return jsonify({
         'success': True,
         'halted': _is_halted(),
+        'shutdown_requested': shutdown_event.is_set(),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     })
 
@@ -1525,6 +1529,27 @@ def emergency_stop():
         'halted': True,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'message': '系统已急停，重启服务器后方可恢复'
+    })
+
+
+def _terminate_current_process():
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+@app.route('/api/system_shutdown', methods=['POST'])
+def system_shutdown():
+    """关闭当前 Web 服务进程。"""
+    halt_event.set()
+    shutdown_event.set()
+    timer = Timer(0.8, _terminate_current_process)
+    timer.daemon = True
+    timer.start()
+    return jsonify({
+        'success': True,
+        'halted': True,
+        'shutdown_requested': True,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'message': '系统正在退出，Web 服务进程即将关闭'
     })
 
 
