@@ -3,6 +3,7 @@ CSV 数据管理工具
 """
 import os
 import re
+import tempfile
 import pandas as pd
 from pathlib import Path
 
@@ -86,7 +87,7 @@ class CSVManager:
         return result
     
     def write_stock(self, stock_code, df):
-        """写入股票数据（自动去重排序）"""
+        """写入股票数据（自动去重排序，原子写入）"""
         path = self.get_stock_path(stock_code)
         df = self._validate_stock_dataframe(df)
         
@@ -99,8 +100,18 @@ class CSVManager:
         # 确保目录存在
         path.parent.mkdir(parents=True, exist_ok=True)
         
-        # 写入CSV
-        df.to_csv(path, index=False)
+        # 原子写入：先写临时文件，再 os.replace
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix='.csv', prefix=f'{stock_code}_', dir=str(path.parent)
+        )
+        try:
+            os.close(tmp_fd)
+            df.to_csv(tmp_path, index=False)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
         return path
 
     @staticmethod
@@ -129,7 +140,7 @@ class CSVManager:
             current_values = result[column]
             invalid_mask = current_values.isna() | (current_values <= 0)
             if invalid_mask.any():
-                result.loc[invalid_mask, column] = fallback_values[invalid_mask].values
+                result.loc[invalid_mask, column] = fallback_values.loc[invalid_mask]
 
         return result
     

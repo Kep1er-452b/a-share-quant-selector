@@ -3,6 +3,7 @@
 """
 import importlib
 import sys
+import threading
 from pathlib import Path
 import yaml
 
@@ -184,10 +185,13 @@ class StrategyRegistry:
 
 # 全局注册器实例
 _registry = None
+_registry_lock = threading.Lock()
 
 def get_registry(params_file="config/strategy_params.yaml"):
     """获取全局策略注册器"""
     global _registry
     if _registry is None:
-        _registry = StrategyRegistry(params_file)
+        with _registry_lock:
+            if _registry is None:
+                _registry = StrategyRegistry(params_file)
     return _registry

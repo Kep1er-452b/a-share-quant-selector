@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
 from utils.technical import MA, LLV, HHV, REF, SMA, KDJ, COUNT, SUM
+from utils.strategy_labels import is_invalid_stock_name
 
 
 class B1V242BStrategy(BaseStrategy):
@@ -144,12 +145,8 @@ class B1V242BStrategy(BaseStrategy):
         if df.empty:
             return []
 
-        if stock_name:
-            invalid_keywords = ['退', '未知', '退市', '已退']
-            if any(kw in stock_name for kw in invalid_keywords):
-                return []
-            if stock_name.startswith('ST') or stock_name.startswith('*ST'):
-                return []
+        if stock_name and is_invalid_stock_name(stock_name):
+            return []
 
         latest = df.iloc[0]
         if latest.get("volume", 0) <= 0 or pd.isna(latest.get("close")):

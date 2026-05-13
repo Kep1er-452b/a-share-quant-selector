@@ -670,7 +670,7 @@ class AKShareFetcher(BaseDataProvider):
     def fetch_stock_update(self, stock_code, days=10):
         """
         抓取近期数据用于增量更新
-        优化：直接指定天数，避免计算误差
+        market_cap 由调用方通过 _apply_market_cap_override 批量注入，此处不再逐股请求。
         """
         try:
             import requests
@@ -727,9 +727,9 @@ class AKShareFetcher(BaseDataProvider):
                 if records:
                     df = pd.DataFrame(records)
                     df['date'] = pd.to_datetime(df['date'])
-                    # 从实时数据获取总市值
-                    market_cap = self._get_realtime_market_cap(stock_code)
-                    df['market_cap'] = market_cap if market_cap else 0
+                    df['amount'] = 0
+                    df['turnover'] = 0
+                    df['market_cap'] = 0
                     df = df.sort_values('date', ascending=False)
                     return self._mark_data_source(df, 'tencent:fqkline:update')
             

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
 from utils.technical import COUNT, EMA, HHV, LLV, MA, REF, SUM, KDJ
+from utils.strategy_labels import is_invalid_stock_name
 
 
 class B2BetaStrategy(BaseStrategy):
@@ -71,7 +72,7 @@ class B2BetaStrategy(BaseStrategy):
         mv_min = self.params["MV_MIN_BILLION"] * 1e8
         market_cap = pd.to_numeric(result.get("market_cap", 0), errors="coerce").fillna(0)
         result["MV"] = market_cap / 1e8
-        result["MVOK"] = True if mv_min <= 0 else market_cap >= mv_min
+        result["MVOK"] = market_cap >= max(mv_min, 1e8)
 
         top_window = self.params["TOP_RANGE_WINDOW"]
         result["VAR_O85"] = LLV(result["open"], top_window) + self.params["TOP_RANGE_RATIO"] * (
@@ -132,12 +133,8 @@ class B2BetaStrategy(BaseStrategy):
         if df.empty:
             return []
 
-        if stock_name:
-            invalid_keywords = ['退', '未知', '退市', '已退']
-            if any(kw in stock_name for kw in invalid_keywords):
-                return []
-            if stock_name.startswith('ST') or stock_name.startswith('*ST'):
-                return []
+        if stock_name and is_invalid_stock_name(stock_name):
+            return []
 
         latest = df.iloc[0]
         if latest.get("volume", 0) <= 0 or pd.isna(latest.get("close")):

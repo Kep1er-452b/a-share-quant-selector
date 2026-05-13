@@ -2502,6 +2502,7 @@ function renderSelectionResults(results, time, meta = {}) {
     const selectedBoards = meta.boards || getSelectedBoards();
     const selectedStrategies = meta.strategies || getSelectedStrategies();
     const stockPoolSize = meta.stock_pool_size || 0;
+    const reportPath = meta.selection_report_path || '';
 
     let totalCount = 0;
     strategies.forEach(name => {
@@ -2545,6 +2546,9 @@ function renderSelectionResults(results, time, meta = {}) {
             </div>
         </div>
     `;
+    if (reportPath) {
+        html += `<div class="state-empty">选股记录已保存: ${escapeHtml(reportPath)}</div>`;
+    }
 
     strategies.forEach(strategyName => {
         const signals = results[strategyName] || [];
@@ -2729,8 +2733,9 @@ async function pollSelectionJobStatus() {
                 boards: job.boards || getSelectedBoards(),
                 strategies: job.strategies || getSelectedStrategies(),
                 stock_pool_size: job.total_candidates || 0,
+                selection_report_path: job.selection_report_path || '',
             });
-            toast('选股执行完成', 'success');
+            toast(job.selection_report_path ? '选股执行完成，Markdown 已保存' : '选股执行完成', 'success');
             return;
         }
 

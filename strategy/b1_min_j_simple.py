@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
 from utils.technical import KDJ, REF, SUM, calculate_zhixing_trend
+from utils.strategy_labels import is_invalid_stock_name
 
 
 def calculate_min_j(df, j_valley_max=55, long_offset=10) -> pd.Series:
@@ -41,17 +42,29 @@ def calculate_min_j(df, j_valley_max=55, long_offset=10) -> pd.Series:
 
     sum_j_short = SUM(result["J_MASK"], 28)
     count_short = SUM(result["C_MASK"], 28)
-    val_short = sum_j_short / count_short.clip(lower=1)
 
     sum_j_mid = SUM(result["J_MASK"], 57)
     count_mid = SUM(result["C_MASK"], 57)
-    val_mid = sum_j_mid / count_mid.clip(lower=1)
 
     sum_j_long = SUM(result["J_MASK"], 114)
     count_long = SUM(result["C_MASK"], 114)
-    val_long = (sum_j_long / count_long.clip(lower=1)) + long_offset
 
-    min_j = (val_short + val_mid + val_long) / 3.0
+    vals = []
+    if (count_short > 0).any():
+        val_short = sum_j_short / count_short.clip(lower=1)
+        vals.append(val_short)
+    if (count_mid > 0).any():
+        val_mid = sum_j_mid / count_mid.clip(lower=1)
+        vals.append(val_mid)
+    if (count_long > 0).any():
+        val_long = (sum_j_long / count_long.clip(lower=1)) + long_offset
+        vals.append(val_long)
+
+    if vals:
+        min_j = sum(vals) / len(vals)
+    else:
+        min_j = pd.Series([30.0] * len(df), index=df.index)
+
     return min_j.set_axis(df.index)
 
 
@@ -106,12 +119,8 @@ class B1MinJSimpleStrategy(BaseStrategy):
         if len(df) < self.params["MIN_HISTORY_DAYS"]:
             return []
 
-        if stock_name:
-            invalid_keywords = ['退', '未知', '退市', '已退']
-            if any(kw in stock_name for kw in invalid_keywords):
-                return []
-            if stock_name.startswith('ST') or stock_name.startswith('*ST'):
-                return []
+        if stock_name and is_invalid_stock_name(stock_name):
+            return []
 
         latest = df.iloc[0]
         if latest.get("volume", 0) <= 0 or pd.isna(latest.get("close")):

@@ -6,6 +6,7 @@ import json
 import sys
 import socket
 import os
+import re
 import secrets
 import signal
 import time
@@ -333,6 +334,91 @@ def _load_stock_names():
         return json.load(f)
 
 
+def _markdown_escape(value):
+    text = str(value if value is not None else "--")
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def _signal_extra_metric(signal):
+    if signal.get('volume_ratio') is not None:
+        return f"量比 {signal.get('volume_ratio')}x"
+    if signal.get('yangyin_ratio_57') is not None:
+        return f"57阳阴比 {signal.get('yangyin_ratio_57')}"
+    if signal.get('yangyin_ratio_14') is not None:
+        return f"14阳阴比 {signal.get('yangyin_ratio_14')}"
+    if signal.get('hm_short') is not None and signal.get('hm_long') is not None:
+        return f"短/长线 {signal.get('hm_short')}/{signal.get('hm_long')}"
+    if signal.get('wl') is not None and signal.get('yl') is not None:
+        return f"WL/YL {signal.get('wl')}/{signal.get('yl')}"
+    return "--"
+
+
+def _build_selection_markdown(results, time_text, meta=None):
+    meta = meta or {}
+    strategies = meta.get('strategies') or list(results.keys())
+    boards = meta.get('boards') or []
+    total_count = sum(len(results.get(strategy_name, [])) for strategy_name in strategies)
+    board_text = " / ".join(BOARD_LABELS.get(board, board) for board in boards) or "全部"
+
+    lines = [
+        "# 选股内容",
+        "",
+        f"- 时间: {time_text or _job_timestamp()}",
+        f"- 命中信号: {total_count}",
+        f"- 策略数量: {len(strategies)}",
+        f"- 股票池: {meta.get('stock_pool_size', 0)}",
+        f"- 板块: {board_text}",
+        "",
+    ]
+
+    if not total_count:
+        lines.extend(["本次执行未筛出符合条件的股票。", ""])
+
+    for strategy_name in strategies:
+        signals = results.get(strategy_name, [])
+        lines.extend([
+            f"## {strategy_name}",
+            "",
+            f"命中 {len(signals)} 只",
+            "",
+        ])
+        if not signals:
+            lines.extend(["当前策略在本次筛选条件下没有命中信号。", ""])
+            continue
+
+        lines.append("| 代码 | 名称 | 板块 | 现价 | J值 | 市值(亿) | 补充指标 | 触发条件 |")
+        lines.append("| --- | --- | --- | ---: | ---: | ---: | --- | --- |")
+        for item in signals:
+            signal = (item.get('signals') or [{}])[0] if isinstance(item.get('signals'), list) else {}
+            reasons = signal.get('reasons') or ["MATCH"]
+            reason_text = "、".join(str(reason) for reason in reasons)
+            lines.append(
+                "| "
+                f"{_markdown_escape(item.get('code'))} | "
+                f"{_markdown_escape(item.get('name') or '未知')} | "
+                f"{_markdown_escape(BOARD_LABELS.get(_classify_board(item.get('code')), _classify_board(item.get('code'))))} | "
+                f"{_markdown_escape(signal.get('close'))} | "
+                f"{_markdown_escape(signal.get('J'))} | "
+                f"{_markdown_escape(signal.get('market_cap'))} | "
+                f"{_markdown_escape(_signal_extra_metric(signal))} | "
+                f"{_markdown_escape(reason_text)} |"
+            )
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _save_selection_markdown(results, time_text, meta=None):
+    output_dir = project_root / "stock-selected"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", f"{timestamp}-选股内容").strip("-")
+    output_path = output_dir / f"{filename}.md"
+    content = _build_selection_markdown(results, time_text, meta=meta)
+    output_path.write_text(content, encoding="utf-8")
+    return str(output_path)
+
+
 def _watchlist_path():
     return Path(csv_manager.data_dir) / 'watchlist.json'
 
@@ -638,6 +724,7 @@ def _create_selection_job(requested_boards, requested_strategies):
         'current_stock': None,
         'results': None,
         'result_time': None,
+        'selection_report_path': None,
         'error': None,
         'logs': [],
     }
@@ -783,19 +870,33 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
         for strategy_name in results:
             results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
 
+        result_time = _job_timestamp()
+        report_meta = {
+            'boards': requested_boards,
+            'strategies': requested_strategies,
+            'stock_pool_size': len(candidates),
+            'invalid_name_count': invalid_name_count,
+            'valid_stock_count': valid_total_count,
+            'skipped_stock_count': skipped_count,
+            'backend': backend,
+        }
+        report_path = _save_selection_markdown(results, result_time, report_meta)
+
         _update_job(
             job_id,
             status='completed',
             progress_pct=100,
             completed_candidates=len(candidates),
             results=results,
-            result_time=_job_timestamp(),
+            result_time=result_time,
+            selection_report_path=report_path,
             current_stock=None,
         )
         _append_job_log_by_id(
             job_id,
             f"执行完成，共命中 {sum(len(items) for items in results.values())} 条信号。"
         )
+        _append_job_log_by_id(job_id, f"选股记录已保存: {report_path}")
     except Exception as exc:
         _update_job(
             job_id,
@@ -1220,6 +1321,18 @@ def run_selection():
         for strategy_name in results:
             results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
 
+        result_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        meta = {
+            'boards': requested_boards,
+            'strategies': requested_strategies,
+            'stock_pool_size': len(candidates),
+            'invalid_name_count': invalid_name_count,
+            'valid_stock_count': valid_total_count,
+            'skipped_stock_count': skipped_count,
+            'backend': backend,
+        }
+        report_path = _save_selection_markdown(results, result_time, meta)
+
         print(
             f"[web] 选股完成: valid={valid_total_count}, skipped={skipped_count}, "
             f"invalid_name={invalid_name_count}, "
@@ -1230,16 +1343,9 @@ def run_selection():
         return jsonify({
             'success': True,
             'data': results,
-            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'meta': {
-                'boards': requested_boards,
-                'strategies': requested_strategies,
-                'stock_pool_size': len(candidates),
-                'invalid_name_count': invalid_name_count,
-                'valid_stock_count': valid_total_count,
-                'skipped_stock_count': skipped_count,
-                'backend': backend,
-            }
+            'time': result_time,
+            'selection_report_path': report_path,
+            'meta': meta,
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})

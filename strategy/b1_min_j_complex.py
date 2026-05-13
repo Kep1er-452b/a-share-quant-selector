@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.base_strategy import BaseStrategy
 from strategy.b1_min_j_simple import calculate_min_j
 from utils.technical import COUNT, HHV, KDJ, LLV, MA, REF, SMA, SUM
+from utils.strategy_labels import is_invalid_stock_name
 
 
 class B1MinJComplexStrategy(BaseStrategy):
@@ -157,12 +158,8 @@ class B1MinJComplexStrategy(BaseStrategy):
         if len(df) < self.params["MIN_HISTORY_DAYS"]:
             return []
 
-        if stock_name:
-            invalid_keywords = ['退', '未知', '退市', '已退']
-            if any(kw in stock_name for kw in invalid_keywords):
-                return []
-            if stock_name.startswith('ST') or stock_name.startswith('*ST'):
-                return []
+        if stock_name and is_invalid_stock_name(stock_name):
+            return []
 
         latest = df.iloc[0]
         if latest.get("volume", 0) <= 0 or pd.isna(latest.get("close")):
