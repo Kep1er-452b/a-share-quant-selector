@@ -101,8 +101,9 @@ def COUNT(cond, n):
 def SUM(series, n):
     """
     N周期求和 - 正确处理倒序排列的数据
+    调用方应保证传入的 series 已是数值类型。
     """
-    reversed_series = pd.to_numeric(series, errors='coerce').fillna(0).iloc[::-1]
+    reversed_series = series.iloc[::-1]
     sum_reversed = reversed_series.rolling(window=n, min_periods=1).sum()
     return sum_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
 
@@ -310,6 +311,7 @@ def calculate_zhixing_main_overlay(df):
     low = pd.to_numeric(df_calc['low'], errors='coerce')
     volume = pd.to_numeric(df_calc['volume'], errors='coerce').fillna(0)
 
+    # df_calc 已转为正序，直接用 ewm/rolling 计算，与 calculate_zhixing_trend 公式一致
     short_line = close.ewm(span=10, adjust=False, min_periods=1).mean().ewm(span=10, adjust=False, min_periods=1).mean()
     bull_bear_line = (
         close.rolling(window=14, min_periods=1).mean() +

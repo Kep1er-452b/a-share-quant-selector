@@ -9,6 +9,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,11 @@ class TushareFetcher(BaseDataProvider):
         self.daily_basic_calls = deque()
         self.daily_basic_limit_per_minute = 180
         self.daily_basic_rate_limit_wait = 62
+        self.daily_basic_lock = Lock()
+        self.pro_bar_calls = deque()
+        self.pro_bar_limit_per_minute = 360
+        self.pro_bar_rate_limit_wait = 62
+        self.pro_bar_lock = Lock()
         self.daily_basic_by_date_cache = {}
         self.daily_basic_by_date_failures = set()
         self.daily_basic_date_cache_max_days = 40
@@ -315,31 +321,71 @@ class TushareFetcher(BaseDataProvider):
         rate_limit_keywords = [
             "每分钟最多访问该接口",
             "抱歉，您每分钟最多访问该接口",
+            "频率超限",
+            "访问接口",
             "rate limit",
             "too many requests",
         ]
         return any(keyword in message.lower() if keyword.isascii() else keyword in message for keyword in rate_limit_keywords)
 
-    def _throttle_daily_basic(self):
+    @staticmethod
+    def _throttle_call_window(calls, limit_per_minute, label):
         now = time.time()
-        while self.daily_basic_calls and now - self.daily_basic_calls[0] >= 60:
-            self.daily_basic_calls.popleft()
+        while calls and now - calls[0] >= 60:
+            calls.popleft()
 
-        if len(self.daily_basic_calls) >= self.daily_basic_limit_per_minute:
-            wait_seconds = 60 - (now - self.daily_basic_calls[0]) + 0.5
+        if len(calls) >= limit_per_minute:
+            wait_seconds = 60 - (now - calls[0]) + 0.5
             wait_seconds = max(wait_seconds, 0.5)
-            print(f"  daily_basic 接口接近限流，等待 {wait_seconds:.1f} 秒后继续...")
+            print(f"  {label} 接口接近限流，等待 {wait_seconds:.1f} 秒后继续...")
             time.sleep(wait_seconds)
             now = time.time()
-            while self.daily_basic_calls and now - self.daily_basic_calls[0] >= 60:
-                self.daily_basic_calls.popleft()
+            while calls and now - calls[0] >= 60:
+                calls.popleft()
 
-        self.daily_basic_calls.append(time.time())
+        calls.append(time.time())
+
+    def _throttle_daily_basic(self):
+        with self.daily_basic_lock:
+            self._throttle_call_window(
+                self.daily_basic_calls,
+                self.daily_basic_limit_per_minute,
+                "daily_basic",
+            )
+
+    def _throttle_pro_bar(self):
+        with self.pro_bar_lock:
+            self._throttle_call_window(
+                self.pro_bar_calls,
+                self.pro_bar_limit_per_minute,
+                "daily/adj_factor",
+            )
 
     def _call_daily_basic(self, **kwargs):
         self._throttle_daily_basic()
         self.daily_basic_api_calls += 1
         return self.pro.daily_basic(**kwargs)
+
+    def _call_pro_bar(self, **kwargs):
+        last_error = None
+        for attempt in range(4):
+            try:
+                self._throttle_pro_bar()
+                return self.ts.pro_bar(**kwargs)
+            except Exception as e:
+                last_error = e
+                if self._is_rate_limit_error(e) and attempt < 3:
+                    wait_seconds = self.pro_bar_rate_limit_wait
+                    print(f"  daily/adj_factor 命中限流，等待 {wait_seconds} 秒后重试...")
+                    time.sleep(wait_seconds)
+                    with self.pro_bar_lock:
+                        self.pro_bar_calls.clear()
+                    continue
+                if attempt < 3:
+                    time.sleep(0.5 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+        return pd.DataFrame()
 
     def _fetch_daily_basic_range(self, ts_code: str, start_date: str, end_date: str):
         last_error = None
@@ -617,7 +663,7 @@ class TushareFetcher(BaseDataProvider):
         end_str = end_date.strftime("%Y%m%d")
 
         try:
-            price_df = self.ts.pro_bar(
+            price_df = self._call_pro_bar(
                 ts_code=ts_code,
                 asset="E",
                 freq="D",
@@ -645,7 +691,7 @@ class TushareFetcher(BaseDataProvider):
         end_str = pd.to_datetime(end_date).strftime("%Y%m%d")
 
         try:
-            price_df = self.ts.pro_bar(
+            price_df = self._call_pro_bar(
                 ts_code=ts_code,
                 asset="E",
                 freq="D",

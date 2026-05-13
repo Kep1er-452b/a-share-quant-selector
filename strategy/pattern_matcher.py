@@ -225,8 +225,7 @@ class PatternMatcher:
                 if HAS_FASTDTW:
                     try:
                         distance, _ = fastdtw(cand_curve, case_curve, dist=euclidean)
-                        max_dist = max(len(cand_curve), len(case_curve))
-                        curve_sim = max(0, 1 - distance / max_dist) if max_dist > 0 else 0
+                        curve_sim = self._normalize_dtw_score(distance, len(cand_curve), len(case_curve))
                     except:
                         curve_sim = self._simple_dtw(cand_curve, case_curve)
                 else:
@@ -261,6 +260,18 @@ class PatternMatcher:
         
         return np.mean(similarities) if similarities else 0.5
     
+    def _normalize_dtw_score(self, distance: float, n: int, m: int) -> float:
+        """归一化 DTW 距离为相似度分数 [0, 1]。
+        
+        归一化曲线元素 ∈ [0,1]，最大可能欧氏距离为 sqrt(max(n,m))。
+        fastdtw / simple_dtw 两条路径共用此归一化，确保分数可比。
+        """
+        max_len = max(n, m)
+        if max_len <= 0:
+            return 0.0
+        norm_factor = np.sqrt(float(max_len))
+        return max(0.0, float(1.0 - distance / norm_factor))
+
     def _simple_dtw(self, seq1: np.ndarray, seq2: np.ndarray) -> float:
         """简化版DTW（当fastdtw不可用时使用）"""
         n, m = len(seq1), len(seq2)
@@ -282,10 +293,8 @@ class PatternMatcher:
                     np.arange(m),
                     seq2
                 )
+            n = m = target_len
         
         # 计算欧氏距离
-        distance = np.sqrt(np.sum((seq1 - seq2) ** 2))
-        max_dist = np.sqrt(len(seq1))
-        
-        similarity = max(0, 1 - distance / max_dist) if max_dist > 0 else 0
-        return similarity
+        distance = float(np.sqrt(np.sum((seq1 - seq2) ** 2)))
+        return self._normalize_dtw_score(distance, n, m)

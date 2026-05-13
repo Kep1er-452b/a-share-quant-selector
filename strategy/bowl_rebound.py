@@ -37,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.base_strategy import BaseStrategy
 from utils.technical import EXIST, REF, KDJ, calculate_zhixing_trend
+from utils.strategy_labels import is_invalid_stock_name
 
 
 class BowlReboundStrategy(BaseStrategy):
@@ -173,14 +174,8 @@ class BowlReboundStrategy(BaseStrategy):
             return []
         
         # 过滤退市/异常股票
-        if stock_name:
-            invalid_keywords = ['退', '未知', '退市', '已退']
-            if any(kw in stock_name for kw in invalid_keywords):
-                return []
-            
-            # 过滤 ST/*ST 股票
-            if stock_name.startswith('ST') or stock_name.startswith('*ST'):
-                return []
+        if stock_name and is_invalid_stock_name(stock_name):
+            return []
         
         # 获取最新一天的数据
         latest = df.iloc[0]

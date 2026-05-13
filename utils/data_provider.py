@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -43,6 +45,8 @@ class BaseDataProvider:
         self.trade_calendar_cache_file = self.full_data_dir / "trade_calendar_cache.json"
         self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
         self._local_trade_calendar_cache = None
+        self._sync_lock = Lock()
+        self._sync_max_workers = min(max(os.cpu_count() or 4, 1), 24)
 
     def _load_local_trade_calendar(self) -> dict:
         """Load seed/user trade calendar caches for providers without a live calendar API."""
@@ -118,6 +122,146 @@ class BaseDataProvider:
                 json.dump(state, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"  保存抓取状态失败: {e}")
+
+    def _sync_one_incremental(self, item: dict, latest_trade_date, status_map: dict, market_cap_map: dict) -> dict:
+        """抓取单只股票的增量数据（线程安全）。"""
+        code = item["code"]
+        name = item.get("name", "")
+        latest_local = status_map[code].get("latest_date")
+        latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
+        missing_trade_dates = self.get_missing_trade_dates(latest_local_date, latest_trade_date)
+        trading_days_needed = max(len(missing_trade_dates), 1) if latest_trade_date and latest_local_date else 10
+        df = self.fetch_stock_update(code, days=min(trading_days_needed, 1000))
+        df = self._apply_market_cap_override(code, df, market_cap_map)
+        if df is not None and not df.empty:
+            self.csv_manager.update_stock(code, df)
+            refreshed = self._inspect_local_stock(code, latest_trade_date)
+            refreshed["status"] = "incremental_updated"
+            refreshed["reason"] = "incremental_ok"
+            return {"code": code, "name": name, "ok": True, "refreshed": refreshed, "rows": len(df)}
+        return {"code": code, "name": name, "ok": False, "fallback_full": True}
+
+    def _sync_one_full_refresh(self, item: dict, latest_trade_date, market_cap_map: dict) -> dict:
+        """全量重抓单只股票（线程安全）。"""
+        code = item["code"]
+        name = item.get("name", "")
+        df = self.fetch_stock_history(code, years=6)
+        df = self._apply_market_cap_override(code, df, market_cap_map)
+        if df is not None and not df.empty:
+            self.csv_manager.write_stock(code, df)
+            refreshed = self._inspect_local_stock(code, latest_trade_date)
+            refreshed["status"] = "full_refreshed"
+            refreshed["reason"] = "full_refresh_ok"
+            return {"code": code, "name": name, "ok": True, "refreshed": refreshed, "rows": len(df)}
+        return {"code": code, "name": name, "ok": False}
+
+    def _sync_parallel_batch(
+        self,
+        items: list,
+        latest_trade_date,
+        status_map: dict,
+        market_cap_map: dict,
+        progress_callback=None,
+        progress_state: Optional[dict] = None,
+        halt_checker=None,
+    ) -> tuple:
+        """并行执行一批股票的增量同步。"""
+        if not items:
+            return [], []
+        ok_list = []
+        fallback_list = []
+        max_workers = min(self._sync_max_workers, max(len(items), 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self._sync_one_incremental, item, latest_trade_date, status_map, market_cap_map): item for item in items}
+            for future in as_completed(futures):
+                if halt_checker and halt_checker():
+                    raise InterruptedError("系统已急停")
+                result = future.result()
+                if result["ok"]:
+                    ok_list.append(result)
+                elif result.get("fallback_full"):
+                    fallback_list.append(futures[future])
+                self._emit_batch_progress(
+                    item=futures[future],
+                    result=result,
+                    stage="sync",
+                    current_step="增量补齐",
+                    progress_callback=progress_callback,
+                    progress_state=progress_state,
+                )
+        return ok_list, fallback_list
+
+    def _sync_full_parallel_batch(
+        self,
+        items: list,
+        latest_trade_date,
+        market_cap_map: dict,
+        progress_callback=None,
+        progress_state: Optional[dict] = None,
+        halt_checker=None,
+    ) -> tuple:
+        """并行执行一批股票的全量重抓。"""
+        if not items:
+            return [], []
+        ok_list = []
+        failed_list = []
+        max_workers = min(self._sync_max_workers, max(len(items), 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self._sync_one_full_refresh, item, latest_trade_date, market_cap_map): item for item in items}
+            for future in as_completed(futures):
+                if halt_checker and halt_checker():
+                    raise InterruptedError("系统已急停")
+                result = future.result()
+                if result["ok"]:
+                    ok_list.append(result)
+                else:
+                    failed_list.append(result)
+                self._emit_batch_progress(
+                    item=futures[future],
+                    result=result,
+                    stage="sync",
+                    current_step="全量重抓",
+                    progress_callback=progress_callback,
+                    progress_state=progress_state,
+                )
+        return ok_list, failed_list
+
+    @staticmethod
+    def _emit_batch_progress(
+        item: dict,
+        result: dict,
+        stage: str,
+        current_step: str,
+        progress_callback=None,
+        progress_state: Optional[dict] = None,
+    ) -> None:
+        if not progress_callback or progress_state is None:
+            return
+
+        if result.get("fallback_full"):
+            progress_state["total"] = progress_state.get("total", 0) + 1
+
+        progress_state["processed"] = progress_state.get("processed", 0) + 1
+        if result.get("ok"):
+            progress_state["success"] = progress_state.get("success", 0) + 1
+        else:
+            progress_state["failed"] = progress_state.get("failed", 0) + 1
+
+        processed = progress_state.get("processed", 0)
+        total = max(progress_state.get("total", 0), 1)
+        progress_callback({
+            "stage": stage,
+            "current_step": current_step,
+            "processed_count": processed,
+            "total_count": progress_state.get("total", 0),
+            "progress_pct": int((processed / total) * 100),
+            "current_stock": {
+                "code": item.get("code", result.get("code", "--")),
+                "name": item.get("name", result.get("name", "未知")),
+            },
+            "success_count": progress_state.get("success", 0),
+            "failed_count": progress_state.get("failed", 0),
+        })
 
     def _profile_key(self, board: str, max_stocks=None) -> str:
         limit = "all" if not max_stocks else str(max_stocks)
@@ -491,6 +635,12 @@ class BaseDataProvider:
 
         processed = 0
         total_work = len(incremental) + len(full_refresh)
+        progress_state = {
+            "processed": 0,
+            "total": total_work,
+            "success": 0,
+            "failed": 0,
+        }
         tracker = ProgressTracker(total_work or 1, label="同步进度")
         success_count = 0
         failed_count = 0
@@ -499,129 +649,67 @@ class BaseDataProvider:
         emit_progress(
             stage="sync",
             current_step="开始同步目标股票池数据",
-            processed_count=processed,
+            processed_count=0,
             total_count=total_work,
             progress_pct=0,
             current_stock=None,
-            success_count=success_count,
-            failed_count=failed_count,
+            success_count=0,
+            failed_count=0,
         )
 
-        for item in incremental:
+        # ---- 增量补齐（并行） ----
+        if incremental:
             ensure_not_halted()
-            code = item["code"]
-            name = item.get("name", "")
-            latest_local = status_map[code].get("latest_date")
-            latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
-            missing_trade_dates = self.get_missing_trade_dates(latest_local_date, latest_trade_date)
-            trading_days_needed = max(len(missing_trade_dates), 1) if latest_trade_date and latest_local_date else 10
-
-            processed += 1
-            current_stock = {"code": code, "name": name}
-            progress_prefix = tracker.line(
-                processed,
-                extra=f"成功 {success_count} | 失败 {failed_count}"
+            print(f"\n  ↻ 增量补齐 {len(incremental)} 只 (并发 {self._sync_max_workers})...")
+            ok_results, fallback_items = self._sync_parallel_batch(
+                incremental,
+                latest_trade_date,
+                status_map,
+                market_cap_map,
+                progress_callback=progress_callback,
+                progress_state=progress_state,
+                halt_checker=halt_checker,
             )
-            emit_progress(
-                stage="sync",
-                current_step="增量补齐",
-                processed_count=processed,
-                total_count=total_work,
-                progress_pct=int((processed / max(total_work, 1)) * 100),
-                current_stock=current_stock,
-                success_count=success_count,
-                failed_count=failed_count,
-            )
-            print(f"{progress_prefix}\n  -> 增量补齐 {code} {name} (缺 {trading_days_needed} 个交易日)...", end=" ")
-            df = self.fetch_stock_update(code, days=min(trading_days_needed, 1000))
-            df = self._apply_market_cap_override(code, df, market_cap_map)
-            if df is not None and not df.empty:
-                self.csv_manager.update_stock(code, df)
-                refreshed = self._inspect_local_stock(code, latest_trade_date)
-                refreshed["status"] = "incremental_updated"
-                refreshed["reason"] = "incremental_ok"
-                status_map[code] = refreshed
-                success_count += 1
-                print("✓")
-            else:
-                print("↺ 增量失败，转全量重抓")
-                full_refresh.append(item)
-                total_work += 1
-                tracker.total = max(total_work, 1)
-                status_map[code]["status"] = "full_refresh"
-                status_map[code]["reason"] = "incremental_failed"
-            emit_progress(
-                stage="sync",
-                current_step="增量补齐完成",
-                processed_count=processed,
-                total_count=total_work,
-                progress_pct=int((processed / max(total_work, 1)) * 100),
-                current_stock=current_stock,
-                success_count=success_count,
-                failed_count=failed_count,
-            )
+            for r in ok_results:
+                status_map[r["code"]] = r["refreshed"]
+            if fallback_items:
+                print(f"    增量失败 {len(fallback_items)} 只，转为全量重抓")
+                for item in fallback_items:
+                    if item["code"] not in {i["code"] for i in full_refresh}:
+                        full_refresh.append(item)
+                    status_map[item["code"]]["status"] = "full_refresh"
+                    status_map[item["code"]]["reason"] = "incremental_failed"
 
-            if processed % 10 == 0:
-                time.sleep(0.1)
-
+        # ---- 全量重抓（并行） ----
         refresh_queue = []
         seen_codes = set()
         for item in full_refresh:
             if item["code"] not in seen_codes:
                 refresh_queue.append(item)
                 seen_codes.add(item["code"])
+        progress_state["total"] = max(progress_state.get("total", 0), len(incremental) + len(refresh_queue))
 
-        for item in refresh_queue:
+        if refresh_queue:
             ensure_not_halted()
-            code = item["code"]
-            name = item.get("name", "")
-            processed += 1
-            current_stock = {"code": code, "name": name}
-            progress_prefix = tracker.line(
-                processed,
-                extra=f"成功 {success_count} | 失败 {failed_count}"
+            print(f"\n  ↻ 全量重抓 {len(refresh_queue)} 只 (并发 {self._sync_max_workers})...")
+            ok_results, failed_results = self._sync_full_parallel_batch(
+                refresh_queue,
+                latest_trade_date,
+                market_cap_map,
+                progress_callback=progress_callback,
+                progress_state=progress_state,
+                halt_checker=halt_checker,
             )
-            emit_progress(
-                stage="sync",
-                current_step="全量重抓",
-                processed_count=processed,
-                total_count=total_work,
-                progress_pct=int((processed / max(total_work, 1)) * 100),
-                current_stock=current_stock,
-                success_count=success_count,
-                failed_count=failed_count,
-            )
-            print(f"{progress_prefix}\n  -> 全量重抓 {code} {name} ...", end=" ")
-            df = self.fetch_stock_history(code, years=6)
-            df = self._apply_market_cap_override(code, df, market_cap_map)
-            if df is not None and not df.empty:
-                self.csv_manager.write_stock(code, df)
-                refreshed = self._inspect_local_stock(code, latest_trade_date)
-                refreshed["status"] = "full_refreshed"
-                refreshed["reason"] = "full_refresh_ok"
-                status_map[code] = refreshed
-                success_count += 1
-                print(f"✓ ({len(df)}条)")
-            else:
-                failed = status_map.get(code, {})
-                failed["status"] = "failed"
-                failed["reason"] = "fetch_failed"
-                status_map[code] = failed
-                failed_count += 1
-                print("✗")
-            emit_progress(
-                stage="sync",
-                current_step="全量重抓完成",
-                processed_count=processed,
-                total_count=total_work,
-                progress_pct=int((processed / max(total_work, 1)) * 100),
-                current_stock=current_stock,
-                success_count=success_count,
-                failed_count=failed_count,
-            )
+            for r in ok_results:
+                status_map[r["code"]] = r["refreshed"]
+            for r in failed_results:
+                status_map[r["code"]]["status"] = "failed"
+                status_map[r["code"]]["reason"] = "fetch_failed"
 
-            if processed % 10 == 0:
-                time.sleep(0.1)
+        success_count = sum(1 for info in status_map.values() if info["status"] in {"incremental_updated", "full_refreshed"})
+        failed_count = sum(1 for info in status_map.values() if info["status"] == "failed")
+        processed = len(incremental) + len(refresh_queue)
+        total_work = len(incremental) + len(refresh_queue)
 
         print("=" * 60)
         print(tracker.line(total_work, extra=f"成功 {success_count} | 失败 {failed_count}"))
