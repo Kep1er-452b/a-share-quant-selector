@@ -26,6 +26,42 @@ BOARD_LABELS = {
     "star": "科创板",
 }
 
+MAX_REASONABLE_MARKET_CAP_YUAN = 20_000_000_000_000
+MIN_REASONABLE_MARKET_CAP_YUAN = 1_000_000
+
+
+def normalize_market_cap_yuan(value, source_unit: str = "yuan") -> Optional[int]:
+    """
+    Normalize market cap values to yuan.
+
+    Most project data is stored in yuan. Some APIs expose values in 100M yuan,
+    and one historical Akshare path could multiply yuan values by 1e8. This
+    helper accepts both forms and repairs the known over-scaled shape.
+    """
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric) or numeric <= 0:
+        return None
+
+    normalized_unit = str(source_unit or "yuan").strip().lower()
+    if normalized_unit in {"hundred_million", "yi", "亿"}:
+        numeric *= 1e8
+    elif normalized_unit == "auto" and numeric < MIN_REASONABLE_MARKET_CAP_YUAN:
+        numeric *= 1e8
+
+    if numeric > MAX_REASONABLE_MARKET_CAP_YUAN:
+        repaired = numeric / 1e8
+        if MIN_REASONABLE_MARKET_CAP_YUAN <= repaired <= MAX_REASONABLE_MARKET_CAP_YUAN:
+            numeric = repaired
+        else:
+            return None
+
+    if numeric < MIN_REASONABLE_MARKET_CAP_YUAN:
+        return None
+    return int(round(numeric))
+
 
 class DataProviderError(RuntimeError):
     """数据源相关错误"""
@@ -473,7 +509,9 @@ class BaseDataProvider:
 
     def _apply_market_cap_override(self, stock_code: str, df: Optional[pd.DataFrame], market_cap_map: Dict[str, int]):
         if df is not None and not df.empty and stock_code in market_cap_map:
-            df["market_cap"] = market_cap_map[stock_code]
+            market_cap = normalize_market_cap_yuan(market_cap_map[stock_code], source_unit="yuan")
+            if market_cap:
+                df["market_cap"] = market_cap
         return df
 
     def _write_profile_state(
