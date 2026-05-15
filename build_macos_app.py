@@ -16,6 +16,7 @@ APP_PATH = Path("/Applications") / f"{APP_NAME}.app"
 EXECUTABLE_NAME = "AStockQuantSelector"
 PYTHON_PATH = PROJECT_ROOT / ".venv" / "bin" / "python"
 LAUNCHER_PATH = PROJECT_ROOT / "launch_desktop_app.py"
+ICON_PATH = PROJECT_ROOT / "assets" / "app_icon.icns"
 
 
 INFO_PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -31,6 +32,8 @@ INFO_PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
   <string>{EXECUTABLE_NAME}</string>
   <key>CFBundleIdentifier</key>
   <string>local.a-share-quant-selector.launcher</string>
+  <key>CFBundleIconFile</key>
+  <string>app_icon</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -55,6 +58,8 @@ def build() -> None:
         raise FileNotFoundError(f"未找到项目 Python: {PYTHON_PATH}")
     if not LAUNCHER_PATH.exists():
         raise FileNotFoundError(f"未找到桌面启动器: {LAUNCHER_PATH}")
+    if not ICON_PATH.exists():
+        raise FileNotFoundError(f"未找到 App 图标: {ICON_PATH}")
 
     if APP_PATH.exists():
         shutil.rmtree(APP_PATH)
@@ -66,6 +71,7 @@ def build() -> None:
     resources.mkdir(parents=True, exist_ok=True)
 
     (contents / "Info.plist").write_text(INFO_PLIST, encoding="utf-8")
+    shutil.copy2(ICON_PATH, resources / "app_icon.icns")
 
     executable = macos / EXECUTABLE_NAME
     executable.write_text(

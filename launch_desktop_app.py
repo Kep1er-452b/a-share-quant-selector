@@ -134,6 +134,20 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
+class DesktopApi:
+    def __init__(self):
+        self.window = None
+
+    def bind_window(self, window) -> None:
+        self.window = window
+
+    def toggle_heatmap_fullscreen(self) -> dict:
+        if self.window is None:
+            return {"success": False, "error": "窗口尚未就绪"}
+        self.window.toggle_fullscreen()
+        return {"success": True}
+
+
 def resolve_web_url() -> tuple[str, int, str]:
     os.chdir(PROJECT_ROOT)
     from web_server import _load_config, _resolve_web_address
@@ -214,13 +228,16 @@ def run_gui() -> int:
         print(f"pywebview 无法导入: {exc}")
         return 1
 
+    api = DesktopApi()
     window = webview.create_window(
         APP_NAME,
         html=status_html(APP_NAME, "正在启动本地 Web 服务，请稍候...", f"日志文件: {LOG_FILE}"),
+        js_api=api,
         width=1440,
         height=920,
         min_size=(1100, 720),
     )
+    api.bind_window(window)
 
     def boot() -> None:
         try:

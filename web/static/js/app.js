@@ -46,6 +46,9 @@ const state = {
     heatmapMetric: 'daily',
     heatmapGroups: [],
     heatmapLoading: false,
+    heatmapPayloadCache: new Map(),
+    heatmapHealth: null,
+    heatmapAppFullscreenActive: false,
     updateModalStep: 'provider',
     updateProvider: null,
     updateHasTushareToken: false,
@@ -587,18 +590,48 @@ async function loadHeatmapMeta(forceReload = false) {
         const cacheErrors = data.cache_status?.errors || {};
         const unmappedCount = Number(data.cache_status?.industry_unmapped_count || 0);
         const refreshPending = Boolean(data.cache_status?.refresh_pending);
+        const anomalyCount = Number(data.cache_status?.market_cap_anomaly_count || 0);
         document.getElementById('heatmap-latest-date').textContent = data.latest_date || '--';
         document.getElementById('heatmap-cache-note').textContent = Object.keys(cacheErrors).length
             ? `缓存已降级使用旧数据: ${Object.keys(cacheErrors).join(' / ')}`
             : (refreshPending
-                ? '行业分类缓存正在后台补全，未分类会逐步减少'
+                ? '云图缓存需要刷新。点击“刷新云图”重建缓存，或先执行 UPDATE 更新数据'
+                : (anomalyCount > 0
+                ? `发现 ${formatNumber(anomalyCount)} 条异常市值，建议刷新云图缓存`
                 : (unmappedCount > 0
                 ? `行业缓存仍有 ${formatNumber(unmappedCount)} 只股票未归类，系统会继续尝试补全`
-                : '行业分类缓存已完整匹配，板块可直接点开查看全部股票'));
+                : '行业分类缓存已完整匹配，板块可直接点开查看全部股票')));
         renderHeatmapFilters();
     } catch (error) {
         document.getElementById('heatmap-cache-note').textContent = `元数据加载失败: ${error.message}`;
     }
+}
+
+async function loadHeatmapHealth(forceReload = false) {
+    if (state.heatmapHealth && !forceReload) {
+        return state.heatmapHealth;
+    }
+    const result = await apiFetch('/api/heatmap/health');
+    if (!result.success) {
+        throw new Error(result.error || '市场云图状态检查失败');
+    }
+    state.heatmapHealth = result.data || {};
+    return state.heatmapHealth;
+}
+
+function heatmapCacheKey(health) {
+    return [
+        state.heatmapScope,
+        state.heatmapMetric,
+        health?.snapshot_latest_date || '--',
+        health?.snapshot_updated_at || '--',
+        health?.local_latest_date || '--',
+    ].join('|');
+}
+
+function clearHeatmapPayloadCache() {
+    state.heatmapPayloadCache.clear();
+    state.heatmapHealth = null;
 }
 
 function renderHeatmapFilters() {
@@ -715,6 +748,48 @@ function renderDashboardPulse(payload) {
     `;
 }
 
+function renderDashboardHealth(payload) {
+    const container = document.getElementById('dashboard-market-health');
+    if (!container) {
+        return;
+    }
+
+    const health = payload?.cache_health || {};
+    const refreshPending = Boolean(health.refresh_pending);
+    const anomalyCount = Number(health.market_cap_anomaly_count || 0);
+    const cacheState = refreshPending ? 'REFRESH' : 'READY';
+    const cacheClass = refreshPending ? 'down' : 'up';
+    const capClass = anomalyCount > 0 ? 'down' : 'up';
+
+    container.innerHTML = `
+        <div class="health-card">
+            <div class="pulse-label">LOCAL DATE</div>
+            <div class="pulse-value">${escapeHtml(health.local_latest_date || '--')}</div>
+            <div class="pulse-sub">${formatNumber(health.local_stock_count || 0)} 本地股票</div>
+        </div>
+        <div class="health-card">
+            <div class="pulse-label">MAP CACHE</div>
+            <div class="pulse-value ${cacheClass}">${cacheState}</div>
+            <div class="pulse-sub">${escapeHtml(health.snapshot_updated_at || '--')}</div>
+        </div>
+        <div class="health-card">
+            <div class="pulse-label">CAP CHECK</div>
+            <div class="pulse-value ${capClass}">${formatNumber(anomalyCount)}</div>
+            <div class="pulse-sub">异常市值记录</div>
+        </div>
+        <div class="health-card">
+            <div class="pulse-label">INDUSTRY MAP</div>
+            <div class="pulse-value">${formatNumber(health.industry_mapped_count || 0)}</div>
+            <div class="pulse-sub">未归类 ${formatNumber(health.industry_unmapped_count || 0)}</div>
+        </div>
+        <div class="health-card">
+            <div class="pulse-label">ACTION</div>
+            <div class="pulse-value ${cacheClass}">${refreshPending ? 'UPDATE' : 'STAND BY'}</div>
+            <div class="pulse-sub">${refreshPending ? 'F2 刷新云图或 UPDATE' : '可直接查看 F2 云图'}</div>
+        </div>
+    `;
+}
+
 async function loadDashboardPulse() {
     if (state.systemHalted) {
         return;
@@ -726,12 +801,17 @@ async function loadDashboardPulse() {
             throw new Error(result.error || '市场强弱数据加载失败');
         }
         renderDashboardPulse(result.data || {});
+        renderDashboardHealth(result.data || {});
     } catch (error) {
         if (error.name === 'AbortError' && state.systemHalted) {
             return;
         }
         if (container) {
             container.innerHTML = `<div class="state-empty">MARKET PULSE LOAD FAILED: ${escapeHtml(error.message)}</div>`;
+        }
+        const healthContainer = document.getElementById('dashboard-market-health');
+        if (healthContainer) {
+            healthContainer.innerHTML = `<div class="state-empty">DATA WATCH LOAD FAILED: ${escapeHtml(error.message)}</div>`;
         }
     }
 }
@@ -957,6 +1037,10 @@ function fullscreenEnabled() {
     return Boolean(document.fullscreenEnabled || document.webkitFullscreenEnabled);
 }
 
+function hasPywebviewFullscreenBridge() {
+    return Boolean(window.pywebview?.api?.toggle_heatmap_fullscreen);
+}
+
 function resizeHeatmapChart(delay = 0) {
     window.setTimeout(() => {
         if (state.heatmapChart) {
@@ -969,9 +1053,10 @@ function syncHeatmapFullscreenState() {
     const shell = getHeatmapFullscreenShell();
     const button = document.getElementById('heatmap-fullscreen-btn');
     const label = button ? button.querySelector('.heatmap-fullscreen-label') : null;
-    const isFullscreen = Boolean(shell && getFullscreenElement() === shell);
+    const isFullscreen = Boolean(shell && getFullscreenElement() === shell) || state.heatmapAppFullscreenActive;
 
     document.body.classList.toggle('heatmap-fullscreen-active', isFullscreen);
+    document.body.classList.toggle('heatmap-app-fullscreen-active', state.heatmapAppFullscreenActive);
     if (button) {
         button.classList.toggle('active', isFullscreen);
         button.setAttribute('aria-pressed', String(isFullscreen));
@@ -993,6 +1078,11 @@ async function exitHeatmapFullscreenIfNeeded() {
             document.webkitExitFullscreen();
         }
     }
+    if (state.heatmapAppFullscreenActive && hasPywebviewFullscreenBridge()) {
+        await window.pywebview.api.toggle_heatmap_fullscreen();
+        state.heatmapAppFullscreenActive = false;
+        syncHeatmapFullscreenState();
+    }
 }
 
 async function toggleHeatmapFullscreen() {
@@ -1001,12 +1091,22 @@ async function toggleHeatmapFullscreen() {
     }
 
     const shell = getHeatmapFullscreenShell();
-    if (!shell || !fullscreenEnabled()) {
+    if (!shell) {
         toast('当前浏览器不支持全屏模式', 'error');
         return;
     }
 
     try {
+        if (!fullscreenEnabled() && hasPywebviewFullscreenBridge()) {
+            await window.pywebview.api.toggle_heatmap_fullscreen();
+            state.heatmapAppFullscreenActive = !state.heatmapAppFullscreenActive;
+            syncHeatmapFullscreenState();
+            return;
+        }
+        if (!fullscreenEnabled()) {
+            toast('当前浏览器不支持全屏模式', 'error');
+            return;
+        }
         if (getFullscreenElement() === shell) {
             await exitHeatmapFullscreenIfNeeded();
             return;
@@ -1196,6 +1296,19 @@ function renderHeatmapChart(groups) {
     });
 }
 
+function renderHeatmapPayload(data) {
+    document.getElementById('heatmap-latest-date').textContent = data.latest_date || '--';
+    document.getElementById('heatmap-subtitle').textContent = `按行业聚合，面积映射总市值，颜色映射${heatmapMetricLabel(state.heatmapMetric)}涨跌幅`;
+    document.getElementById('heatmap-scope-label').textContent = heatmapScopeLabel(state.heatmapScope);
+    document.getElementById('heatmap-metric-label').textContent = heatmapMetricLabel(state.heatmapMetric);
+    document.getElementById('heatmap-stock-count').textContent = `${formatNumber(data.stock_count || 0)} 只股票`;
+    const tickerText = buildTickerText(data.ticker_stats, data.latest_date).join('   •   ');
+    document.getElementById('heatmap-ticker-track').textContent = buildTickerLoopText(data.ticker_stats, data.latest_date);
+    updateGlobalTicker(`${heatmapScopeLabel(state.heatmapScope)}   ${tickerText}`);
+    renderHeatmapIndices(data.header_indices || []);
+    renderHeatmapChart(data.groups || []);
+}
+
 async function loadHeatmap(forceReload = false) {
     if (state.systemHalted) {
         return;
@@ -1203,24 +1316,37 @@ async function loadHeatmap(forceReload = false) {
     setHeatmapLoading(true, forceReload ? '正在刷新市场云图...' : '正在生成市场云图...');
 
     try {
-        const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}`);
+        const health = await loadHeatmapHealth(forceReload);
+        const key = heatmapCacheKey(health);
+        if (!forceReload && state.heatmapPayloadCache.has(key)) {
+            renderHeatmapPayload(state.heatmapPayloadCache.get(key));
+            resizeHeatmapChart(40);
+            return;
+        }
+
+        if (!forceReload && health.refresh_pending) {
+            throw new Error('市场云图缓存不是最新，请点击“刷新云图”重建缓存，或先执行 UPDATE 更新数据。');
+        }
+
+        const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}${forceReload ? '&refresh=1' : ''}`);
         if (!result.success) {
             throw new Error(result.error || '市场云图加载失败');
         }
         const data = result.data || {};
-        document.getElementById('heatmap-latest-date').textContent = data.latest_date || '--';
-        document.getElementById('heatmap-subtitle').textContent = `按行业聚合，面积映射总市值，颜色映射${heatmapMetricLabel(state.heatmapMetric)}涨跌幅`;
-        document.getElementById('heatmap-scope-label').textContent = heatmapScopeLabel(state.heatmapScope);
-        document.getElementById('heatmap-metric-label').textContent = heatmapMetricLabel(state.heatmapMetric);
-        document.getElementById('heatmap-stock-count').textContent = `${formatNumber(data.stock_count || 0)} 只股票`;
-        const tickerText = buildTickerText(data.ticker_stats, data.latest_date).join('   •   ');
-        document.getElementById('heatmap-ticker-track').textContent = buildTickerLoopText(data.ticker_stats, data.latest_date);
-        updateGlobalTicker(`${heatmapScopeLabel(state.heatmapScope)}   ${tickerText}`);
-        renderHeatmapIndices(data.header_indices || []);
-        renderHeatmapChart(data.groups || []);
+        if (forceReload) {
+            state.heatmapHealth = null;
+            state.heatmapPayloadCache.clear();
+        }
+        const cacheHealth = forceReload ? await loadHeatmapHealth(true) : health;
+        state.heatmapPayloadCache.set(heatmapCacheKey(cacheHealth), data);
+        renderHeatmapPayload(data);
     } catch (error) {
         const container = document.getElementById('heatmap-chart');
         if (container) {
+            if (state.heatmapChart) {
+                state.heatmapChart.dispose();
+                state.heatmapChart = null;
+            }
             container.innerHTML = `<div class="state-empty">市场云图加载失败: ${escapeHtml(error.message)}</div>`;
         }
     } finally {
@@ -2232,6 +2358,7 @@ async function pollUpdateJobStatus() {
                 updateButton.disabled = false;
             }
             toast('数据更新完成', 'success');
+            clearHeatmapPayloadCache();
             await loadStats();
             if (state.currentPage === 'heatmap') {
                 await Promise.all([loadHeatmapMeta(true), loadHeatmap(true)]);
@@ -3216,7 +3343,11 @@ function bindEvents() {
         }
     });
     document.getElementById('save-config-btn').addEventListener('click', saveConfig);
-    document.getElementById('refresh-heatmap-btn').addEventListener('click', () => loadHeatmap(true));
+    document.getElementById('refresh-heatmap-btn').addEventListener('click', async () => {
+        clearHeatmapPayloadCache();
+        await loadHeatmap(true);
+        await loadHeatmapMeta(true);
+    });
     document.getElementById('heatmap-fullscreen-btn').addEventListener('click', toggleHeatmapFullscreen);
     document.getElementById('update-data-btn').addEventListener('click', openUpdateModal);
     document.getElementById('shutdown-btn').addEventListener('click', openShutdownConfirm);

@@ -15,7 +15,7 @@ import random
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.csv_manager import CSVManager
-from utils.data_provider import BaseDataProvider
+from utils.data_provider import BaseDataProvider, normalize_market_cap_yuan
 
 # 设置请求会话
 session = requests.Session()
@@ -152,10 +152,9 @@ class AKShareFetcher(BaseDataProvider):
                             parts = line.split('~')
                             if len(parts) >= 46:
                                 # 字段44是总市值（亿）
-                                cap = float(parts[44]) if parts[44] else 0
-                                if cap > 0:
-                                    # 转为元（腾讯接口是亿）
-                                    market_cap_map[code] = int(cap * 1e8)
+                                cap = normalize_market_cap_yuan(parts[44], source_unit="hundred_million")
+                                if cap:
+                                    market_cap_map[code] = cap
                         except:
                             continue
                 
@@ -178,12 +177,8 @@ class AKShareFetcher(BaseDataProvider):
                 code = str(row['代码']).zfill(6)
                 if code not in stock_codes:
                     continue
-                cap = row['总市值']
-                if pd.notna(cap) and cap > 0:
-                    if cap < 1e10:
-                        cap = int(cap * 1e8)
-                    else:
-                        cap = int(cap)
+                cap = normalize_market_cap_yuan(row['总市值'], source_unit="auto")
+                if cap:
                     market_cap_map[code] = cap
             if market_cap_map:
                 return market_cap_map
@@ -513,10 +508,10 @@ class AKShareFetcher(BaseDataProvider):
                     total_cap = total_cap_row['value'].values[0]
                     if isinstance(total_cap, str):
                         if '亿' in total_cap:
-                            return float(total_cap.replace('亿', '')) * 1e8
+                            return normalize_market_cap_yuan(total_cap.replace('亿', ''), source_unit="hundred_million")
                         else:
-                            return float(total_cap)
-                    return float(total_cap)
+                            return normalize_market_cap_yuan(total_cap, source_unit="auto")
+                    return normalize_market_cap_yuan(total_cap, source_unit="auto")
         except Exception as e:
             print(f"  获取总市值失败: {e}")
         return None
@@ -779,13 +774,8 @@ class AKShareFetcher(BaseDataProvider):
             spot_df = ak.stock_zh_a_spot_em()
             for _, row in spot_df.iterrows():
                 code = str(row['代码']).zfill(6)
-                cap = row['总市值']
-                if pd.notna(cap) and cap > 0:
-                    # 统一转为元
-                    if cap < 1e10:
-                        cap = int(cap * 1e8)
-                    else:
-                        cap = int(cap)
+                cap = normalize_market_cap_yuan(row['总市值'], source_unit="auto")
+                if cap:
                     market_cap_map[code] = cap
             print(f"  ✓ akshare接口成功: {len(market_cap_map)} 只股票市值")
         except Exception as e:
@@ -969,13 +959,8 @@ class AKShareFetcher(BaseDataProvider):
             spot_df = ak.stock_zh_a_spot_em()
             for _, row in spot_df.iterrows():
                 code = str(row['代码']).zfill(6)
-                cap = row['总市值']
-                if pd.notna(cap) and cap > 0:
-                    # 统一转为元
-                    if cap < 1e10:
-                        cap = int(cap * 1e8)
-                    else:
-                        cap = int(cap)
+                cap = normalize_market_cap_yuan(row['总市值'], source_unit="auto")
+                if cap:
                     market_cap_map[code] = cap
             print(f"  ✓ akshare接口成功: {len(market_cap_map)} 只股票市值")
         except Exception as e:

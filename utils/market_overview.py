@@ -11,6 +11,8 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
+from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, normalize_market_cap_yuan
+
 
 INDEX_TARGETS = [
     {"symbol": "sh000001", "code": "000001", "name": "上证指数"},
@@ -138,7 +140,7 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
 
     latest_date = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
     latest_close = _safe_float(df.iloc[0]["close"])
-    market_cap = _safe_float(df.iloc[0].get("market_cap"))
+    market_cap = normalize_market_cap_yuan(df.iloc[0].get("market_cap"), source_unit="yuan") or 0
     if pd.isna(latest_date) or latest_close is None:
         return None
 
@@ -501,6 +503,67 @@ def market_cache_needs_refresh(data_dir: str = "data") -> bool:
     )
 
 
+def load_market_caches(data_dir: str = "data") -> dict:
+    return {
+        "snapshot": load_snapshot_cache(data_dir),
+        "industry": load_industry_cache(data_dir),
+        "indices": load_index_cache(data_dir),
+        "errors": {},
+    }
+
+
+def count_market_cap_anomalies(data_dir: str = "data") -> int:
+    snapshot = load_snapshot_cache(data_dir)
+    count = 0
+    for stock in snapshot.get("stocks", []) or []:
+        market_cap = _safe_float(stock.get("market_cap"))
+        if market_cap and market_cap > MAX_REASONABLE_MARKET_CAP_YUAN:
+            count += 1
+    return count
+
+
+def market_cache_health(data_dir: str = "data") -> dict:
+    local_status = _local_stock_data_status(data_dir)
+    snapshot = load_snapshot_cache(data_dir)
+    industry = load_industry_cache(data_dir)
+    indices = load_index_cache(data_dir)
+
+    local_latest = local_status.get("latest_date")
+    snapshot_latest = snapshot.get("latest_date")
+    local_count = local_status.get("stock_count") or 0
+    snapshot_count = int(snapshot.get("stock_count") or 0)
+    snapshot_stale = bool(
+        not snapshot
+        or (local_latest and (not snapshot_latest or local_latest > snapshot_latest))
+        or (local_count and local_count != snapshot_count)
+    )
+    industry_ready = bool(
+        industry
+        and "unmapped_count" in industry
+        and "mapped_count" in industry
+        and industry.get("source")
+    )
+    indices_ready = bool(indices and indices.get("items"))
+    refresh_pending = snapshot_stale or not industry_ready or not indices_ready
+
+    return {
+        "local_latest_date": local_latest,
+        "local_stock_count": local_count,
+        "snapshot_latest_date": snapshot_latest,
+        "snapshot_stock_count": snapshot_count,
+        "snapshot_updated_at": snapshot.get("updated_at"),
+        "industry_updated_at": industry.get("updated_at"),
+        "industry_mapped_count": int(industry.get("mapped_count") or 0),
+        "industry_unmapped_count": int(industry.get("unmapped_count") or 0),
+        "indices_updated_at": indices.get("updated_at"),
+        "snapshot_stale": snapshot_stale,
+        "industry_ready": industry_ready,
+        "indices_ready": indices_ready,
+        "refresh_pending": refresh_pending,
+        "market_cap_anomaly_count": count_market_cap_anomalies(data_dir),
+    }
+
+
 def _group_stocks_by_industry(stocks: List[dict], industry_items: Dict[str, str], metric: str) -> List[dict]:
     grouped: Dict[str, dict] = {}
     for stock in stocks:
@@ -558,8 +621,8 @@ def _build_market_stats(stocks: List[dict], metric: str) -> dict:
     }
 
 
-def build_heatmap_payload(data_dir: str = "data", scope: str = "all", metric: str = "daily") -> dict:
-    caches = ensure_market_caches(data_dir=data_dir)
+def build_heatmap_payload(data_dir: str = "data", scope: str = "all", metric: str = "daily", refresh: bool = True) -> dict:
+    caches = ensure_market_caches(data_dir=data_dir) if refresh else load_market_caches(data_dir=data_dir)
     snapshot = caches.get("snapshot") or {}
     industry_cache = caches.get("industry") or {}
     index_cache = caches.get("indices") or {}

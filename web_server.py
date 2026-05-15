@@ -30,6 +30,8 @@ from utils.market_overview import (
     build_heatmap_payload,
     rebuild_market_caches,
     ensure_market_caches,
+    load_market_caches,
+    market_cache_health,
     market_cache_needs_refresh,
     is_hidden_market_stock,
 )
@@ -1209,7 +1211,8 @@ def get_dashboard_pulse():
     try:
         config = _load_config()
         data_dir = str(_config_value(config, 'data_dir', default='data'))
-        payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily')
+        payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily', refresh=False)
+        health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
         ranked_groups = [
             group for group in groups
@@ -1227,6 +1230,7 @@ def get_dashboard_pulse():
                 'leaders': leaders,
                 'laggards': laggards,
                 'header_indices': payload.get('header_indices', []),
+                'cache_health': health,
             }
         })
     except Exception as e:
@@ -1511,6 +1515,7 @@ def get_heatmap():
     try:
         config = _load_config()
         data_dir = str(_config_value(config, 'data_dir', default='data'))
+        force_refresh = str(request.args.get('refresh') or '').lower() in {'1', 'true', 'yes'}
         scope = _normalize_csv_value(request.args.get('scope')) or 'all'
         if scope not in {'all', 'main', 'chinext', 'star'}:
             scope = 'all'
@@ -1519,8 +1524,31 @@ def get_heatmap():
         if metric not in {'daily', 'weekly', 'monthly', 'five_day'}:
             metric = 'daily'
 
-        payload = build_heatmap_payload(data_dir=data_dir, scope=scope, metric=metric)
+        if force_refresh:
+            rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
+        else:
+            health = market_cache_health(data_dir=data_dir)
+            if health.get('refresh_pending'):
+                return jsonify({
+                    'success': False,
+                    'error': '市场云图缓存不是最新，请先点击“刷新云图”或执行数据更新。',
+                    'reason': 'refresh_pending',
+                    'data': health,
+                })
+
+        payload = build_heatmap_payload(data_dir=data_dir, scope=scope, metric=metric, refresh=False)
         return jsonify({'success': True, 'data': payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/heatmap/health')
+def get_heatmap_health():
+    """快速检查市场云图缓存健康状态，不触发重建。"""
+    try:
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        return jsonify({'success': True, 'data': market_cache_health(data_dir=data_dir)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -1531,7 +1559,8 @@ def get_heatmap_meta():
     try:
         config = _load_config()
         data_dir = str(_config_value(config, 'data_dir', default='data'))
-        cache_bundle = ensure_market_caches(data_dir=data_dir)
+        cache_bundle = load_market_caches(data_dir=data_dir)
+        health = market_cache_health(data_dir=data_dir)
         snapshot_stocks = cache_bundle.get('snapshot', {}).get('stocks', []) or []
         visible_snapshot_stocks = [
             stock for stock in snapshot_stocks
@@ -1548,7 +1577,6 @@ def get_heatmap_meta():
             os.getenv('TUSHARE_TOKEN')
             or get_config_value(config, 'data_source', 'tushare', 'token')
         )
-        cache_refresh_pending = market_cache_needs_refresh(data_dir=data_dir)
 
         return jsonify({
             'success': True,
@@ -1580,7 +1608,12 @@ def get_heatmap_meta():
                     'index_updated_at': cache_bundle.get('indices', {}).get('updated_at'),
                     'industry_mapped_count': industry_mapped_count,
                     'industry_unmapped_count': industry_unmapped_count,
-                    'refresh_pending': cache_refresh_pending,
+                    'refresh_pending': health.get('refresh_pending'),
+                    'local_latest_date': health.get('local_latest_date'),
+                    'local_stock_count': health.get('local_stock_count'),
+                    'snapshot_stale': health.get('snapshot_stale'),
+                    'indices_ready': health.get('indices_ready'),
+                    'market_cap_anomaly_count': health.get('market_cap_anomaly_count'),
                     'errors': cache_bundle.get('errors', {}),
                 },
             }
