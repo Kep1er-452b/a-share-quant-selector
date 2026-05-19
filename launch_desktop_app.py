@@ -142,10 +142,10 @@ class DesktopApi:
         self.window = window
 
     def toggle_heatmap_fullscreen(self) -> dict:
-        if self.window is None:
-            return {"success": False, "error": "窗口尚未就绪"}
-        self.window.toggle_fullscreen()
-        return {"success": True}
+        return {
+            "success": False,
+            "error": "云图全屏现在只控制页面内部视图，不再切换 App 窗口状态",
+        }
 
 
 def resolve_web_url() -> tuple[str, int, str]:

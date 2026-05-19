@@ -1524,8 +1524,21 @@ def get_heatmap():
         if metric not in {'daily', 'weekly', 'monthly', 'five_day'}:
             metric = 'daily'
 
+        refresh_errors = {}
         if force_refresh:
-            rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
+            cache_result = rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
+            refresh_errors = cache_result.get('errors') or {}
+            health = market_cache_health(data_dir=data_dir)
+            if health.get('refresh_pending'):
+                return jsonify({
+                    'success': False,
+                    'error': '市场云图刷新后仍不是最新，旧缓存已保留，请检查刷新失败项。',
+                    'reason': 'refresh_pending_after_refresh',
+                    'data': {
+                        'health': health,
+                        'errors': refresh_errors,
+                    },
+                })
         else:
             health = market_cache_health(data_dir=data_dir)
             if health.get('refresh_pending'):
@@ -1537,6 +1550,9 @@ def get_heatmap():
                 })
 
         payload = build_heatmap_payload(data_dir=data_dir, scope=scope, metric=metric, refresh=False)
+        if refresh_errors:
+            payload.setdefault('cache_status', {})['errors'] = refresh_errors
+            payload.setdefault('cache_status', {})['warning'] = '部分缓存刷新失败，当前云图可能使用保留缓存。'
         return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})

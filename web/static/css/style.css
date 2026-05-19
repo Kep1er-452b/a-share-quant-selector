@@ -1444,41 +1444,41 @@ select {
     padding: 8px;
 }
 
-body.heatmap-app-fullscreen-active .shell {
+body.heatmap-focus-active .shell {
     grid-template-rows: minmax(0, 1fr);
 }
 
-body.heatmap-app-fullscreen-active .topbar,
-body.heatmap-app-fullscreen-active .menubar,
-body.heatmap-app-fullscreen-active .ticker-strip,
-body.heatmap-app-fullscreen-active .command-bar,
-body.heatmap-app-fullscreen-active .status-footer,
-body.heatmap-app-fullscreen-active .heatmap-sidebar-panel,
-body.heatmap-app-fullscreen-active .heatmap-header-panel {
+body.heatmap-focus-active .topbar,
+body.heatmap-focus-active .menubar,
+body.heatmap-focus-active .ticker-strip,
+body.heatmap-focus-active .command-bar,
+body.heatmap-focus-active .status-footer,
+body.heatmap-focus-active .heatmap-sidebar-panel,
+body.heatmap-focus-active .heatmap-header-panel {
     display: none;
 }
 
-body.heatmap-app-fullscreen-active .main,
-body.heatmap-app-fullscreen-active .content,
-body.heatmap-app-fullscreen-active .page.active,
-body.heatmap-app-fullscreen-active .heatmap-layout,
-body.heatmap-app-fullscreen-active .heatmap-main,
-body.heatmap-app-fullscreen-active .heatmap-fullscreen-shell,
-body.heatmap-app-fullscreen-active .heatmap-panel,
-body.heatmap-app-fullscreen-active .heatmap-panel-body {
+body.heatmap-focus-active .main,
+body.heatmap-focus-active .content,
+body.heatmap-focus-active .page.active,
+body.heatmap-focus-active .heatmap-layout,
+body.heatmap-focus-active .heatmap-main,
+body.heatmap-focus-active .heatmap-fullscreen-shell,
+body.heatmap-focus-active .heatmap-panel,
+body.heatmap-focus-active .heatmap-panel-body {
     height: 100%;
     min-height: 0;
 }
 
-body.heatmap-app-fullscreen-active .heatmap-layout {
+body.heatmap-focus-active .heatmap-layout {
     grid-template-columns: minmax(0, 1fr);
 }
 
-body.heatmap-app-fullscreen-active .heatmap-chart-wrap {
+body.heatmap-focus-active .heatmap-chart-wrap {
     min-height: calc(100vh - 70px);
 }
 
-body.heatmap-app-fullscreen-active #heatmap-chart {
+body.heatmap-focus-active #heatmap-chart {
     height: calc(100vh - 70px);
 }
 
@@ -1603,6 +1603,9 @@ body.heatmap-app-fullscreen-active #heatmap-chart {
 
 .industry-modal-box {
     width: min(1200px, 100%);
+    max-height: calc(100vh - 48px);
+    display: flex;
+    flex-direction: column;
 }
 
 .stock-modal-box {
@@ -1681,6 +1684,12 @@ body.heatmap-app-fullscreen-active #heatmap-chart {
     gap: 8px;
 }
 
+.industry-modal-box .modal-body {
+    min-height: 0;
+    flex: 1;
+    grid-template-rows: auto minmax(0, 1fr);
+}
+
 #stock-chart {
     width: 100%;
     height: 520px;
@@ -1695,6 +1704,26 @@ body.heatmap-app-fullscreen-active #heatmap-chart {
     color: var(--dim);
     font-size: 10px;
     line-height: 1.5;
+}
+
+.industry-table-wrap {
+    max-height: calc(100vh - 170px);
+    min-height: 0;
+}
+
+.industry-detail-table tbody {
+    max-height: calc(100vh - 230px);
+    overflow-y: auto;
+}
+
+.industry-stock-row {
+    cursor: pointer;
+}
+
+.industry-stock-row:focus td,
+.industry-stock-row:hover td {
+    background: var(--hover-green);
+    color: var(--white);
 }
 
 .update-modal-step {
