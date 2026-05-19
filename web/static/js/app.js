@@ -48,7 +48,7 @@ const state = {
     heatmapLoading: false,
     heatmapPayloadCache: new Map(),
     heatmapHealth: null,
-    heatmapAppFullscreenActive: false,
+    heatmapFocusActive: false,
     updateModalStep: 'provider',
     updateProvider: null,
     updateHasTushareToken: false,
@@ -1029,18 +1029,6 @@ function getHeatmapFullscreenShell() {
     return document.getElementById('heatmap-fullscreen-shell');
 }
 
-function getFullscreenElement() {
-    return document.fullscreenElement || document.webkitFullscreenElement || null;
-}
-
-function fullscreenEnabled() {
-    return Boolean(document.fullscreenEnabled || document.webkitFullscreenEnabled);
-}
-
-function hasPywebviewFullscreenBridge() {
-    return Boolean(window.pywebview?.api?.toggle_heatmap_fullscreen);
-}
-
 function resizeHeatmapChart(delay = 0) {
     window.setTimeout(() => {
         if (state.heatmapChart) {
@@ -1050,13 +1038,12 @@ function resizeHeatmapChart(delay = 0) {
 }
 
 function syncHeatmapFullscreenState() {
-    const shell = getHeatmapFullscreenShell();
     const button = document.getElementById('heatmap-fullscreen-btn');
     const label = button ? button.querySelector('.heatmap-fullscreen-label') : null;
-    const isFullscreen = Boolean(shell && getFullscreenElement() === shell) || state.heatmapAppFullscreenActive;
+    const isFullscreen = state.heatmapFocusActive;
 
     document.body.classList.toggle('heatmap-fullscreen-active', isFullscreen);
-    document.body.classList.toggle('heatmap-app-fullscreen-active', state.heatmapAppFullscreenActive);
+    document.body.classList.toggle('heatmap-focus-active', isFullscreen);
     if (button) {
         button.classList.toggle('active', isFullscreen);
         button.setAttribute('aria-pressed', String(isFullscreen));
@@ -1070,17 +1057,8 @@ function syncHeatmapFullscreenState() {
 }
 
 async function exitHeatmapFullscreenIfNeeded() {
-    const shell = getHeatmapFullscreenShell();
-    if (shell && getFullscreenElement() === shell) {
-        if (document.exitFullscreen) {
-            await document.exitFullscreen();
-        } else if (document.webkitExitFullscreen) {
-            document.webkitExitFullscreen();
-        }
-    }
-    if (state.heatmapAppFullscreenActive && hasPywebviewFullscreenBridge()) {
-        await window.pywebview.api.toggle_heatmap_fullscreen();
-        state.heatmapAppFullscreenActive = false;
+    if (state.heatmapFocusActive) {
+        state.heatmapFocusActive = false;
         syncHeatmapFullscreenState();
     }
 }
@@ -1092,39 +1070,13 @@ async function toggleHeatmapFullscreen() {
 
     const shell = getHeatmapFullscreenShell();
     if (!shell) {
-        toast('当前浏览器不支持全屏模式', 'error');
+        toast('当前云图容器不可用', 'error');
         return;
     }
 
     try {
-        if (!fullscreenEnabled() && hasPywebviewFullscreenBridge()) {
-            await window.pywebview.api.toggle_heatmap_fullscreen();
-            state.heatmapAppFullscreenActive = !state.heatmapAppFullscreenActive;
-            syncHeatmapFullscreenState();
-            return;
-        }
-        if (!fullscreenEnabled()) {
-            toast('当前浏览器不支持全屏模式', 'error');
-            return;
-        }
-        if (getFullscreenElement() === shell) {
-            await exitHeatmapFullscreenIfNeeded();
-            return;
-        }
-        if (getFullscreenElement()) {
-            if (document.exitFullscreen) {
-                await document.exitFullscreen();
-            } else if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            }
-        }
-        if (shell.requestFullscreen) {
-            await shell.requestFullscreen();
-        } else if (shell.webkitRequestFullscreen) {
-            shell.webkitRequestFullscreen();
-        } else {
-            throw new Error('浏览器未提供可用的全屏接口');
-        }
+        state.heatmapFocusActive = !state.heatmapFocusActive;
+        syncHeatmapFullscreenState();
     } catch (error) {
         toast(`全屏切换失败: ${error.message}`, 'error');
     }
@@ -1330,7 +1282,10 @@ async function loadHeatmap(forceReload = false) {
 
         const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}${forceReload ? '&refresh=1' : ''}`);
         if (!result.success) {
-            throw new Error(result.error || '市场云图加载失败');
+            const detail = result.data?.errors && Object.keys(result.data.errors).length
+                ? `: ${Object.entries(result.data.errors).map(([key, value]) => `${key}=${value}`).join('; ')}`
+                : '';
+            throw new Error(`${result.error || '市场云图加载失败'}${detail}`);
         }
         const data = result.data || {};
         if (forceReload) {
@@ -2189,7 +2144,7 @@ function openIndustryModal(group) {
 
     const tbody = document.getElementById('industry-modal-tbody');
     tbody.innerHTML = group.children.map(item => `
-        <tr>
+        <tr class="industry-stock-row" data-code="${escapeHtml(item.code)}" data-name="${escapeHtml(item.name || '')}" tabindex="0">
             <td class="code-cell">${escapeHtml(item.code)}</td>
             <td>${escapeHtml(item.name || '未知')}</td>
             <td>${boardBadge(item.board || item.code)}</td>
@@ -3419,9 +3374,27 @@ function bindEvents() {
     });
 
     document.getElementById('industry-modal').addEventListener('click', event => {
+        const row = event.target.closest('.industry-stock-row');
+        if (row) {
+            closeIndustryModal();
+            viewStockDetail(row.dataset.code, row.dataset.name || '');
+            return;
+        }
         if (event.target.id === 'industry-modal') {
             closeIndustryModal();
         }
+    });
+    document.getElementById('industry-modal').addEventListener('keydown', event => {
+        if (event.key !== 'Enter') {
+            return;
+        }
+        const row = event.target.closest('.industry-stock-row');
+        if (!row) {
+            return;
+        }
+        event.preventDefault();
+        closeIndustryModal();
+        viewStockDetail(row.dataset.code, row.dataset.name || '');
     });
     document.getElementById('industry-modal-close-btn').addEventListener('click', closeIndustryModal);
     document.addEventListener('fullscreenchange', syncHeatmapFullscreenState);

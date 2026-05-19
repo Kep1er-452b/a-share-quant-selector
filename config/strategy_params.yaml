@@ -69,6 +69,20 @@ B1V242BStrategy:
   B1_TREND_TOLERANCE: 0.985
 
 # ============================================
+# B1 (V2.42P) 策略
+# ============================================
+B1V242PStrategy:
+  J_MAX: 13
+  MV_MIN_BILLION: 50
+  YANGYIN_RATIO_28: 2.25
+  YANGYIN_RATIO_14: 2.75
+  PLRY_VOL_RATIO: 1.95
+  HALF_DOWN_VOL_RATIO: 0.5
+  TOP_RANGE_RATIO: 0.95
+  FD15_VOL_RATIO: 1.2
+  B1_TREND_TOLERANCE: 0.985
+
+# ============================================
 # B2 选股 Beta 版策略
 # ============================================
 B2BetaStrategy:
@@ -109,8 +123,8 @@ B1MinJComplexStrategy:
   J_VALLEY_MAX: 55
   LONG_OFFSET: 10
   MV_MIN_BILLION: 50
-  YANGYIN_RATIO_57: 1.25
-  YANGYIN_RATIO_14: 2.25
+  YANGYIN_RATIO_28: 2.25
+  YANGYIN_RATIO_14: 2.75
   PLRY_VOL_RATIO: 1.95
   HALF_DOWN_VOL_RATIO: 0.5
   TOP_RANGE_RATIO: 0.95

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -23,14 +24,18 @@ INDEX_TARGETS = [
 ]
 
 CNINFO_STANDARD_PRIORITY = [
-    "证监会行业分类标准（2012）",
     "申银万国行业分类标准",
     "申银万国行业分类标准(旧)",
-    "新财富行业分类标准",
     "巨潮行业分类标准",
     "巨潮行业分类标准(旧)",
+    "中证行业分类标准",
+    "中证行业分类标准(旧)",
+    "新财富行业分类标准",
+    "证监会行业分类标准（2012）",
     "证监会行业分类标准（2001）",
 ]
+
+INDUSTRY_FETCH_MAX_WORKERS = 12
 
 HIDDEN_MARKET_STOCK_CODES = {"300391"}
 HIDDEN_MARKET_STOCK_NAMES = {"长药退"}
@@ -278,42 +283,41 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
     previous_cache = load_industry_cache(data_dir)
     previous_items = previous_cache.get("items", {})
     csv_codes = {path.stem for path in data_path.rglob("*.csv")}
-    sectors_df = ak.stock_sector_spot(indicator="行业")
     mapping: Dict[str, str] = {}
-    sector_total = len(sectors_df)
+    source_map: Dict[str, str] = {}
 
-    for index, row in enumerate(sectors_df.to_dict("records"), start=1):
-        label = str(row.get("label", ""))
-        sector_name = str(row.get("板块", "")).strip()
-        if not label or not sector_name:
-            continue
+    def fetch_eastmoney_industry(code: str) -> tuple[str, str]:
         try:
-            detail_df = ak.stock_sector_detail(sector=label)
+            info_df = ak.stock_individual_info_em(symbol=code)
         except Exception:
-            continue
+            return code, ""
+        if info_df is None or info_df.empty or not {"item", "value"}.issubset(info_df.columns):
+            return code, ""
+        rows = info_df[info_df["item"].astype(str).str.strip() == "行业"]
+        if rows.empty:
+            return code, ""
+        return code, _safe_text(rows.iloc[0].get("value"))
 
-        for detail in detail_df.itertuples(index=False):
-            code = str(getattr(detail, "code", "")).zfill(6)
-            if code and code in csv_codes and code not in mapping:
-                mapping[code] = sector_name
+    code_list = sorted(csv_codes)
+    processed = 0
+    with ThreadPoolExecutor(max_workers=INDUSTRY_FETCH_MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_eastmoney_industry, code): code for code in code_list}
+        for future in as_completed(futures):
+            processed += 1
+            code, industry_name = future.result()
+            if industry_name:
+                mapping[code] = industry_name
+                source_map[code] = "eastmoney"
 
-        if progress_callback and (index == 1 or index == sector_total or index % 6 == 0):
-            progress_callback(
-                stage="industry",
-                current_step="刷新行业映射缓存",
-                processed_count=index,
-                total_count=sector_total,
-                progress_pct=int((index / max(sector_total, 1)) * 100),
-                current_stock=None,
-            )
-
-    missing_codes = sorted(csv_codes - set(mapping))
-    reused_count = 0
-    for code in list(missing_codes):
-        cached_label = _safe_text(previous_items.get(code))
-        if cached_label:
-            mapping[code] = cached_label
-            reused_count += 1
+            if progress_callback and (processed == 1 or processed == len(code_list) or processed % 150 == 0):
+                progress_callback(
+                    stage="industry",
+                    current_step="按交易软件口径刷新行业映射",
+                    processed_count=processed,
+                    total_count=len(code_list),
+                    progress_pct=int((processed / max(len(code_list), 1)) * 100),
+                    current_stock={"code": code, "name": ""},
+                )
 
     missing_codes = sorted(csv_codes - set(mapping))
 
@@ -331,14 +335,14 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
                 continue
             scoped = scoped.sort_values("变更日期", ascending=False)
             for _, row in scoped.iterrows():
-                for field in ["行业大类", "行业中类", "行业次类", "行业门类"]:
+                for field in ["行业次类", "行业大类", "行业中类", "行业门类"]:
                     value = _safe_text(row.get(field))
                     if value:
                         return value
 
         normalized = normalized.sort_values("变更日期", ascending=False)
         for _, row in normalized.iterrows():
-            for field in ["行业大类", "行业中类", "行业次类", "行业门类"]:
+            for field in ["行业次类", "行业大类", "行业中类", "行业门类"]:
                 value = _safe_text(row.get(field))
                 if value:
                     return value
@@ -356,24 +360,41 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         return code, choose_cninfo_industry(detail_df)
 
     cninfo_total = len(missing_codes)
-    for processed, code in enumerate(missing_codes, start=1):
-        resolved_code, industry_name = fetch_cninfo_industry(code)
-        if industry_name:
-            mapping[resolved_code] = industry_name
-        if progress_callback and cninfo_total and (processed == 1 or processed == cninfo_total or processed % 25 == 0):
-            progress_callback(
-                stage="industry",
-                current_step="补充分散的未分类股票行业",
-                processed_count=processed,
-                total_count=cninfo_total,
-                progress_pct=int((processed / max(cninfo_total, 1)) * 100),
-                current_stock={"code": resolved_code, "name": ""},
-            )
+    if missing_codes:
+        processed = 0
+        with ThreadPoolExecutor(max_workers=INDUSTRY_FETCH_MAX_WORKERS) as executor:
+            futures = {executor.submit(fetch_cninfo_industry, code): code for code in missing_codes}
+            for future in as_completed(futures):
+                processed += 1
+                resolved_code, industry_name = future.result()
+                if industry_name:
+                    mapping[resolved_code] = industry_name
+                    source_map[resolved_code] = "cninfo"
+                if progress_callback and cninfo_total and (processed == 1 or processed == cninfo_total or processed % 25 == 0):
+                    progress_callback(
+                        stage="industry",
+                        current_step="补充分散的未分类股票行业",
+                        processed_count=processed,
+                        total_count=cninfo_total,
+                        progress_pct=int((processed / max(cninfo_total, 1)) * 100),
+                        current_stock={"code": resolved_code, "name": ""},
+                    )
+
+    missing_codes = sorted(csv_codes - set(mapping))
+    reused_count = 0
+    for code in list(missing_codes):
+        cached_label = _safe_text(previous_items.get(code))
+        if cached_label:
+            mapping[code] = cached_label
+            source_map[code] = "previous_cache"
+            reused_count += 1
 
     payload = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "akshare:stock_sector_spot/stock_sector_detail + akshare:stock_industry_change_cninfo",
+        "source": "akshare:stock_individual_info_em + akshare:stock_industry_change_cninfo",
         "mapped_count": len(mapping),
+        "eastmoney_count": sum(1 for source in source_map.values() if source == "eastmoney"),
+        "cninfo_count": sum(1 for source in source_map.values() if source == "cninfo"),
         "reused_count": reused_count,
         "unmapped_count": len(csv_codes - set(mapping)),
         "items": mapping,
