@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import re
 import textwrap
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -22,15 +23,20 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
 try:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
     import matplotlib.dates as mdates
     import matplotlib.font_manager as fm
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
 
     MPL_AVAILABLE = True
 except ModuleNotFoundError:
     mdates = None
     fm = None
     plt = None
+    mticker = None
     MPL_AVAILABLE = False
 
 
@@ -147,6 +153,7 @@ def load_prices(path: str, lookback: int) -> pd.DataFrame:
     df = normalize_columns(df)
     df["ma50"] = df["close"].rolling(50, min_periods=1).mean()
     df["ma200"] = df["close"].rolling(200, min_periods=1).mean()
+    df["vol_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
     return df.tail(lookback).copy().reset_index(drop=True)
 
 
@@ -420,8 +427,22 @@ def merge_annotations(auto: dict[str, Any], annotations_path: str | None) -> dic
     return merged
 
 
-def wrap_label(text: str, width: int = 18) -> str:
-    return "\n".join(textwrap.wrap(text, width=width, break_long_words=False, replace_whitespace=False))
+def wrap_label(text: str, width: int = 18, max_lines: int | None = None) -> str:
+    """Wrap Chinese/English labels into predictable short lines."""
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if not normalized:
+        return ""
+    lines = textwrap.wrap(
+        normalized,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+    )
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip("，。；;,. ") + "..."
+    return "\n".join(lines)
 
 
 def draw_chart(df: pd.DataFrame, analysis: dict[str, Any], output: str, title: str | None) -> None:
@@ -437,11 +458,12 @@ def draw_chart(df: pd.DataFrame, analysis: dict[str, Any], output: str, title: s
     volume_available = has_volume(df)
     if volume_available:
         fig, (ax, vol_ax) = plt.subplots(
-            2, 1, figsize=(16, 9), sharex=True, gridspec_kw={"height_ratios": [4, 1]}
+            2, 1, figsize=(18, 10.5), sharex=True, gridspec_kw={"height_ratios": [4.4, 1.0]}
         )
     else:
-        fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+        fig, ax = plt.subplots(1, 1, figsize=(18, 9.5))
         vol_ax = None
+    fig.subplots_adjust(left=0.07, right=0.985, top=0.86, bottom=0.09, hspace=0.06)
 
     dates = pd.to_datetime(df["date"])
     ax.plot(dates, df["close"], color="black", lw=1.6, label="收盘价")
@@ -453,58 +475,94 @@ def draw_chart(df: pd.DataFrame, analysis: dict[str, Any], output: str, title: s
         end = pd.to_datetime(box["end"])
         color = "#8fd19e" if box.get("kind") == "accumulation" else "#f2a0a0"
         ax.fill_between([start, end], float(box["low"]), float(box["high"]), color=color, alpha=0.24)
-        ax.text(start, float(box["high"]), f" {box.get('label', '')}", color="#333333", va="bottom", fontsize=11)
+        ax.text(start, float(box["high"]), f" {box.get('label', '')}", color="#333333", va="bottom", fontsize=12)
 
     y_min = float(np.nanmin(df["low"]))
     y_max = float(np.nanmax(df["high"]))
     y_pad = (y_max - y_min) * 0.12 or y_max * 0.05 or 1.0
     ax.set_ylim(y_min - y_pad, y_max + y_pad)
-    phase_y = y_max + y_pad * 0.55
-    for phase in analysis.get("phases", []):
+    for idx, phase in enumerate(analysis.get("phases", [])):
         start = pd.to_datetime(phase["start"])
         end = pd.to_datetime(phase["end"])
         ax.axvline(start, color="black", ls="--", lw=2.0, alpha=0.75)
         mid = start + (end - start) / 2
-        ax.text(mid, phase_y, phase["label"], color="#b30000", ha="center", va="center", fontsize=16, fontweight="bold")
+        phase_y = y_max + y_pad * (0.62 if idx % 2 == 0 else 0.42)
+        phase_label = wrap_label(phase["label"], width=9, max_lines=2)
+        ax.text(
+            mid,
+            phase_y,
+            phase_label,
+            color="#b30000",
+            ha="center",
+            va="center",
+            fontsize=15,
+            fontweight="bold",
+        )
     if analysis.get("phases"):
         ax.axvline(pd.to_datetime(analysis["phases"][-1]["end"]), color="black", ls="--", lw=1.4, alpha=0.45)
 
-    offsets = [(40, 50), (55, -58), (-70, 50), (-75, -58), (90, 42), (85, -65)]
+    offsets = [(45, 54), (65, -64), (-130, 55), (-135, -72), (88, 88), (-155, 94), (120, -118), (-180, -118)]
     for idx, event in enumerate(analysis.get("events", [])):
         x = pd.to_datetime(event["date"])
         y = float(event["price"])
         reason = event.get("reason", "")
-        label = f"{event['term']}：{reason}"
+        label = wrap_label(f"{event['term']}：{reason}", width=18, max_lines=3)
         dx, dy = offsets[idx % len(offsets)]
+        event_pos = dates.searchsorted(x)
+        if event_pos > len(dates) * 0.82 and dx > 0:
+            dx = -abs(dx) - 24
+        elif event_pos < len(dates) * 0.18 and dx < 0:
+            dx = abs(dx) + 24
+        y_ratio = (y - y_min) / ((y_max - y_min) or 1.0)
+        if y_ratio > 0.78 and dy > 0:
+            dy = -abs(dy)
+        elif y_ratio < 0.22 and dy < 0:
+            dy = abs(dy)
         ax.scatter([x], [y], s=48, color="#111111", zorder=5)
         ax.annotate(
-            wrap_label(label),
+            label,
             xy=(x, y),
             xytext=(dx, dy),
             textcoords="offset points",
             arrowprops={"arrowstyle": "->", "lw": 1.0, "color": "#333333"},
-            bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "#777777", "alpha": 0.88},
-            fontsize=10,
+            bbox={"boxstyle": "round,pad=0.28", "fc": "white", "ec": "#777777", "alpha": 0.9},
+            fontsize=10.5,
             ha="left" if dx >= 0 else "right",
             va="center",
+            annotation_clip=False,
         )
 
-    summary = analysis.get("summary", "")
     chart_title = title or "威科夫二世：市场结构读图"
-    ax.set_title(f"{chart_title}\n{summary}", fontsize=15, loc="left")
+    latest = df.iloc[-1]
+    title_line = (
+        f"{chart_title}\n"
+        f"末日收盘 {float(latest['close']):.2f} | MA50 {float(latest['ma50']):.2f} | MA200 {float(latest['ma200']):.2f}"
+    )
+    fig.suptitle(title_line, fontsize=18, fontweight="bold", x=0.07, y=0.985, ha="left")
     ax.set_ylabel("价格")
     ax.grid(True, color="#d8d8d8", lw=0.7, alpha=0.6)
     ax.legend(loc="upper left", frameon=False, ncols=3)
 
     if volume_available and vol_ax is not None:
         colors = np.where(df["close"] >= df["open"], "#5aa469", "#c44e52")
-        vol_ax.bar(dates, df["volume"], color=colors, alpha=0.6, width=1.0)
-        vol_ax.set_ylabel("成交量")
+        vol_ax.bar(dates, df["volume"], color=colors, alpha=0.35, width=1.0, label="成交量")
+        if "vol_ma20" in df.columns:
+            vol_ax.plot(dates, df["vol_ma20"], color="#555555", lw=1.1, label="20日均量")
+        vol_ax.set_ylabel("成交量\n(亿股)")
+        if mticker is not None:
+            vol_ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda value, _pos: f"{value / 1e8:.2f}"))
         vol_ax.grid(True, axis="y", color="#e2e2e2", lw=0.6, alpha=0.6)
+        vol_ax.legend(loc="upper left", frameon=False, fontsize=9)
 
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
-    fig.tight_layout()
+    fig.text(
+        0.01,
+        0.02,
+        "注：威科夫判断强调供求与行为证据，不构成投资建议。",
+        fontsize=9,
+        color="#555555",
+    )
     fig.savefig(output, dpi=180, bbox_inches="tight")
     plt.close(fig)
 

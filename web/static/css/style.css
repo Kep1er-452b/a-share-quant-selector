@@ -247,6 +247,11 @@ select {
     animation: ticker-scroll 28s linear infinite;
 }
 
+.ticker-track.wyckoff-progress-ticker {
+    color: var(--gold);
+    animation-duration: 20s;
+}
+
 @keyframes ticker-scroll {
     0% {
         transform: translateX(0);
@@ -282,7 +287,8 @@ select {
 .dashboard-terminal-grid,
 .dashboard-grid,
 .selection-layout,
-.heatmap-layout {
+.heatmap-layout,
+.wyckoff-layout {
     display: grid;
     gap: 1px;
     background: var(--grid-line);
@@ -329,6 +335,23 @@ select {
 .heatmap-layout {
     grid-template-columns: 320px minmax(0, 1fr);
     align-items: start;
+}
+
+.wyckoff-layout {
+    grid-template-columns: 340px minmax(0, 1.1fr) minmax(360px, 0.9fr);
+    align-items: stretch;
+}
+
+.wyckoff-control-panel,
+.wyckoff-chart-panel,
+.wyckoff-analysis-panel {
+    min-height: calc(100vh - 126px);
+}
+
+.wyckoff-control-body {
+    display: grid;
+    align-content: start;
+    gap: 8px;
 }
 
 .heatmap-main {
@@ -803,7 +826,8 @@ select {
 .watchlist-actions,
 .modal-header-actions,
 .export-confirm-actions,
-.watchlist-row-actions {
+.watchlist-row-actions,
+.wyckoff-input-row {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -816,6 +840,14 @@ select {
 
 .watchlist-note-input {
     max-width: 180px;
+}
+
+.wyckoff-query-input {
+    max-width: none;
+}
+
+.wyckoff-input-row .btn {
+    min-width: 92px;
 }
 
 .watchlist-row-actions {
@@ -1249,6 +1281,113 @@ select {
 
 .metric-value {
     font-size: 11px;
+}
+
+.wyckoff-status-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1px;
+    background: var(--grid-line);
+}
+
+.wyckoff-chart-body {
+    min-height: calc(100vh - 176px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-raised);
+}
+
+.wyckoff-chart-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.wyckoff-chart-actions .btn {
+    min-height: 18px;
+    padding: 0 7px;
+    font-size: 9px;
+}
+
+.wyckoff-chart-placeholder {
+    width: 100%;
+    min-height: 360px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--dim);
+    border: 1px solid var(--verydim);
+    font-size: 10px;
+    text-align: center;
+    padding: 16px;
+}
+
+.wyckoff-chart-img {
+    display: none;
+    width: 100%;
+    height: auto;
+    max-height: calc(100vh - 190px);
+    object-fit: contain;
+    border: 1px solid var(--verydim);
+    background: #ffffff;
+    cursor: zoom-in;
+}
+
+.wyckoff-analysis-text {
+    min-height: calc(100vh - 270px);
+    max-height: calc(100vh - 270px);
+    margin: 0;
+    padding: 8px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--bg-input);
+    border: 1px solid var(--verydim);
+    color: var(--white);
+    font-size: 11px;
+    line-height: 1.55;
+}
+
+.wyckoff-paths {
+    display: grid;
+    gap: 1px;
+    margin-top: 8px;
+    background: var(--grid-line);
+}
+
+.wyckoff-path-row {
+    display: grid;
+    grid-template-columns: 58px minmax(0, 1fr);
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--bg-raised);
+    color: var(--dim);
+    font-size: 9px;
+}
+
+.wyckoff-path-row code {
+    color: var(--gold);
+    overflow-wrap: anywhere;
+}
+
+.wyckoff-viewer-box {
+    width: min(96vw, 1800px);
+    height: min(94vh, 1120px);
+}
+
+.wyckoff-viewer-body {
+    height: calc(100% - 52px);
+    padding: 8px;
+    background: #050505;
+}
+
+.wyckoff-viewer-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #ffffff;
+    border: 1px solid var(--verydim);
 }
 
 .stock-kv {

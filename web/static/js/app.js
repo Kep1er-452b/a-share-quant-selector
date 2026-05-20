@@ -7,6 +7,7 @@ const PAGE_TITLES = {
     selection: '执行选股',
     strategies: '策略配置',
     watchlist: '自选股票',
+    wyckoff: '威科夫分析',
 };
 
 const BOARD_LABELS = {
@@ -58,6 +59,12 @@ const state = {
     pendingExportStock: null,
     watchlistLoaded: false,
     watchlistCache: [],
+    wyckoffConfigLoaded: false,
+    wyckoffConfigured: false,
+    wyckoffRunning: false,
+    wyckoffProgressTimer: null,
+    wyckoffProgressStep: 0,
+    currentWyckoffResult: null,
 };
 
 function escapeHtml(value) {
@@ -527,6 +534,9 @@ function switchPage(page) {
     }
     if (page === 'watchlist') {
         loadWatchlist();
+    }
+    if (page === 'wyckoff') {
+        loadWyckoffConfig();
     }
 }
 
@@ -2132,6 +2142,212 @@ async function removeWatchlistItem(code) {
     }
 }
 
+function setWyckoffStatus(message, tone = '') {
+    const status = document.getElementById('wyckoff-run-status');
+    if (!status) {
+        return;
+    }
+    status.textContent = message;
+    status.className = `metric-value${tone ? ` ${tone}` : ''}`;
+    flashElement(status);
+}
+
+function stopWyckoffProgress() {
+    window.clearInterval(state.wyckoffProgressTimer);
+    state.wyckoffProgressTimer = null;
+    state.wyckoffProgressStep = 0;
+    document.getElementById('global-ticker-track')?.classList.remove('wyckoff-progress-ticker');
+}
+
+function startWyckoffProgress(query) {
+    stopWyckoffProgress();
+    const messages = [
+        `已接收 ${query}，正在读取本地 CSV 与计算 MA50/MA200。`,
+        '正在压缩最近 500 根日线，准备发送给 DeepSeek。',
+        'DeepSeek 正在做威科夫结构判断，页面保持连接中。',
+        '正在等待模型返回 JSON；若 DeepSeek 空返回，系统会自动重试。',
+        '收到结果后会校验日期与价格，再交给本地渲染器画 PNG。',
+        '仍在分析中；这不是原始思维链，而是安全的任务进度摘要。',
+    ];
+    const chartPlaceholder = document.getElementById('wyckoff-chart-placeholder');
+    const render = () => {
+        const message = messages[Math.min(state.wyckoffProgressStep, messages.length - 1)];
+        const progressText = `WYCKOFF ${String(state.wyckoffProgressStep + 1).padStart(2, '0')}/${messages.length}   ${message}`;
+        document.getElementById('global-ticker-track')?.classList.add('wyckoff-progress-ticker');
+        updateGlobalTicker(progressText);
+        chartPlaceholder.textContent = message;
+        state.wyckoffProgressStep = (state.wyckoffProgressStep + 1) % messages.length;
+    };
+    render();
+    state.wyckoffProgressTimer = window.setInterval(render, 4200);
+}
+
+async function loadWyckoffConfig(forceReload = false) {
+    if (state.systemHalted) {
+        return;
+    }
+    if (state.wyckoffConfigLoaded && !forceReload) {
+        return;
+    }
+    const configStatus = document.getElementById('wyckoff-config-status');
+    try {
+        const result = await apiFetch('/api/wyckoff/config');
+        if (!result.success) {
+            throw new Error(result.error || '威科夫配置检查失败');
+        }
+        state.wyckoffConfigured = Boolean(result.data?.configured);
+        state.wyckoffConfigLoaded = true;
+        document.getElementById('wyckoff-model-label').textContent = result.data?.model || 'deepseek-v4-pro';
+        configStatus.textContent = state.wyckoffConfigured ? 'DeepSeek token 已配置，本地 CSV 分析可用' : '未配置 DeepSeek token';
+        configStatus.classList.toggle('down', !state.wyckoffConfigured);
+        configStatus.classList.toggle('highlight', state.wyckoffConfigured);
+    } catch (error) {
+        configStatus.textContent = `配置检查失败: ${error.message}`;
+        configStatus.classList.add('down');
+    }
+}
+
+function renderWyckoffResult(result) {
+    state.currentWyckoffResult = result;
+    const stock = result.stock || {};
+    const analysis = result.analysis || {};
+    const paths = result.paths || {};
+    const chartImg = document.getElementById('wyckoff-chart-img');
+    const placeholder = document.getElementById('wyckoff-chart-placeholder');
+    const chartSubtitle = document.getElementById('wyckoff-chart-subtitle');
+    const chartMeta = document.getElementById('wyckoff-chart-meta');
+    const analysisMeta = document.getElementById('wyckoff-analysis-meta');
+    const latestRun = document.getElementById('wyckoff-latest-run');
+    const analysisText = document.getElementById('wyckoff-analysis-text');
+    const pathsEl = document.getElementById('wyckoff-paths');
+
+    const chartUrl = `${result.chart_url}?t=${Date.now()}`;
+    chartImg.src = chartUrl;
+    chartImg.style.display = 'block';
+    chartImg.dataset.fullsrc = chartUrl;
+    placeholder.style.display = 'none';
+    chartSubtitle.textContent = `${stock.code || '--'} ${stock.name || ''} · ${analysis.mode || 'unclear'} · ${analysis.current_phase || 'unclear'}`.trim();
+    chartMeta.textContent = result.data?.latest_date || 'PNG';
+    analysisMeta.textContent = result.model || 'JSON';
+    latestRun.textContent = result.generated_at || '--';
+    analysisText.textContent = result.analysis_text || analysis.summary_text || 'AI 未返回分析正文';
+    document.getElementById('wyckoff-fullscreen-btn').disabled = false;
+    document.getElementById('wyckoff-reveal-btn').disabled = !paths.chart_path;
+
+    pathsEl.innerHTML = [
+        ['CHART', paths.chart_path],
+        ['JSON', paths.analysis_path],
+        ['DEBUG', paths.debug_path],
+    ].filter(([, value]) => value).map(([label, value]) => `
+        <div class="wyckoff-path-row">
+            <span>${label}</span>
+            <code>${escapeHtml(value)}</code>
+        </div>
+    `).join('');
+}
+
+function openWyckoffViewer() {
+    const result = state.currentWyckoffResult;
+    if (!result?.chart_url) {
+        toast('当前还没有可预览的威科夫图表', 'error');
+        return;
+    }
+    const stock = result.stock || {};
+    const analysis = result.analysis || {};
+    document.getElementById('wyckoff-viewer-title').textContent =
+        `${stock.code || ''} ${stock.name || ''} · ${analysis.mode || '--'} · ${analysis.current_phase || '--'}`.trim();
+    document.getElementById('wyckoff-viewer-img').src = `${result.chart_url}?t=${Date.now()}`;
+    document.getElementById('wyckoff-viewer').classList.add('active');
+}
+
+function closeWyckoffViewer() {
+    document.getElementById('wyckoff-viewer').classList.remove('active');
+}
+
+async function revealWyckoffChart() {
+    const chartPath = state.currentWyckoffResult?.paths?.chart_path;
+    if (!chartPath) {
+        toast('当前没有可在访达中打开的图表', 'error');
+        return;
+    }
+    try {
+        const result = await apiFetch('/api/wyckoff/reveal', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ path: chartPath }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '访达打开失败');
+        }
+        toast('已在访达中定位图表文件', 'success');
+    } catch (error) {
+        toast(`访达打开失败: ${error.message}`, 'error');
+    }
+}
+
+async function runWyckoffAnalysis() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法执行威科夫分析', 'error');
+        return;
+    }
+    if (state.wyckoffRunning) {
+        return;
+    }
+    const input = document.getElementById('wyckoff-query');
+    const button = document.getElementById('wyckoff-run-btn');
+    const query = input.value.trim();
+    if (!query) {
+        toast('请输入股票代码、名称或拼音', 'error');
+        input.focus();
+        return;
+    }
+
+    state.wyckoffRunning = true;
+    button.disabled = true;
+    setStatus('running');
+    setWyckoffStatus('RUNNING', 'highlight');
+    setCommandOutput(`WYCKOFF ${query}<GO>`, 'info');
+    document.getElementById('wyckoff-analysis-text').textContent = '等待 DeepSeek 返回结构化分析...';
+    document.getElementById('wyckoff-fullscreen-btn').disabled = true;
+    document.getElementById('wyckoff-reveal-btn').disabled = true;
+    document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
+    document.getElementById('wyckoff-chart-img').style.display = 'none';
+    startWyckoffProgress(query);
+
+    try {
+        const result = await apiFetch('/api/wyckoff/analyze', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ query }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '威科夫分析失败');
+        }
+        stopWyckoffProgress();
+        renderWyckoffResult(result);
+        updateGlobalTicker(`WYCKOFF READY   ${result.stock?.code || query} ${result.stock?.name || ''}   图表已保存到 ${result.paths?.chart_path || 'outputs/wyckoff'}`);
+        setWyckoffStatus('READY', 'highlight');
+        setStatus('ready');
+        toast(`威科夫分析完成: ${result.stock?.code || query}`, 'success', 4200);
+    } catch (error) {
+        stopWyckoffProgress();
+        updateGlobalTicker(`WYCKOFF ERROR   ${query}   ${error.message}`);
+        setWyckoffStatus('ERROR', 'down');
+        setStatus('error');
+        document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
+        document.getElementById('wyckoff-chart-placeholder').textContent = `分析失败: ${error.message}`;
+        document.getElementById('wyckoff-analysis-text').textContent = `分析失败: ${error.message}`;
+        toast(`威科夫分析失败: ${error.message}`, 'error', 5200);
+    } finally {
+        state.wyckoffRunning = false;
+        button.disabled = false;
+    }
+}
+
 function openIndustryModal(group) {
     if (!group || !Array.isArray(group.children)) {
         return;
@@ -3177,6 +3393,10 @@ function runTerminalCommand() {
         switchPage('watchlist');
         return;
     }
+    if (command === 'F7' || command === 'WYCKOFF' || command === 'WK') {
+        switchPage('wyckoff');
+        return;
+    }
     if (command === 'UPDATE') {
         openUpdateModal();
         return;
@@ -3295,6 +3515,23 @@ function bindEvents() {
         if (event.key === 'Enter') {
             event.preventDefault();
             addWatchlistItem();
+        }
+    });
+    document.getElementById('wyckoff-run-btn').addEventListener('click', runWyckoffAnalysis);
+    document.getElementById('wyckoff-fullscreen-btn').addEventListener('click', openWyckoffViewer);
+    document.getElementById('wyckoff-reveal-btn').addEventListener('click', revealWyckoffChart);
+    document.getElementById('wyckoff-chart-img').addEventListener('click', openWyckoffViewer);
+    document.getElementById('wyckoff-viewer-close-btn').addEventListener('click', closeWyckoffViewer);
+    document.getElementById('wyckoff-viewer-reveal-btn').addEventListener('click', revealWyckoffChart);
+    document.getElementById('wyckoff-viewer').addEventListener('click', event => {
+        if (event.target.id === 'wyckoff-viewer') {
+            closeWyckoffViewer();
+        }
+    });
+    document.getElementById('wyckoff-query').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            runWyckoffAnalysis();
         }
     });
     document.getElementById('save-config-btn').addEventListener('click', saveConfig);

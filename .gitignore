@@ -38,6 +38,7 @@ data/
 
 # Logs
 *.log
+outputs/
 
 # Config with sensitive info (user should create their own)
 config/config.yaml
