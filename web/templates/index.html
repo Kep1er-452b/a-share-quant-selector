@@ -97,6 +97,10 @@
                 <span class="nav-fn">F6</span>
                 <span class="nav-label">WATCHLIST</span>
             </li>
+            <li class="nav-item" data-page="wyckoff">
+                <span class="nav-fn">F7</span>
+                <span class="nav-label">WYCKOFF</span>
+            </li>
         </ul>
         <div class="asset-tabs" aria-hidden="true">
             <span class="asset-tab active">EQ</span>
@@ -318,6 +322,83 @@
                             </tbody>
                         </table>
                     </div>
+                </div>
+            </section>
+
+            <section id="wyckoff-page" class="page">
+                <div class="wyckoff-layout">
+                    <section class="panel wyckoff-control-panel">
+                        <div class="panel-header panel-header-wrap">
+                            <div>
+                                <span class="panel-title">WYCKOFF AI ANALYSIS</span>
+                                <div class="panel-subtitle" id="wyckoff-config-status">检查 DeepSeek 配置...</div>
+                            </div>
+                            <span class="panel-meta">F7</span>
+                        </div>
+                        <div class="panel-body wyckoff-control-body">
+                            <div class="control-section">
+                                <div class="control-section-head">
+                                    <span class="control-section-title">SINGLE STOCK</span>
+                                    <span class="control-section-meta">LOCAL CSV</span>
+                                </div>
+                                <div class="wyckoff-input-row">
+                                    <input type="text" id="wyckoff-query" class="search-input wyckoff-query-input" placeholder="CODE / NAME / PINYIN">
+                                    <button class="btn btn-primary" id="wyckoff-run-btn" type="button">ANALYZE</button>
+                                </div>
+                            </div>
+                            <div class="wyckoff-status-grid">
+                                <div class="metric">
+                                    <div class="metric-label">STATUS</div>
+                                    <div class="metric-value" id="wyckoff-run-status">READY</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-label">MODEL</div>
+                                    <div class="metric-value" id="wyckoff-model-label">deepseek-v4-pro</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-label">LATEST RUN</div>
+                                    <div class="metric-value" id="wyckoff-latest-run">--</div>
+                                </div>
+                            </div>
+                            <div class="terminal-list">
+                                <div class="terminal-row">01  F7 第一版只分析单只股票，读取本地 CSV，不抓远端数据。</div>
+                                <div class="terminal-row">02  AI 只输出结构化威科夫标注，本地可信渲染器负责画图。</div>
+                                <div class="terminal-row">03  图表、JSON 与调试记录保存到 outputs/wyckoff。</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel wyckoff-chart-panel">
+                        <div class="panel-header panel-header-wrap">
+                            <div>
+                                <span class="panel-title">CHART OUTPUT</span>
+                                <div class="panel-subtitle" id="wyckoff-chart-subtitle">尚未生成威科夫图表</div>
+                            </div>
+                            <div class="wyckoff-chart-actions">
+                                <button class="btn btn-ghost" id="wyckoff-fullscreen-btn" type="button" disabled>全屏看图</button>
+                                <button class="btn btn-ghost" id="wyckoff-reveal-btn" type="button" disabled>访达打开</button>
+                                <span class="panel-meta" id="wyckoff-chart-meta">PNG</span>
+                            </div>
+                        </div>
+                        <div class="panel-body wyckoff-chart-body">
+                            <div class="wyckoff-chart-placeholder" id="wyckoff-chart-placeholder">等待分析任务...</div>
+                            <img id="wyckoff-chart-img" class="wyckoff-chart-img" alt="威科夫分析图表">
+                        </div>
+                    </section>
+
+                    <section class="panel wyckoff-analysis-panel">
+                        <div class="panel-header panel-header-wrap">
+                            <div>
+                                <span class="panel-title">AI TEXT ANALYSIS</span>
+                                <div class="panel-subtitle">模型原文分析经过结构化校验后展示</div>
+                            </div>
+                            <span class="panel-meta" id="wyckoff-analysis-meta">JSON</span>
+                        </div>
+                        <div class="panel-body">
+                            <pre class="wyckoff-analysis-text" id="wyckoff-analysis-text">等待威科夫分析...</pre>
+                            <div class="wyckoff-paths" id="wyckoff-paths"></div>
+                        </div>
+                    </section>
                 </div>
             </section>
 
@@ -641,6 +722,24 @@
                 <button class="btn btn-primary" id="export-update-first-btn" type="button">先更新后导出</button>
                 <button class="btn btn-secondary" id="export-force-btn" type="button">直接导出</button>
             </div>
+        </div>
+    </div>
+</div>
+
+<div id="wyckoff-viewer" class="modal-backdrop">
+    <div class="modal-box wyckoff-viewer-box">
+        <div class="modal-header">
+            <div>
+                <div class="modal-kicker">WYCKOFF CHART VIEWER</div>
+                <h2 class="modal-title" id="wyckoff-viewer-title">威科夫图表</h2>
+            </div>
+            <div class="modal-header-actions">
+                <button class="btn btn-ghost" id="wyckoff-viewer-reveal-btn" type="button">访达打开</button>
+                <button class="modal-close" id="wyckoff-viewer-close-btn" type="button">X</button>
+            </div>
+        </div>
+        <div class="modal-body wyckoff-viewer-body">
+            <img id="wyckoff-viewer-img" class="wyckoff-viewer-img" alt="威科夫图表全屏预览">
         </div>
     </div>
 </div>

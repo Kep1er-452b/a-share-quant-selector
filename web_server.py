@@ -1,7 +1,7 @@
 """
 Web 服务器 - A股量化选股系统前端
 """
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, send_from_directory
 import json
 import sys
 import socket
@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import signal
+import subprocess
 import time
 import uuid
 from threading import Event, Lock, Thread, Timer
@@ -46,6 +47,8 @@ from utils.stock_exporter import (
     resolve_stock_query,
     search_stocks,
 )
+from wyckoff_ai import WyckoffPipeline, has_deepseek_config
+from wyckoff_ai.pipeline import WyckoffPipelineError
 import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
 
@@ -1203,6 +1206,83 @@ def export_stock_csv(code):
         return jsonify(result)
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wyckoff/config')
+def get_wyckoff_config():
+    """Return Wyckoff AI configuration status without exposing secrets."""
+    try:
+        config = _load_config()
+        return jsonify({
+            'success': True,
+            'data': {
+                'configured': has_deepseek_config(config),
+                'provider': 'deepseek',
+                'model': 'deepseek-v4-pro',
+            },
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/wyckoff/analyze', methods=['POST'])
+def analyze_wyckoff_stock():
+    """Run a single-stock Wyckoff AI analysis against local CSV data."""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        payload = request.get_json(silent=True) or {}
+        query = _normalize_csv_value(payload.get('query'))
+        if not query:
+            return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音'}), 400
+
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
+        result = pipeline.analyze_stock(query)
+        chart_filename = Path(result['paths']['chart_path']).name
+        result['chart_url'] = f"/outputs/wyckoff/charts/{chart_filename}"
+        return jsonify(result)
+    except WyckoffPipelineError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wyckoff/reveal', methods=['POST'])
+def reveal_wyckoff_file():
+    """Reveal a generated Wyckoff artifact in Finder."""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        payload = request.get_json(silent=True) or {}
+        raw_path = _normalize_csv_value(payload.get('path'))
+        if not raw_path:
+            return jsonify({'success': False, 'error': '缺少文件路径'}), 400
+
+        outputs_root = (project_root / 'outputs' / 'wyckoff').resolve()
+        target = Path(raw_path)
+        if not target.is_absolute():
+            target = project_root / target
+        target = target.resolve()
+        if outputs_root not in target.parents and target != outputs_root:
+            return jsonify({'success': False, 'error': '只能打开 outputs/wyckoff 下的文件'}), 400
+        if not target.exists():
+            return jsonify({'success': False, 'error': f'文件不存在: {target}'}), 404
+
+        subprocess.run(['open', '-R', str(target)], check=False)
+        return jsonify({'success': True, 'path': str(target)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/outputs/wyckoff/charts/<path:filename>')
+def serve_wyckoff_chart(filename):
+    """Serve generated Wyckoff chart PNG files from the ignored outputs folder."""
+    charts_dir = project_root / 'outputs' / 'wyckoff' / 'charts'
+    return send_from_directory(charts_dir, filename)
 
 
 @app.route('/api/dashboard-pulse')

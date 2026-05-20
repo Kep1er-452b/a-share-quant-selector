@@ -36,6 +36,15 @@ web:
   auto_port: true
   allow_lan: false  # 如需局域网访问才改为 true
 
+# 威科夫 AI 分析配置
+# deepseek_api_key 请放在 config/config_local.yaml 或环境变量 DEEPSEEK_API_KEY
+wyckoff_ai:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4-pro"
+  timeout_seconds: 90
+  deepseek_api_key: ""
+
 # 数据更新配置
 update:
   lookback_days: 10
