@@ -74,7 +74,7 @@ class DeepSeekWyckoffClient:
             "messages": messages,
             "stream": False,
             "extra_body": {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}},
-            "max_tokens": 4096,
+            "max_tokens": 6144,
         }
         if thinking_enabled:
             kwargs["reasoning_effort"] = "max"

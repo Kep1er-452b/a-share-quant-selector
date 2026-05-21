@@ -146,6 +146,31 @@ def _validate_phases(phases: Any, available_dates: set[str]) -> list[dict[str, A
     return normalized
 
 
+def _validate_key_levels(levels: Any, df: pd.DataFrame) -> list[dict[str, Any]]:
+    if levels is None:
+        return []
+    if not isinstance(levels, list):
+        raise WyckoffSchemaError("key_levels 必须是数组")
+    low_limit = float(df["low"].min()) * 0.88
+    high_limit = float(df["high"].max()) * 1.12
+    normalized = []
+    for index, item in enumerate(levels[:10], 1):
+        if not isinstance(item, dict):
+            raise WyckoffSchemaError("key_levels 中每一项都必须是对象")
+        try:
+            price = float(item.get("price"))
+        except Exception as exc:
+            raise WyckoffSchemaError(f"key_level[{index}] 价格无法解析") from exc
+        if price < low_limit or price > high_limit:
+            raise WyckoffSchemaError(f"key_level[{index}] 价格明显超出行情范围: {price:.4f}")
+        normalized.append({
+            "price": round(price, 4),
+            "label": str(item.get("label") or "关键价位").strip()[:32],
+            "meaning": str(item.get("meaning") or "").strip()[:120],
+        })
+    return normalized
+
+
 def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
     """Validate model output against the actual CSV dates and prices."""
     if not isinstance(payload, dict):
@@ -160,14 +185,17 @@ def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, An
     normalized["mode"] = mode
     normalized["current_phase"] = str(payload.get("current_phase") or "unclear").strip()[:32]
     normalized["summary_text"] = _require_text(payload, "summary_text")
+    normalized["background_text"] = str(payload.get("background_text") or "").strip()[:240]
     normalized["risk_note"] = str(
         payload.get("risk_note") or "本分析仅为基于历史量价结构的技术分析，不构成投资建议。"
     ).strip()
     normalized["events"] = _validate_events(payload.get("events"), prices_by_date)
     normalized["ranges"] = _validate_ranges(payload.get("ranges"), available_dates)
     normalized["phases"] = _validate_phases(payload.get("phases"), available_dates)
+    normalized["key_levels"] = _validate_key_levels(payload.get("key_levels"), df)
     scenarios = payload.get("scenarios") or []
     normalized["scenarios"] = scenarios if isinstance(scenarios, list) else [str(scenarios)]
+    normalized["conclusion_text"] = str(payload.get("conclusion_text") or "").strip()[:180]
     return normalized
 
 
