@@ -64,6 +64,12 @@ const state = {
     wyckoffRunning: false,
     wyckoffProgressTimer: null,
     wyckoffProgressStep: 0,
+    wyckoffPollTimer: null,
+    wyckoffJobId: null,
+    wyckoffLastProgressText: '',
+    wyckoffTickerQueue: [],
+    wyckoffTickerTimer: null,
+    wyckoffTickerActive: false,
     currentWyckoffResult: null,
 };
 
@@ -220,7 +226,7 @@ function signedClass(value) {
     if (!Number.isFinite(numeric) || numeric === 0) {
         return '';
     }
-    return numeric > 0 ? 'up' : 'down';
+    return numeric > 0 ? 'price-up' : 'price-down';
 }
 
 function heatmapColor(changePct) {
@@ -234,15 +240,15 @@ function heatmapColor(changePct) {
     }
     if (clamped > 0) {
         const ratio = clamped / 4;
-        const red = Math.round(13 + (0 - 13) * ratio);
-        const green = Math.round(26 + (255 - 26) * ratio);
-        const blue = Math.round(13 + (65 - 13) * ratio);
+        const red = Math.round(26 + (255 - 26) * ratio);
+        const green = Math.round(10 + (49 - 10) * ratio);
+        const blue = Math.round(10 + (49 - 10) * ratio);
         return `rgb(${red}, ${green}, ${blue})`;
     }
     const ratio = Math.abs(clamped) / 4;
-    const red = Math.round(26 + (255 - 26) * ratio);
-    const green = Math.round(10 + (49 - 10) * ratio);
-    const blue = Math.round(10 + (49 - 10) * ratio);
+    const red = Math.round(13 + (0 - 13) * ratio);
+    const green = Math.round(26 + (200 - 26) * ratio);
+    const blue = Math.round(13 + (83 - 13) * ratio);
     return `rgb(${red}, ${green}, ${blue})`;
 }
 
@@ -1758,7 +1764,7 @@ function renderStockChart(data) {
                 label: {
                     show: true,
                     formatter: params => String(params.data[2]),
-                    color: '#ff4dff',
+                    color: '#ff8a80',
                     fontSize: 13,
                     fontWeight: 700,
                     position: 'top',
@@ -1773,7 +1779,7 @@ function renderStockChart(data) {
                 label: {
                     show: true,
                     formatter: params => String(params.data[2]),
-                    color: '#00ff41',
+                    color: '#ff3131',
                     fontSize: 13,
                     fontWeight: 700,
                     position: 'top',
@@ -1788,7 +1794,7 @@ function renderStockChart(data) {
                 label: {
                     show: true,
                     formatter: params => String(params.data[2]),
-                    color: '#00ff41',
+                    color: '#69f0ae',
                     fontSize: 13,
                     fontWeight: 700,
                     position: 'bottom',
@@ -1803,7 +1809,7 @@ function renderStockChart(data) {
                 label: {
                     show: true,
                     formatter: params => String(params.data[2]),
-                    color: '#ff4dff',
+                    color: '#00c853',
                     fontSize: 13,
                     fontWeight: 700,
                     position: 'bottom',
@@ -2154,32 +2160,109 @@ function setWyckoffStatus(message, tone = '') {
 
 function stopWyckoffProgress() {
     window.clearInterval(state.wyckoffProgressTimer);
+    window.clearInterval(state.wyckoffPollTimer);
+    window.clearTimeout(state.wyckoffTickerTimer);
     state.wyckoffProgressTimer = null;
+    state.wyckoffPollTimer = null;
     state.wyckoffProgressStep = 0;
-    document.getElementById('global-ticker-track')?.classList.remove('wyckoff-progress-ticker');
+    state.wyckoffJobId = null;
+    state.wyckoffLastProgressText = '';
+    state.wyckoffTickerQueue = [];
+    state.wyckoffTickerTimer = null;
+    state.wyckoffTickerActive = false;
+    const track = document.getElementById('global-ticker-track');
+    if (track) {
+        track.classList.remove('wyckoff-progress-ticker');
+        track.style.removeProperty('--ticker-duration');
+    }
 }
 
-function startWyckoffProgress(query) {
-    stopWyckoffProgress();
-    const messages = [
-        `已接收 ${query}，正在读取本地 CSV 与计算 MA50/MA200。`,
-        '正在压缩最近 500 根日线，准备发送给 DeepSeek。',
-        'DeepSeek 正在做威科夫结构判断，页面保持连接中。',
-        '正在等待模型返回 JSON；若 DeepSeek 空返回，系统会自动重试。',
-        '收到结果后会校验日期与价格，再交给本地渲染器画 PNG。',
-        '仍在分析中；这不是原始思维链，而是安全的任务进度摘要。',
-    ];
+function runNextWyckoffTicker() {
+    const next = state.wyckoffTickerQueue.shift();
+    if (!next) {
+        state.wyckoffTickerActive = false;
+        return;
+    }
+    state.wyckoffTickerActive = true;
+    const track = document.getElementById('global-ticker-track');
+    if (track) {
+        track.classList.add('wyckoff-progress-ticker');
+        const repeated = `${next}   •   ${next}`;
+        const duration = Math.max(16, Math.min(42, Math.ceil(next.length * 0.32)));
+        track.style.setProperty('--ticker-duration', `${duration}s`);
+        state.globalTickerText = repeated;
+        track.textContent = repeated;
+        flashElement(track);
+        state.wyckoffTickerTimer = window.setTimeout(runNextWyckoffTicker, duration * 1000);
+    }
+}
+
+function enqueueWyckoffTicker(message, force = false) {
+    const normalized = String(message || '').trim();
+    if (!normalized) {
+        return;
+    }
+    if (!force && normalized === state.wyckoffLastProgressText) {
+        return;
+    }
+    state.wyckoffLastProgressText = normalized;
+    if (state.wyckoffTickerQueue[state.wyckoffTickerQueue.length - 1] !== normalized) {
+        state.wyckoffTickerQueue.push(normalized);
+    }
+    if (!state.wyckoffTickerActive) {
+        runNextWyckoffTicker();
+    }
+}
+
+function renderWyckoffProgress(job) {
+    const message = job?.message || '威科夫任务进行中。';
+    const pct = Number.isFinite(Number(job?.progress_pct)) ? Number(job.progress_pct) : 0;
+    const step = job?.current_step || job?.status || 'running';
     const chartPlaceholder = document.getElementById('wyckoff-chart-placeholder');
-    const render = () => {
-        const message = messages[Math.min(state.wyckoffProgressStep, messages.length - 1)];
-        const progressText = `WYCKOFF ${String(state.wyckoffProgressStep + 1).padStart(2, '0')}/${messages.length}   ${message}`;
-        document.getElementById('global-ticker-track')?.classList.add('wyckoff-progress-ticker');
-        updateGlobalTicker(progressText);
+    const progressText = `WYCKOFF ${String(Math.round(pct)).padStart(3, '0')}%   ${String(step).toUpperCase()}   ${message}`;
+    enqueueWyckoffTicker(progressText);
+    if (chartPlaceholder && chartPlaceholder.style.display !== 'none') {
         chartPlaceholder.textContent = message;
-        state.wyckoffProgressStep = (state.wyckoffProgressStep + 1) % messages.length;
-    };
-    render();
-    state.wyckoffProgressTimer = window.setInterval(render, 4200);
+    }
+}
+
+async function pollWyckoffJob() {
+    if (!state.wyckoffJobId) {
+        return;
+    }
+    try {
+        const result = await apiFetch(`/api/wyckoff/status/${state.wyckoffJobId}`);
+        if (!result.success) {
+            throw new Error(result.error || '威科夫任务状态读取失败');
+        }
+        const job = result.data || {};
+        renderWyckoffProgress(job);
+        if (job.status === 'done') {
+            stopWyckoffProgress();
+            renderWyckoffResult(job.result);
+            updateGlobalTicker(`WYCKOFF READY   ${job.result?.stock?.code || ''} ${job.result?.stock?.name || ''}   图表已保存到 ${job.result?.paths?.chart_path || 'outputs/wyckoff'}`);
+            setWyckoffStatus('READY', 'highlight');
+            setStatus('ready');
+            toast(`威科夫分析完成: ${job.result?.stock?.code || ''}`, 'success', 4200);
+            state.wyckoffRunning = false;
+            document.getElementById('wyckoff-run-btn').disabled = false;
+            return;
+        }
+        if (job.status === 'error') {
+            throw new Error(job.error || job.message || '威科夫分析失败');
+        }
+    } catch (error) {
+        stopWyckoffProgress();
+        updateGlobalTicker(`WYCKOFF ERROR   ${error.message}`);
+        setWyckoffStatus('ERROR', 'down');
+        setStatus('error');
+        document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
+        document.getElementById('wyckoff-chart-placeholder').textContent = `分析失败: ${error.message}`;
+        document.getElementById('wyckoff-analysis-text').textContent = `分析失败: ${error.message}`;
+        toast(`威科夫分析失败: ${error.message}`, 'error', 5200);
+        state.wyckoffRunning = false;
+        document.getElementById('wyckoff-run-btn').disabled = false;
+    }
 }
 
 async function loadWyckoffConfig(forceReload = false) {
@@ -2305,6 +2388,7 @@ async function runWyckoffAnalysis() {
     }
 
     state.wyckoffRunning = true;
+    stopWyckoffProgress();
     button.disabled = true;
     setStatus('running');
     setWyckoffStatus('RUNNING', 'highlight');
@@ -2314,10 +2398,10 @@ async function runWyckoffAnalysis() {
     document.getElementById('wyckoff-reveal-btn').disabled = true;
     document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
     document.getElementById('wyckoff-chart-img').style.display = 'none';
-    startWyckoffProgress(query);
+    enqueueWyckoffTicker(`WYCKOFF 000%   START   已接收 ${query}，正在创建后端分析任务。`, true);
 
     try {
-        const result = await apiFetch('/api/wyckoff/analyze', {
+        const result = await apiFetch('/api/wyckoff/start', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2327,12 +2411,10 @@ async function runWyckoffAnalysis() {
         if (!result.success) {
             throw new Error(result.error || '威科夫分析失败');
         }
-        stopWyckoffProgress();
-        renderWyckoffResult(result);
-        updateGlobalTicker(`WYCKOFF READY   ${result.stock?.code || query} ${result.stock?.name || ''}   图表已保存到 ${result.paths?.chart_path || 'outputs/wyckoff'}`);
-        setWyckoffStatus('READY', 'highlight');
-        setStatus('ready');
-        toast(`威科夫分析完成: ${result.stock?.code || query}`, 'success', 4200);
+        state.wyckoffJobId = result.job_id;
+        renderWyckoffProgress(result.data || {});
+        state.wyckoffPollTimer = window.setInterval(pollWyckoffJob, 1200);
+        await pollWyckoffJob();
     } catch (error) {
         stopWyckoffProgress();
         updateGlobalTicker(`WYCKOFF ERROR   ${query}   ${error.message}`);
@@ -2342,7 +2424,6 @@ async function runWyckoffAnalysis() {
         document.getElementById('wyckoff-chart-placeholder').textContent = `分析失败: ${error.message}`;
         document.getElementById('wyckoff-analysis-text').textContent = `分析失败: ${error.message}`;
         toast(`威科夫分析失败: ${error.message}`, 'error', 5200);
-    } finally {
         state.wyckoffRunning = false;
         button.disabled = false;
     }

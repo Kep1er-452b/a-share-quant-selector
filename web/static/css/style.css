@@ -9,6 +9,8 @@
     --grid-line: #222222;
     --up: #00ff41;
     --down: #ff3131;
+    --price-up: #ff3131;
+    --price-down: #00c853;
     --neutral: #888888;
     --accent: #ff6600;
     --gold: #ffd700;
@@ -244,7 +246,7 @@ select {
     font-size: 10px;
     line-height: 21px;
     letter-spacing: 0.05em;
-    animation: ticker-scroll 28s linear infinite;
+    animation: ticker-scroll var(--ticker-duration, 28s) linear infinite;
 }
 
 .ticker-track.wyckoff-progress-ticker {
@@ -520,11 +522,11 @@ select {
 }
 
 .quote-chart-meta.positive {
-    color: var(--down);
+    color: var(--price-up);
 }
 
 .quote-chart-meta.negative {
-    color: var(--up);
+    color: var(--price-down);
 }
 
 .quote-sparkline {
@@ -693,11 +695,11 @@ select {
 }
 
 .pulse-value.up {
-    color: var(--down);
+    color: var(--price-up);
 }
 
 .pulse-value.down {
-    color: var(--up);
+    color: var(--price-down);
 }
 
 .pulse-sub {
@@ -1042,6 +1044,14 @@ select {
 
 .down {
     color: var(--down);
+}
+
+.price-up {
+    color: var(--price-up);
+}
+
+.price-down {
+    color: var(--price-down);
 }
 
 .highlight {
@@ -1475,7 +1485,7 @@ select {
 }
 
 .heatmap-legend-bar .neg {
-    color: var(--down);
+    color: var(--price-down);
 }
 
 .heatmap-legend-bar .mid {
@@ -1483,7 +1493,7 @@ select {
 }
 
 .heatmap-legend-bar .pos {
-    color: var(--up);
+    color: var(--price-up);
 }
 
 .heatmap-filter-note {

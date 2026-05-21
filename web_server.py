@@ -65,6 +65,8 @@ selection_jobs = {}
 selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
+wyckoff_jobs = {}
+wyckoff_jobs_lock = Lock()
 watchlist_lock = Lock()
 
 INDEX_KLINE_TARGETS = {
@@ -1246,6 +1248,115 @@ def analyze_wyckoff_stock():
         return jsonify(result)
     except WyckoffPipelineError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _update_wyckoff_job(job_id, **updates):
+    with wyckoff_jobs_lock:
+        job = wyckoff_jobs.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _run_wyckoff_job(job_id, query):
+    try:
+        _update_wyckoff_job(
+            job_id,
+            status='running',
+            current_step='任务启动',
+            message='威科夫任务已启动，正在准备分析环境。',
+            progress_pct=1,
+        )
+
+        def progress_callback(payload):
+            _update_wyckoff_job(
+                job_id,
+                status='running',
+                current_step=payload.get('step') or 'running',
+                message=payload.get('message') or '任务进行中',
+                progress_pct=int(payload.get('progress_pct') or 0),
+            )
+
+        config = _load_config()
+        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
+        result = pipeline.analyze_stock(query, progress_callback=progress_callback)
+        chart_filename = Path(result['paths']['chart_path']).name
+        result['chart_url'] = f"/outputs/wyckoff/charts/{chart_filename}"
+        _update_wyckoff_job(
+            job_id,
+            status='done',
+            current_step='完成',
+            message='威科夫分析完成，图表与文件已保存。',
+            progress_pct=100,
+            result=result,
+        )
+    except WyckoffPipelineError as e:
+        _update_wyckoff_job(
+            job_id,
+            status='error',
+            current_step='失败',
+            message=str(e),
+            error=str(e),
+        )
+    except Exception as e:
+        _update_wyckoff_job(
+            job_id,
+            status='error',
+            current_step='失败',
+            message=str(e),
+            error=str(e),
+        )
+
+
+@app.route('/api/wyckoff/start', methods=['POST'])
+def start_wyckoff_stock():
+    """Start a single-stock Wyckoff AI analysis job."""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        payload = request.get_json(silent=True) or {}
+        query = _normalize_csv_value(payload.get('query'))
+        if not query:
+            return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音'}), 400
+
+        job_id = str(uuid.uuid4())
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with wyckoff_jobs_lock:
+            wyckoff_jobs[job_id] = {
+                'job_id': job_id,
+                'query': query,
+                'status': 'queued',
+                'current_step': '排队',
+                'message': '威科夫任务已进入队列。',
+                'progress_pct': 0,
+                'created_at': now,
+                'updated_at': now,
+                'result': None,
+                'error': None,
+            }
+        thread = Thread(target=_run_wyckoff_job, args=(job_id, query), daemon=True)
+        thread.start()
+        return jsonify({'success': True, 'job_id': job_id, 'data': wyckoff_jobs[job_id]})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wyckoff/status/<job_id>')
+def get_wyckoff_job_status(job_id):
+    """Return current Wyckoff analysis job progress."""
+    try:
+        if _is_halted():
+            return _halted_response()
+        with wyckoff_jobs_lock:
+            job = wyckoff_jobs.get(job_id)
+            if not job:
+                return jsonify({'success': False, 'error': '威科夫任务不存在或已过期'}), 404
+            return jsonify({'success': True, 'data': dict(job)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 

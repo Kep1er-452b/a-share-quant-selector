@@ -45,6 +45,7 @@ def build_messages(symbol: str, stock_name: str, df) -> list[dict[str, str]]:
         "请基于下面本地 CSV 清洗后的真实行情数据做威科夫结构分析。"
         "只能引用数据中真实存在的日期，事件价格必须贴近当天 OHLC。"
         "证据不足时请输出 unclear，不要强行凑 Phase 或事件。"
+        "请输出接近专业人工读图的长分析，不要只给摘要；summary_text 至少覆盖背景、事件链、价位、确认条件和失效条件。"
         "必须返回非空 JSON 对象。\n\n"
         f"元数据 JSON:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
         f"OHLCV CSV:\n{csv_payload}"
