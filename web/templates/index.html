@@ -16,8 +16,8 @@
         <div class="halt-confirm-label">EMERGENCY CONTROL</div>
         <div class="halt-confirm-title">确认执行急停</div>
         <p class="halt-confirm-body">
-            急停会立即终止当前 Web 交互与在途请求，并阻止后续所有 API 操作。<br>
-            如需恢复，必须重启 Web 服务。
+            急停会记录事故日志与任务快照，强制停止当前运行任务，并退出系统。<br>
+            这是事故处理按钮；正常关闭请使用 EXIT。
         </p>
         <div class="halt-confirm-actions">
             <button class="btn btn-danger" id="confirm-halt-btn" type="button">确认急停</button>
@@ -227,7 +227,7 @@
                             <div class="terminal-row">01  先进入 SELECTION 页面勾选板块与策略，再执行扫描。</div>
                             <div class="terminal-row">02  顶部 RUN 会沿用当前筛选快照，适合重复执行同一轮扫描。</div>
                             <div class="terminal-row">03  HEATMAP 面板用于快速观察行业与个股分布，点击即可打开细节。</div>
-                            <div class="terminal-row">04  HALT 为硬停机指令，仅在需要中止全部 Web API 时使用。</div>
+                            <div class="terminal-row">04  HALT 为事故急停指令，会记录现场、停止任务并退出系统。</div>
                         </div>
                     </section>
 
