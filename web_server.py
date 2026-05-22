@@ -1,7 +1,7 @@
 """
 Web 服务器 - A股量化选股系统前端
 """
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_from_directory, has_request_context
 import json
 import sys
 import socket
@@ -76,6 +76,10 @@ INDEX_KLINE_TARGETS = {
     'sh000688': {'symbol': 'sh000688', 'name': '科创50'},
 }
 INDEX_KLINE_CACHE_TTL_SECONDS = 15 * 60
+LOG_DIR = project_root / "logs"
+SYSTEM_LOG_FILE = LOG_DIR / "system.log"
+INCIDENT_DIR = LOG_DIR / "incidents"
+EMERGENCY_EXIT_DELAY_SECONDS = 1.2
 
 
 def _reload_registry():
@@ -282,8 +286,187 @@ def _halted_response():
     return jsonify({
         'success': False,
         'halted': True,
-        'error': '系统已急停，重启服务器后方可恢复'
+        'shutdown_requested': shutdown_event.is_set(),
+        'error': '系统已急停，Web 服务正在退出或已停止'
     }), 503
+
+
+def _json_default(value):
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _sanitize_for_log(value):
+    sensitive_markers = ("token", "secret", "password", "passwd", "api_key", "apikey", "key")
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if any(marker in lowered for marker in sensitive_markers):
+                sanitized[key_text] = "***REDACTED***"
+            else:
+                sanitized[key_text] = _sanitize_for_log(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_log(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _append_system_log(event, message, detail=None):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "time": _job_timestamp(),
+        "event": event,
+        "message": message,
+    }
+    if detail is not None:
+        payload["detail"] = _sanitize_for_log(detail)
+    with open(SYSTEM_LOG_FILE, "a", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+
+
+def _compact_job_snapshot(job, fields):
+    snapshot = {}
+    for field in fields:
+        if field in job:
+            snapshot[field] = job.get(field)
+    if "started_at_monotonic" in job:
+        snapshot["elapsed_seconds"] = _elapsed_seconds(job)
+    if "logs" in job:
+        snapshot["logs"] = list(job.get("logs") or [])[-12:]
+    return _sanitize_for_log(snapshot)
+
+
+def _snapshot_jobs_for_incident():
+    common_fields = [
+        "job_id", "status", "created_at", "updated_at", "started_at", "finished_at",
+        "elapsed_seconds", "error", "progress_pct", "current_step", "current_stock",
+    ]
+    with update_jobs_lock:
+        update_snapshot = [
+            _compact_job_snapshot(
+                job,
+                common_fields + [
+                    "provider", "processed_count", "total_count", "cache_refresh",
+                    "success_count", "failed_count",
+                ],
+            )
+            for job in update_jobs.values()
+        ]
+    with selection_jobs_lock:
+        selection_snapshot = [
+            _compact_job_snapshot(
+                job,
+                common_fields + [
+                    "boards", "strategies", "backend", "total_candidates",
+                    "completed_candidates", "valid_stock_count", "skipped_stock_count",
+                    "invalid_name_count", "selected_count", "result_time",
+                    "selection_report_path",
+                ],
+            )
+            for job in selection_jobs.values()
+        ]
+    with wyckoff_jobs_lock:
+        wyckoff_snapshot = [
+            _compact_job_snapshot(
+                job,
+                [
+                    "job_id", "query", "status", "current_step", "message",
+                    "progress_pct", "created_at", "updated_at", "error",
+                ],
+            )
+            for job in wyckoff_jobs.values()
+        ]
+
+    return {
+        "update_jobs": update_snapshot,
+        "selection_jobs": selection_snapshot,
+        "wyckoff_jobs": wyckoff_snapshot,
+    }
+
+
+def _mark_jobs_emergency_halted(reason):
+    timestamp = _job_timestamp()
+    with update_jobs_lock:
+        for job in update_jobs.values():
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "halted"
+                job["error"] = reason
+                job["finished_at"] = timestamp
+                job["updated_at"] = timestamp
+                job["elapsed_seconds"] = _elapsed_seconds(job)
+                _append_job_log(job, "事故急停触发，系统即将退出。")
+    with selection_jobs_lock:
+        for job in selection_jobs.values():
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "halted"
+                job["error"] = reason
+                job["updated_at"] = timestamp
+                job["elapsed_seconds"] = _elapsed_seconds(job)
+                _append_job_log(job, "事故急停触发，系统即将退出。")
+    with wyckoff_jobs_lock:
+        for job in wyckoff_jobs.values():
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "halted"
+                job["current_step"] = "事故急停"
+                job["message"] = "事故急停触发，系统即将退出。"
+                job["error"] = reason
+                job["updated_at"] = timestamp
+
+
+def _write_emergency_incident(reason):
+    INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now()
+    incident_id = timestamp.strftime("%Y%m%d-%H%M%S")
+    request_snapshot = {}
+    if has_request_context():
+        request_snapshot = {
+            "remote_addr": request.remote_addr,
+            "path": request.path,
+            "method": request.method,
+            "user_agent": request.headers.get("User-Agent"),
+        }
+    payload = {
+        "incident_id": incident_id,
+        "type": "emergency_stop",
+        "reason": reason,
+        "created_at": timestamp.isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+        "shutdown_delay_seconds": EMERGENCY_EXIT_DELAY_SECONDS,
+        "request": request_snapshot,
+        "tasks": _snapshot_jobs_for_incident(),
+    }
+    incident_path = INCIDENT_DIR / f"{incident_id}-emergency-stop.json"
+    with open(incident_path, "w", encoding="utf-8") as file:
+        json.dump(_sanitize_for_log(payload), file, ensure_ascii=False, indent=2, default=_json_default)
+    _append_system_log(
+        "emergency_stop",
+        "事故急停触发，任务快照已写入，Web 服务即将退出。",
+        {"incident_path": str(incident_path), "pid": os.getpid()},
+    )
+    return incident_path
+
+
+def _schedule_process_termination(delay_seconds):
+    timer = Timer(delay_seconds, _terminate_current_process)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _trigger_emergency_stop(reason="用户手动触发事故急停"):
+    halt_event.set()
+    shutdown_event.set()
+    _mark_jobs_emergency_halted(reason)
+    incident_path = _write_emergency_incident(reason)
+    _schedule_process_termination(EMERGENCY_EXIT_DELAY_SECONDS)
+    return incident_path
 
 
 def _classify_board(stock_code):
@@ -861,6 +1044,7 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
                 ]
                 for future in as_completed(futures):
                     if _is_halted():
+                        executor.shutdown(wait=False, cancel_futures=True)
                         _update_job(job_id, status='halted', error='系统已急停')
                         _append_job_log_by_id(job_id, '任务因系统急停而终止。')
                         return
@@ -2066,13 +2250,16 @@ def get_system_status():
 
 @app.route('/api/emergency_stop', methods=['POST'])
 def emergency_stop():
-    """触发全局急停。急停后仅允许查询状态，需重启服务恢复。"""
-    halt_event.set()
+    """触发事故急停：记录现场、阻止新任务，并退出当前 Web 服务进程。"""
+    incident_path = _trigger_emergency_stop()
     return jsonify({
         'success': True,
         'halted': True,
+        'shutdown_requested': True,
+        'shutdown_delay_seconds': EMERGENCY_EXIT_DELAY_SECONDS,
+        'incident_path': str(incident_path),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'message': '系统已急停，重启服务器后方可恢复'
+        'message': '事故急停已触发，系统正在记录现场并退出'
     })
 
 
@@ -2085,9 +2272,7 @@ def system_shutdown():
     """关闭当前 Web 服务进程。"""
     halt_event.set()
     shutdown_event.set()
-    timer = Timer(0.8, _terminate_current_process)
-    timer.daemon = True
-    timer.start()
+    _schedule_process_termination(0.8)
     return jsonify({
         'success': True,
         'halted': True,
