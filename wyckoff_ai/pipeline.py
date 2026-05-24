@@ -68,12 +68,15 @@ class WyckoffPipeline:
         emit("indicators", "正在标准化 OHLCV，并计算 MA50、MA200、成交量比率。", 22)
         recent = model_frame(df)
         data_date = get_latest_data_date(df)
+        run_started_at = datetime.now()
+        generated_at = run_started_at.strftime("%Y-%m-%d %H:%M:%S")
         emit("prepare_outputs", f"数据日期 {data_date}，正在准备输出文件路径。", 30)
         paths = build_wyckoff_output_paths(
             symbol=stock["code"],
             stock_name=stock.get("name"),
             data_date=data_date,
             output_dir=self.output_dir,
+            run_timestamp=run_started_at,
         )
         for path in paths.values():
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +100,6 @@ class WyckoffPipeline:
         )
         emit("render", "结构校验通过，正在调用本地可信渲染器生成 PNG 图表。", 86)
         chart_path = render_chart(stock["csv_path"], analysis, paths["chart_path"], title)
-        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         result = {
             "success": True,

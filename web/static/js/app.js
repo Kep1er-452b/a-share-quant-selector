@@ -59,9 +59,13 @@ const state = {
     pendingExportStock: null,
     watchlistLoaded: false,
     watchlistCache: [],
+    watchlistVisibleCodes: [],
+    watchlistSelectedCodes: new Set(),
     wyckoffConfigLoaded: false,
     wyckoffConfigured: false,
     wyckoffRunning: false,
+    wyckoffBatchRunning: false,
+    wyckoffBatchItems: [],
     wyckoffProgressTimer: null,
     wyckoffProgressStep: 0,
     wyckoffPollTimer: null,
@@ -71,6 +75,7 @@ const state = {
     wyckoffTickerTimer: null,
     wyckoffTickerActive: false,
     currentWyckoffResult: null,
+    currentWyckoffBatchIndex: null,
 };
 
 function escapeHtml(value) {
@@ -2017,19 +2022,52 @@ function formatWatchlistDate(value) {
     return String(value).replace(' ', '<br>');
 }
 
+function updateWatchlistSelectionControls() {
+    const selectedCount = state.watchlistSelectedCodes.size;
+    const selectedLabel = document.getElementById('watchlist-selected-label');
+    const batchWyckoffBtn = document.getElementById('watchlist-batch-wyckoff-btn');
+    const batchDeleteBtn = document.getElementById('watchlist-batch-delete-btn');
+    const selectAll = document.getElementById('watchlist-select-all');
+    const visibleCodes = state.watchlistVisibleCodes || [];
+    const visibleSelectedCount = visibleCodes.filter(code => state.watchlistSelectedCodes.has(code)).length;
+
+    if (selectedLabel) {
+        selectedLabel.textContent = `已选 ${formatNumber(selectedCount)}`;
+    }
+    if (batchWyckoffBtn) {
+        batchWyckoffBtn.disabled = selectedCount === 0 || state.wyckoffRunning || state.systemHalted;
+    }
+    if (batchDeleteBtn) {
+        batchDeleteBtn.disabled = selectedCount === 0 || state.systemHalted;
+    }
+    if (selectAll) {
+        selectAll.checked = visibleCodes.length > 0 && visibleSelectedCount === visibleCodes.length;
+        selectAll.indeterminate = visibleSelectedCount > 0 && visibleSelectedCount < visibleCodes.length;
+        selectAll.disabled = visibleCodes.length === 0 || state.systemHalted;
+    }
+}
+
 function renderWatchlist(items) {
     const tbody = document.getElementById('watchlist-tbody');
     const totalLabel = document.getElementById('watchlist-total-label');
+    state.watchlistVisibleCodes = items.map(stock => String(stock.code || '').trim()).filter(Boolean);
     if (totalLabel) {
         totalLabel.textContent = `已添加 ${formatNumber(items.length)} 只自选股票`;
     }
     if (!items.length) {
-        tbody.innerHTML = '<tr><td colspan="9" class="state-empty">暂无自选股，可输入代码、名称或拼音首字母添加。</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" class="state-empty">暂无自选股，可输入代码、名称或拼音首字母添加。</td></tr>';
+        updateWatchlistSelectionControls();
         return;
     }
 
     tbody.innerHTML = items.map(stock => `
         <tr>
+            <td class="select-cell">
+                <input class="watchlist-select-row" type="checkbox"
+                    data-code="${escapeHtml(stock.code)}"
+                    aria-label="选择 ${escapeHtml(stock.code)}"
+                    ${state.watchlistSelectedCodes.has(stock.code) ? 'checked' : ''}>
+            </td>
             <td class="code-cell">${escapeHtml(stock.code)}</td>
             <td>${escapeHtml(stock.name || '未知')}</td>
             <td>${boardBadge(stock.board || stock.code)}</td>
@@ -2058,6 +2096,7 @@ function renderWatchlist(items) {
             </td>
         </tr>
     `).join('');
+    updateWatchlistSelectionControls();
 }
 
 function filterWatchlist(keyword) {
@@ -2090,10 +2129,17 @@ async function loadWatchlist(forceReload = false) {
             throw new Error(result.error || '自选股加载失败');
         }
         state.watchlistCache = result.data || [];
+        const availableCodes = new Set(state.watchlistCache.map(stock => stock.code));
+        state.watchlistSelectedCodes.forEach(code => {
+            if (!availableCodes.has(code)) {
+                state.watchlistSelectedCodes.delete(code);
+            }
+        });
         state.watchlistLoaded = true;
         filterWatchlist(document.getElementById('watchlist-query')?.value || '');
     } catch (error) {
-        tbody.innerHTML = `<tr><td colspan="9" class="state-empty">加载失败: ${escapeHtml(error.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="10" class="state-empty">加载失败: ${escapeHtml(error.message)}</td></tr>`;
+        updateWatchlistSelectionControls();
     }
 }
 
@@ -2126,6 +2172,8 @@ async function addWatchlistItem() {
         noteInput.value = '';
         state.watchlistLoaded = false;
         await loadWatchlist(true);
+        state.watchlistSelectedCodes.add(result.data.code);
+        filterWatchlist(document.getElementById('watchlist-query')?.value || '');
         toast(`已加入自选: ${result.data.code} ${result.data.name || ''}`.trim(), 'success');
     } catch (error) {
         toast(`添加失败: ${error.message}`, 'error');
@@ -2141,10 +2189,59 @@ async function removeWatchlistItem(code) {
             throw new Error(result.error || '删除失败');
         }
         state.watchlistLoaded = false;
+        state.watchlistSelectedCodes.delete(code);
         await loadWatchlist(true);
         toast(`已移除自选: ${code}`, 'success');
     } catch (error) {
         toast(`删除失败: ${error.message}`, 'error');
+    }
+}
+
+function getSelectedWatchlistItems() {
+    const selected = state.watchlistSelectedCodes;
+    return state.watchlistCache.filter(stock => selected.has(stock.code));
+}
+
+function toggleVisibleWatchlistSelection(checked) {
+    (state.watchlistVisibleCodes || []).forEach(code => {
+        if (checked) {
+            state.watchlistSelectedCodes.add(code);
+        } else {
+            state.watchlistSelectedCodes.delete(code);
+        }
+    });
+    filterWatchlist(document.getElementById('watchlist-query')?.value || '');
+}
+
+async function removeSelectedWatchlistItems() {
+    const items = getSelectedWatchlistItems();
+    if (!items.length) {
+        toast('请先选择要删除的自选股', 'error');
+        return;
+    }
+    const summary = items.slice(0, 4).map(stock => `${stock.code} ${stock.name || ''}`.trim()).join('、');
+    const suffix = items.length > 4 ? ` 等 ${items.length} 只` : '';
+    if (!window.confirm(`确认删除自选股：${summary}${suffix}？`)) {
+        return;
+    }
+
+    try {
+        const result = await apiFetch('/api/watchlist/batch', {
+            method: 'DELETE',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ codes: items.map(stock => stock.code) }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '批量删除失败');
+        }
+        (result.removed_codes || []).forEach(code => state.watchlistSelectedCodes.delete(code));
+        state.watchlistLoaded = false;
+        await loadWatchlist(true);
+        toast(`已批量删除 ${formatNumber(result.removed_count || 0)} 只自选股`, 'success');
+    } catch (error) {
+        toast(`批量删除失败: ${error.message}`, 'error');
     }
 }
 
@@ -2367,6 +2464,254 @@ async function revealWyckoffChart() {
         toast('已在访达中定位图表文件', 'success');
     } catch (error) {
         toast(`访达打开失败: ${error.message}`, 'error');
+    }
+}
+
+async function organizeWyckoffCache() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法整理缓存', 'error');
+        return;
+    }
+    try {
+        setWyckoffStatus('CACHE', 'highlight');
+        const result = await apiFetch('/api/wyckoff/cache/organize', {
+            method: 'POST',
+        });
+        if (!result.success) {
+            throw new Error(result.error || '缓存整理失败');
+        }
+        const data = result.data || {};
+        const message = `缓存整理完成: 迁移 ${data.moved_runs || 0} 次分析，文件 ${data.moved_files || 0} 个，归档 ${data.orphaned_files || 0} 个`;
+        updateGlobalTicker(`WYCKOFF CACHE READY   ${message}`);
+        setCommandOutput('WYCKOFF CACHE ORGANIZE', 'success');
+        setWyckoffStatus('READY', 'highlight');
+        toast(message, 'success', 4200);
+    } catch (error) {
+        setWyckoffStatus('ERROR', 'down');
+        toast(`缓存整理失败: ${error.message}`, 'error', 5200);
+    }
+}
+
+async function cleanupWyckoffCache() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法清理缓存', 'error');
+        return;
+    }
+    const confirmed = window.confirm('清理旧缓存会删除每只股票除最近一次以外的威科夫分析文件，是否继续？');
+    if (!confirmed) {
+        return;
+    }
+    try {
+        setWyckoffStatus('CLEAN', 'highlight');
+        const result = await apiFetch('/api/wyckoff/cache/cleanup', {
+            method: 'POST',
+        });
+        if (!result.success) {
+            throw new Error(result.error || '缓存清理失败');
+        }
+        const data = result.data || {};
+        const message = `缓存清理完成: 保留 ${data.kept_runs || 0} 次，删除 ${data.deleted_runs || 0} 次分析`;
+        updateGlobalTicker(`WYCKOFF CACHE CLEAN   ${message}`);
+        setCommandOutput('WYCKOFF CACHE CLEANUP', 'success');
+        setWyckoffStatus('READY', 'highlight');
+        toast(message, 'success', 5200);
+    } catch (error) {
+        setWyckoffStatus('ERROR', 'down');
+        toast(`缓存清理失败: ${error.message}`, 'error', 5200);
+    }
+}
+
+function delay(ms) {
+    return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+function renderWyckoffBatchQueue() {
+    const summary = document.getElementById('wyckoff-batch-summary');
+    const list = document.getElementById('wyckoff-batch-list');
+    if (!summary || !list) {
+        return;
+    }
+    const items = state.wyckoffBatchItems || [];
+    if (!items.length) {
+        summary.textContent = '未运行';
+        list.innerHTML = '<div class="wyckoff-batch-row">从 F6 自选股票选择后可批量送入威科夫分析。</div>';
+        return;
+    }
+    const doneCount = items.filter(item => item.status === 'done').length;
+    const errorCount = items.filter(item => item.status === 'error').length;
+    const running = items.find(item => item.status === 'running');
+    summary.textContent = running
+        ? `${doneCount}/${items.length} 运行中 ${running.code}`
+        : `${doneCount}/${items.length} 完成，失败 ${errorCount}`;
+    list.innerHTML = items.map((item, index) => {
+        const status = item.status || 'queued';
+        const active = state.currentWyckoffBatchIndex === index ? ' active' : '';
+        const statusLabel = {
+            queued: '排队',
+            running: '运行中',
+            done: '完成',
+            error: '失败',
+        }[status] || status;
+        const right = item.error || item.detail || statusLabel;
+        return `
+            <button class="wyckoff-batch-row ${escapeHtml(status)}${active}" type="button" data-index="${index}">
+                <span>${index + 1}. ${escapeHtml(item.code)} ${escapeHtml(item.name || '')}</span>
+                <span>${escapeHtml(right)}</span>
+            </button>
+        `;
+    }).join('');
+}
+
+function showWyckoffBatchResult(index) {
+    const item = state.wyckoffBatchItems[index];
+    if (!item) {
+        return;
+    }
+    state.currentWyckoffBatchIndex = index;
+    renderWyckoffBatchQueue();
+    if (item.result) {
+        renderWyckoffResult(item.result);
+        updateGlobalTicker(`WYCKOFF VIEW   ${item.code} ${item.name || ''}   已切换到批量结果`);
+        setCommandOutput(`WYCKOFF VIEW ${item.code}`, 'info');
+        return;
+    }
+    const message = item.error
+        ? `分析失败: ${item.error}`
+        : `${item.code} ${item.name || ''} ${item.detail || '尚未生成图表'}`.trim();
+    document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
+    document.getElementById('wyckoff-chart-placeholder').textContent = message;
+    document.getElementById('wyckoff-chart-img').style.display = 'none';
+    document.getElementById('wyckoff-analysis-text').textContent = message;
+    document.getElementById('wyckoff-fullscreen-btn').disabled = true;
+    document.getElementById('wyckoff-reveal-btn').disabled = true;
+    setCommandOutput(`WYCKOFF VIEW ${item.code}`, item.error ? 'error' : 'info');
+}
+
+async function startWyckoffJob(query) {
+    const result = await apiFetch('/api/wyckoff/start', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query }),
+    });
+    if (!result.success) {
+        throw new Error(result.error || '威科夫分析失败');
+    }
+    return result;
+}
+
+async function waitForWyckoffJob(jobId) {
+    while (true) {
+        if (state.systemHalted) {
+            throw new Error('系统已急停');
+        }
+        const result = await apiFetch(`/api/wyckoff/status/${jobId}`);
+        if (!result.success) {
+            throw new Error(result.error || '威科夫任务状态读取失败');
+        }
+        const job = result.data || {};
+        renderWyckoffProgress(job);
+        if (job.status === 'done') {
+            return job.result;
+        }
+        if (job.status === 'error' || job.status === 'halted') {
+            throw new Error(job.error || job.message || '威科夫分析失败');
+        }
+        await delay(1200);
+    }
+}
+
+async function runSelectedWatchlistWyckoffBatch() {
+    if (state.systemHalted) {
+        toast('系统已急停，无法执行威科夫分析', 'error');
+        return;
+    }
+    if (state.wyckoffRunning) {
+        toast('威科夫任务正在运行，请等待完成', 'error');
+        return;
+    }
+    const selectedItems = getSelectedWatchlistItems();
+    if (!selectedItems.length) {
+        toast('请先选择要批量分析的自选股', 'error');
+        return;
+    }
+
+    switchPage('wyckoff');
+    stopWyckoffProgress();
+    state.wyckoffRunning = true;
+    state.wyckoffBatchRunning = true;
+    state.wyckoffBatchItems = selectedItems.map(stock => ({
+        code: stock.code,
+        name: stock.name || '',
+        status: 'queued',
+        detail: '等待分析',
+    }));
+    state.currentWyckoffBatchIndex = null;
+    renderWyckoffBatchQueue();
+    updateWatchlistSelectionControls();
+
+    const runButton = document.getElementById('wyckoff-run-btn');
+    const input = document.getElementById('wyckoff-query');
+    runButton.disabled = true;
+    setStatus('running');
+    setWyckoffStatus('BATCH', 'highlight');
+    document.getElementById('wyckoff-analysis-text').textContent = `批量威科夫分析已启动，共 ${selectedItems.length} 只。`;
+    document.getElementById('wyckoff-fullscreen-btn').disabled = true;
+    document.getElementById('wyckoff-reveal-btn').disabled = true;
+    document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
+    document.getElementById('wyckoff-chart-placeholder').textContent = '批量分析队列正在启动...';
+    document.getElementById('wyckoff-chart-img').style.display = 'none';
+
+    let successCount = 0;
+    let errorCount = 0;
+    try {
+        for (let index = 0; index < state.wyckoffBatchItems.length; index += 1) {
+            const item = state.wyckoffBatchItems[index];
+            state.currentWyckoffBatchIndex = index;
+            item.status = 'running';
+            item.detail = '创建任务';
+            renderWyckoffBatchQueue();
+            input.value = item.code;
+            setCommandOutput(`WYCKOFF BATCH ${index + 1}/${state.wyckoffBatchItems.length} ${item.code}<GO>`, 'info');
+            enqueueWyckoffTicker(`WYCKOFF BATCH ${index + 1}/${state.wyckoffBatchItems.length}   ${item.code} ${item.name || ''}   正在创建分析任务。`, true);
+
+            try {
+                const startResult = await startWyckoffJob(item.code);
+                state.wyckoffJobId = startResult.job_id;
+                item.detail = '分析中';
+                renderWyckoffProgress(startResult.data || {});
+                renderWyckoffBatchQueue();
+                const result = await waitForWyckoffJob(startResult.job_id);
+                renderWyckoffResult(result);
+                state.currentWyckoffBatchIndex = index;
+                item.status = 'done';
+                item.detail = '图表已保存';
+                item.result = result;
+                successCount += 1;
+                toast(`威科夫完成: ${item.code} ${item.name || ''}`.trim(), 'success', 2600);
+            } catch (error) {
+                item.status = 'error';
+                item.error = error.message;
+                errorCount += 1;
+                updateGlobalTicker(`WYCKOFF BATCH ERROR   ${item.code}   ${error.message}`);
+            } finally {
+                state.wyckoffJobId = null;
+                renderWyckoffBatchQueue();
+            }
+        }
+        const summary = `批量威科夫完成: 成功 ${successCount}，失败 ${errorCount}`;
+        setWyckoffStatus(errorCount ? 'PARTIAL' : 'READY', errorCount ? 'down' : 'highlight');
+        setStatus(errorCount ? 'error' : 'ready');
+        updateGlobalTicker(`WYCKOFF BATCH READY   ${summary}`);
+        toast(summary, errorCount ? 'error' : 'success', 5200);
+    } finally {
+        stopWyckoffProgress();
+        state.wyckoffRunning = false;
+        state.wyckoffBatchRunning = false;
+        runButton.disabled = false;
+        updateWatchlistSelectionControls();
+        renderWyckoffBatchQueue();
     }
 }
 
@@ -3570,6 +3915,19 @@ function bindEvents() {
             removeWatchlistItem(removeButton.dataset.code);
         }
     });
+    document.getElementById('watchlist-tbody').addEventListener('change', event => {
+        const checkbox = event.target.closest('.watchlist-select-row');
+        if (!checkbox) {
+            return;
+        }
+        const code = checkbox.dataset.code;
+        if (checkbox.checked) {
+            state.watchlistSelectedCodes.add(code);
+        } else {
+            state.watchlistSelectedCodes.delete(code);
+        }
+        updateWatchlistSelectionControls();
+    });
 
     document.getElementById('board-filter').addEventListener('change', updateSelectionSnapshot);
     document.getElementById('strategy-filter').addEventListener('change', updateSelectionSnapshot);
@@ -3603,6 +3961,11 @@ function bindEvents() {
     document.getElementById('refresh-selection-options-btn').addEventListener('click', () => loadSelectionOptions(true));
     document.getElementById('watchlist-add-btn').addEventListener('click', addWatchlistItem);
     document.getElementById('watchlist-refresh-btn').addEventListener('click', () => loadWatchlist(true));
+    document.getElementById('watchlist-batch-delete-btn').addEventListener('click', removeSelectedWatchlistItems);
+    document.getElementById('watchlist-batch-wyckoff-btn').addEventListener('click', runSelectedWatchlistWyckoffBatch);
+    document.getElementById('watchlist-select-all').addEventListener('change', event => {
+        toggleVisibleWatchlistSelection(event.target.checked);
+    });
     document.getElementById('watchlist-query').addEventListener('input', event => filterWatchlist(event.target.value));
     document.getElementById('watchlist-query').addEventListener('keydown', event => {
         if (event.key === 'Enter') {
@@ -3617,8 +3980,17 @@ function bindEvents() {
         }
     });
     document.getElementById('wyckoff-run-btn').addEventListener('click', runWyckoffAnalysis);
+    document.getElementById('wyckoff-batch-list').addEventListener('click', event => {
+        const row = event.target.closest('.wyckoff-batch-row[data-index]');
+        if (!row) {
+            return;
+        }
+        showWyckoffBatchResult(Number(row.dataset.index));
+    });
     document.getElementById('wyckoff-fullscreen-btn').addEventListener('click', openWyckoffViewer);
     document.getElementById('wyckoff-reveal-btn').addEventListener('click', revealWyckoffChart);
+    document.getElementById('wyckoff-cache-organize-btn').addEventListener('click', organizeWyckoffCache);
+    document.getElementById('wyckoff-cache-cleanup-btn').addEventListener('click', cleanupWyckoffCache);
     document.getElementById('wyckoff-chart-img').addEventListener('click', openWyckoffViewer);
     document.getElementById('wyckoff-viewer-close-btn').addEventListener('click', closeWyckoffViewer);
     document.getElementById('wyckoff-viewer-reveal-btn').addEventListener('click', revealWyckoffChart);

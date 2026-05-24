@@ -829,7 +829,8 @@ select {
 .modal-header-actions,
 .export-confirm-actions,
 .watchlist-row-actions,
-.wyckoff-input-row {
+.wyckoff-input-row,
+.watchlist-bulk-actions {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -860,6 +861,18 @@ select {
     min-height: 22px;
     padding: 0 6px;
     font-size: 9px;
+}
+
+.select-cell {
+    width: 34px;
+    text-align: center !important;
+}
+
+.select-cell input {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: var(--accent);
 }
 
 .update-token-input {
@@ -928,7 +941,7 @@ select {
 }
 
 #watchlist-table {
-    min-width: 1180px;
+    min-width: 1230px;
 }
 
 #watchlist-table td:last-child {
@@ -1298,6 +1311,81 @@ select {
     grid-template-columns: 1fr;
     gap: 1px;
     background: var(--grid-line);
+}
+
+.wyckoff-cache-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.wyckoff-cache-actions .btn {
+    min-height: 22px;
+    font-size: 9px;
+}
+
+.wyckoff-batch-panel {
+    margin-top: 8px;
+    border: 1px solid var(--verydim);
+    background: var(--bg-input);
+}
+
+.wyckoff-batch-head,
+.wyckoff-batch-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    padding: 5px 7px;
+    border-bottom: 1px solid var(--verydim);
+    border-left: 0;
+    border-right: 0;
+    border-top: 0;
+    font-size: 9px;
+    color: var(--dim);
+    font-family: inherit;
+    text-align: left;
+    background: var(--bg-input);
+}
+
+.wyckoff-batch-head {
+    color: var(--gold);
+    background: var(--bg-header);
+}
+
+.wyckoff-batch-list {
+    max-height: 150px;
+    overflow: auto;
+}
+
+.wyckoff-batch-row:last-child {
+    border-bottom: 0;
+}
+
+.wyckoff-batch-row:not(:disabled) {
+    cursor: pointer;
+}
+
+.wyckoff-batch-row:hover,
+.wyckoff-batch-row.active {
+    background: var(--hover-green);
+}
+
+.wyckoff-batch-row.active {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.wyckoff-batch-row.done {
+    color: var(--up);
+}
+
+.wyckoff-batch-row.error {
+    color: var(--down);
+}
+
+.wyckoff-batch-row.running {
+    color: var(--accent);
 }
 
 .wyckoff-chart-body {

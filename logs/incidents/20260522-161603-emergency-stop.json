@@ -1,0 +1,176 @@
+{
+  "incident_id": "20260522-161603",
+  "type": "emergency_stop",
+  "reason": "用户手动触发事故急停",
+  "created_at": "2026-05-22T16:16:03",
+  "pid": 22978,
+  "shutdown_delay_seconds": 1.2,
+  "request": {
+    "remote_addr": "127.0.0.1",
+    "path": "/api/emergency_stop",
+    "method": "POST",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+  },
+  "tasks": {
+    "update_jobs": [
+      {
+        "job_id": "321121d34690",
+        "status": "completed",
+        "created_at": "2026-05-22 15:53:50",
+        "updated_at": "2026-05-22 16:01:58",
+        "started_at": "2026-05-22 15:53:50",
+        "finished_at": "2026-05-22 16:01:58",
+        "elapsed_seconds": 1333,
+        "error": null,
+        "progress_pct": 100,
+        "current_step": "更新完成",
+        "current_stock": null,
+        "provider": "akshare",
+        "processed_count": 5178,
+        "total_count": 5178,
+        "cache_refresh": {
+          "snapshot": "_refresh_market_caches_for_job.<locals>.cache_progress() got an unexpected keyword argument 'stage'",
+          "industry": "_refresh_market_caches_for_job.<locals>.cache_progress() got an unexpected keyword argument 'stage'"
+        },
+        "logs": [
+          {
+            "time": "2026-05-22 15:58:36",
+            "message": "增量补齐: 药明康德(603259) 4050/5178"
+          },
+          {
+            "time": "2026-05-22 15:58:41",
+            "message": "增量补齐: 嘉诚国际(603535) 4200/5178"
+          },
+          {
+            "time": "2026-05-22 15:58:47",
+            "message": "增量补齐: 神力股份(603819) 4350/5178"
+          },
+          {
+            "time": "2026-05-22 15:58:52",
+            "message": "增量补齐: 聚合顺(605166) 4500/5178"
+          },
+          {
+            "time": "2026-05-22 15:58:57",
+            "message": "增量补齐: 申联生物(688098) 4650/5178"
+          },
+          {
+            "time": "2026-05-22 15:59:01",
+            "message": "增量补齐: 联影医疗(688271) 4800/5178"
+          },
+          {
+            "time": "2026-05-22 15:59:05",
+            "message": "增量补齐: 龙迅股份(688486) 4950/5178"
+          },
+          {
+            "time": "2026-05-22 15:59:14",
+            "message": "增量补齐: 银河微电(688689) 5100/5178"
+          },
+          {
+            "time": "2026-05-22 15:59:24",
+            "message": "全量重抓: 慧谷新材(301683) 5178/5178"
+          },
+          {
+            "time": "2026-05-22 15:59:24",
+            "message": "开始刷新市场缓存。"
+          },
+          {
+            "time": "2026-05-22 16:01:58",
+            "message": "缓存刷新完成，但存在降级项: {'snapshot': \"_refresh_market_caches_for_job.<locals>.cache_progress() got an unexpected keyword argument 'stage'\", 'industry': \"_refresh_market_caches_for_job.<locals>.cache_progress() got an unexpected keyword argument 'stage'\"}"
+          },
+          {
+            "time": "2026-05-22 16:01:58",
+            "message": "数据更新与缓存重建已完成。"
+          }
+        ]
+      }
+    ],
+    "selection_jobs": [
+      {
+        "job_id": "5d6e2348555f",
+        "status": "halted",
+        "created_at": "2026-05-22 16:04:51",
+        "updated_at": "2026-05-22 16:16:03",
+        "elapsed_seconds": 672,
+        "error": "用户手动触发事故急停",
+        "progress_pct": 29,
+        "current_stock": {
+          "code": "300101",
+          "name": "振芯科技"
+        },
+        "boards": [
+          "main",
+          "chinext",
+          "star"
+        ],
+        "strategies": [
+          "B1V242BStrategy",
+          "B2BetaStrategy",
+          "BowlReboundStrategy",
+          "B1V242PStrategy",
+          "B1MinJSimpleStrategy",
+          "B1MinJComplexStrategy"
+        ],
+        "backend": "thread",
+        "total_candidates": 5017,
+        "completed_candidates": 1500,
+        "valid_stock_count": 1499,
+        "skipped_stock_count": 1,
+        "invalid_name_count": 178,
+        "selected_count": 354,
+        "result_time": null,
+        "selection_report_path": null,
+        "logs": [
+          {
+            "time": "2026-05-22 16:09:30",
+            "message": "已处理 1000/5017，当前至 英威腾(002334)。"
+          },
+          {
+            "time": "2026-05-22 16:12:50",
+            "message": "已处理 1050/5017，当前至 露笑科技(002617)。"
+          },
+          {
+            "time": "2026-05-22 16:12:58",
+            "message": "已处理 1100/5017，当前至 顺威股份(002676)。"
+          },
+          {
+            "time": "2026-05-22 16:14:11",
+            "message": "已处理 1150/5017，当前至 中矿资源(002738)。"
+          },
+          {
+            "time": "2026-05-22 16:14:14",
+            "message": "已处理 1200/5017，当前至 侨银股份(002973)。"
+          },
+          {
+            "time": "2026-05-22 16:14:15",
+            "message": "已处理 1250/5017，当前至 瀛通通讯(002861)。"
+          },
+          {
+            "time": "2026-05-22 16:14:15",
+            "message": "已处理 1300/5017，当前至 洪汇新材(002802)。"
+          },
+          {
+            "time": "2026-05-22 16:14:15",
+            "message": "已处理 1350/5017，当前至 振邦智能(003028)。"
+          },
+          {
+            "time": "2026-05-22 16:14:15",
+            "message": "已处理 1400/5017，当前至 蒙娜丽莎(002918)。"
+          },
+          {
+            "time": "2026-05-22 16:14:19",
+            "message": "已处理 1450/5017，当前至 回天新材(300041)。"
+          },
+          {
+            "time": "2026-05-22 16:14:20",
+            "message": "已处理 1500/5017，当前至 振芯科技(300101)。"
+          },
+          {
+            "time": "2026-05-22 16:16:03",
+            "message": "事故急停触发，系统即将退出。"
+          }
+        ]
+      }
+    ],
+    "wyckoff_jobs": []
+  }
+}

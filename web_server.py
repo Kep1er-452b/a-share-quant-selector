@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import signal
+import shutil
 import subprocess
 import time
 import uuid
@@ -16,6 +17,7 @@ from threading import Event, Lock, Thread, Timer
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timedelta
+from urllib.parse import quote
 import yaml
 import pandas as pd
 
@@ -48,6 +50,7 @@ from utils.stock_exporter import (
     search_stocks,
 )
 from wyckoff_ai import WyckoffPipeline, has_deepseek_config
+from wyckoff_ai.naming import stock_output_folder_name
 from wyckoff_ai.pipeline import WyckoffPipelineError
 import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
@@ -517,11 +520,28 @@ def _parse_requested_strategies(raw_value):
 
 def _load_stock_names():
     names_file = Path("data/stock_names.json")
-    if not names_file.exists():
-        return {}
+    result = {}
+    if names_file.exists():
+        with open(names_file, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        for code, name in payload.items():
+            normalized_code = str(code or "").strip().zfill(6)
+            if CSVManager.STOCK_CODE_PATTERN.match(normalized_code):
+                result[normalized_code] = str(name or "").strip()
 
-    with open(names_file, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    tushare_meta_file = Path("data/tushare_stock_map.json")
+    if tushare_meta_file.exists():
+        try:
+            with open(tushare_meta_file, 'r', encoding='utf-8') as f:
+                payload = json.load(f) or {}
+            for code, meta in payload.items():
+                normalized_code = str(code or "").strip().zfill(6)
+                name = meta.get('name') if isinstance(meta, dict) else None
+                if CSVManager.STOCK_CODE_PATTERN.match(normalized_code) and name:
+                    result[normalized_code] = str(name).strip()
+        except Exception:
+            pass
+    return result
 
 
 def _markdown_escape(value):
@@ -639,6 +659,10 @@ def _save_watchlist(payload):
 
 def _stock_display_name(code, stock_names):
     return stock_names.get(code) or fallback_stock_name(code)
+
+
+def _is_fallback_stock_name(code, name):
+    return str(name or "").strip() == fallback_stock_name(code)
 
 
 def _build_board_counts(stock_codes):
@@ -1411,6 +1435,216 @@ def get_wyckoff_config():
         return jsonify({'success': False, 'error': str(e)})
 
 
+def _wyckoff_outputs_root():
+    return project_root / 'outputs' / 'wyckoff'
+
+
+def _path_relative_to_project(path):
+    target = Path(path)
+    if not target.is_absolute():
+        target = project_root / target
+    try:
+        return target.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return target.as_posix()
+
+
+def _wyckoff_chart_url(chart_path):
+    outputs_root = _wyckoff_outputs_root().resolve()
+    target = Path(chart_path)
+    if not target.is_absolute():
+        target = project_root / target
+    try:
+        relative = target.resolve().relative_to(outputs_root).as_posix()
+        return f"/outputs/wyckoff/files/{quote(relative)}"
+    except ValueError:
+        return f"/outputs/wyckoff/charts/{quote(target.name)}"
+
+
+def _attach_wyckoff_chart_url(result):
+    if isinstance(result, dict):
+        chart_path = (result.get('paths') or {}).get('chart_path')
+        if chart_path:
+            result['chart_url'] = _wyckoff_chart_url(chart_path)
+    return result
+
+
+def _wyckoff_run_timestamp(value, fallback_path):
+    text = str(value or '').strip()
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y%m%d-%H%M%S', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            return datetime.strptime(text[:19], fmt).strftime('%Y%m%d-%H%M%S')
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(Path(fallback_path).stat().st_mtime).strftime('%Y%m%d-%H%M%S')
+    except OSError:
+        return datetime.now().strftime('%Y%m%d-%H%M%S')
+
+
+def _unique_wyckoff_run_dir(stock_dir, timestamp):
+    candidate = stock_dir / timestamp
+    if not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        suffixed = stock_dir / f"{timestamp}-{index}"
+        if not suffixed.exists():
+            return suffixed
+        index += 1
+
+
+def _unique_file_path(path):
+    if not path.exists():
+        return path
+    index = 2
+    stem = path.stem
+    suffix = path.suffix
+    while True:
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _legacy_wyckoff_stem(path, suffix):
+    name = Path(path).name
+    return name[:-len(suffix)] if name.endswith(suffix) else None
+
+
+def organize_wyckoff_cache():
+    """Move legacy flat Wyckoff artifacts into stock/run folders."""
+    root = _wyckoff_outputs_root()
+    legacy_dirs = {
+        'analysis_path': root / 'json',
+        'chart_path': root / 'charts',
+        'debug_path': root / 'debug',
+    }
+    if not any(path.exists() for path in legacy_dirs.values()):
+        return {'moved_runs': 0, 'moved_files': 0, 'orphaned_files': 0, 'skipped': 0}
+
+    suffixes = {
+        'analysis_path': '-analysis.json',
+        'chart_path': '-chart.png',
+        'debug_path': '-debug.txt',
+    }
+    grouped = {}
+    for kind, directory in legacy_dirs.items():
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            if not path.is_file():
+                continue
+            stem = _legacy_wyckoff_stem(path, suffixes[kind])
+            if not stem:
+                continue
+            grouped.setdefault(stem, {})[kind] = path
+
+    moved_runs = 0
+    moved_files = 0
+    orphaned_files = 0
+    skipped = 0
+    for stem, files in grouped.items():
+        analysis_path = files.get('analysis_path')
+        if not analysis_path:
+            skipped += 1
+            continue
+        try:
+            payload = json.loads(analysis_path.read_text(encoding='utf-8'))
+        except Exception:
+            skipped += 1
+            continue
+
+        stock = payload.get('stock') or {}
+        code = str(stock.get('code') or '').strip()
+        name = str(stock.get('name') or code).strip()
+        if not code:
+            skipped += 1
+            continue
+
+        stock_dir = root / stock_output_folder_name(name, code)
+        run_dir = _unique_wyckoff_run_dir(
+            stock_dir,
+            _wyckoff_run_timestamp(payload.get('generated_at'), analysis_path),
+        )
+        new_paths = {
+            'analysis_path': run_dir / 'json' / analysis_path.name,
+            'chart_path': run_dir / 'charts' / files.get('chart_path', Path(f'{stem}-chart.png')).name,
+            'debug_path': run_dir / 'debug' / files.get('debug_path', Path(f'{stem}-debug.txt')).name,
+        }
+        for target in new_paths.values():
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+        for kind, source in files.items():
+            target = new_paths.get(kind)
+            if not target:
+                continue
+            shutil.move(str(source), str(target))
+            moved_files += 1
+
+        payload.setdefault('paths', {})
+        for key, target in new_paths.items():
+            if target.exists():
+                payload['paths'][key] = _path_relative_to_project(target)
+        payload['paths']['run_dir'] = _path_relative_to_project(run_dir)
+        payload['paths']['stock_dir'] = _path_relative_to_project(stock_dir)
+        new_paths['analysis_path'].write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        moved_runs += 1
+
+    for kind, directory in legacy_dirs.items():
+        if not directory.exists():
+            continue
+        subdir = {
+            'analysis_path': 'json',
+            'chart_path': 'charts',
+            'debug_path': 'debug',
+        }[kind]
+        for source in list(directory.iterdir()):
+            if not source.is_file():
+                continue
+            timestamp = _wyckoff_run_timestamp('', source)
+            target = _unique_file_path(root / '_orphaned' / timestamp / subdir / source.name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+            orphaned_files += 1
+
+    for directory in legacy_dirs.values():
+        if directory.exists() and not any(directory.iterdir()):
+            directory.rmdir()
+
+    return {'moved_runs': moved_runs, 'moved_files': moved_files, 'orphaned_files': orphaned_files, 'skipped': skipped}
+
+
+def cleanup_wyckoff_cache_keep_latest():
+    """Keep only the newest run folder for each stock folder."""
+    root = _wyckoff_outputs_root()
+    organize_result = organize_wyckoff_cache()
+    kept_runs = 0
+    deleted_runs = 0
+    deleted_files = 0
+    stock_dirs = [
+        path for path in root.iterdir()
+        if path.is_dir() and path.name not in {'charts', 'json', 'debug'} and not path.name.startswith('_')
+    ] if root.exists() else []
+    for stock_dir in stock_dirs:
+        run_dirs = [path for path in stock_dir.iterdir() if path.is_dir()]
+        if len(run_dirs) <= 1:
+            kept_runs += len(run_dirs)
+            continue
+        run_dirs.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+        kept_runs += 1
+        for old_run in run_dirs[1:]:
+            deleted_files += sum(1 for item in old_run.rglob('*') if item.is_file())
+            shutil.rmtree(old_run)
+            deleted_runs += 1
+    return {
+        **organize_result,
+        'kept_runs': kept_runs,
+        'deleted_runs': deleted_runs,
+        'deleted_files': deleted_files,
+    }
+
+
 @app.route('/api/wyckoff/analyze', methods=['POST'])
 def analyze_wyckoff_stock():
     """Run a single-stock Wyckoff AI analysis against local CSV data."""
@@ -1427,9 +1661,7 @@ def analyze_wyckoff_stock():
         data_dir = str(_config_value(config, 'data_dir', default='data'))
         pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
         result = pipeline.analyze_stock(query)
-        chart_filename = Path(result['paths']['chart_path']).name
-        result['chart_url'] = f"/outputs/wyckoff/charts/{chart_filename}"
-        return jsonify(result)
+        return jsonify(_attach_wyckoff_chart_url(result))
     except WyckoffPipelineError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
@@ -1468,8 +1700,7 @@ def _run_wyckoff_job(job_id, query):
         data_dir = str(_config_value(config, 'data_dir', default='data'))
         pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
         result = pipeline.analyze_stock(query, progress_callback=progress_callback)
-        chart_filename = Path(result['paths']['chart_path']).name
-        result['chart_url'] = f"/outputs/wyckoff/charts/{chart_filename}"
+        _attach_wyckoff_chart_url(result)
         _update_wyckoff_job(
             job_id,
             status='done',
@@ -1540,7 +1771,31 @@ def get_wyckoff_job_status(job_id):
             job = wyckoff_jobs.get(job_id)
             if not job:
                 return jsonify({'success': False, 'error': '威科夫任务不存在或已过期'}), 404
-            return jsonify({'success': True, 'data': dict(job)})
+        return jsonify({'success': True, 'data': dict(job)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wyckoff/cache/organize', methods=['POST'])
+def organize_wyckoff_cache_endpoint():
+    """Organize legacy Wyckoff cache artifacts into stock/run folders."""
+    try:
+        if _is_halted():
+            return _halted_response()
+        result = organize_wyckoff_cache()
+        return jsonify({'success': True, 'data': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wyckoff/cache/cleanup', methods=['POST'])
+def cleanup_wyckoff_cache_endpoint():
+    """Delete old Wyckoff run folders, keeping the newest run per stock."""
+    try:
+        if _is_halted():
+            return _halted_response()
+        result = cleanup_wyckoff_cache_keep_latest()
+        return jsonify({'success': True, 'data': result})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1578,6 +1833,16 @@ def serve_wyckoff_chart(filename):
     """Serve generated Wyckoff chart PNG files from the ignored outputs folder."""
     charts_dir = project_root / 'outputs' / 'wyckoff' / 'charts'
     return send_from_directory(charts_dir, filename)
+
+
+@app.route('/outputs/wyckoff/files/<path:filename>')
+def serve_wyckoff_file(filename):
+    """Serve generated Wyckoff files from nested output folders."""
+    outputs_root = _wyckoff_outputs_root().resolve()
+    target = (outputs_root / filename).resolve()
+    if outputs_root not in target.parents and target != outputs_root:
+        return jsonify({'success': False, 'error': '只能读取 outputs/wyckoff 下的文件'}), 400
+    return send_from_directory(outputs_root, filename)
 
 
 @app.route('/api/dashboard-pulse')
@@ -2110,18 +2375,26 @@ def get_watchlist():
             items = payload.get('items', {})
 
         rows = []
+        changed = False
         for code, meta in sorted(items.items(), key=lambda entry: entry[1].get('created_at', '')):
             try:
                 code = CSVManager.validate_stock_code(code)
             except ValueError:
                 continue
             row = _stock_table_row(code, stock_names)
+            stored_name = str(meta.get('name') or '').strip()
+            if row.get('name') and (not stored_name or _is_fallback_stock_name(code, stored_name)):
+                meta['name'] = row['name']
+                meta['updated_at'] = meta.get('updated_at') or _job_timestamp()
+                changed = True
             row.update({
                 'note': str(meta.get('note') or ''),
                 'created_at': meta.get('created_at'),
                 'updated_at': meta.get('updated_at'),
             })
             rows.append(row)
+        if changed:
+            _save_watchlist(payload)
 
         return jsonify({'success': True, 'data': rows})
     except Exception as e:
@@ -2170,6 +2443,47 @@ def add_watchlist_item():
             'updated_at': items[code].get('updated_at'),
         })
         return jsonify({'success': True, 'data': row})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/watchlist/batch', methods=['DELETE'])
+def remove_watchlist_items():
+    """批量移除自选股。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        payload = request.get_json(silent=True) or {}
+        raw_codes = payload.get('codes') or []
+        if not isinstance(raw_codes, list):
+            return jsonify({'success': False, 'error': 'codes 必须是数组'}), 400
+
+        codes = []
+        for raw_code in raw_codes:
+            try:
+                code = CSVManager.validate_stock_code(raw_code)
+            except ValueError:
+                continue
+            if code not in codes:
+                codes.append(code)
+        if not codes:
+            return jsonify({'success': False, 'error': '请选择要删除的自选股'}), 400
+
+        removed_codes = []
+        with watchlist_lock:
+            watchlist = _load_watchlist()
+            items = watchlist.setdefault('items', {})
+            for code in codes:
+                if items.pop(code, None) is not None:
+                    removed_codes.append(code)
+            _save_watchlist(watchlist)
+
+        return jsonify({
+            'success': True,
+            'removed_codes': removed_codes,
+            'removed_count': len(removed_codes),
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
