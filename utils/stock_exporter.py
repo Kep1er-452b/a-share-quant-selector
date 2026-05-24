@@ -31,20 +31,32 @@ except ImportError:  # pragma: no cover - dependency is declared, fallback keeps
 
 
 def load_stock_names(data_dir: str = "data") -> Dict[str, str]:
+    result = {}
     names_file = Path(data_dir) / "stock_names.json"
-    if not names_file.exists():
-        return {}
-    try:
-        with open(names_file, "r", encoding="utf-8") as file:
-            payload = json.load(file) or {}
-        result = {}
-        for code, name in payload.items():
-            normalized_code = str(code or "").strip().zfill(6)
-            if CSVManager.STOCK_CODE_PATTERN.match(normalized_code):
-                result[normalized_code] = str(name or "").strip()
-        return result
-    except Exception:
-        return {}
+    if names_file.exists():
+        try:
+            with open(names_file, "r", encoding="utf-8") as file:
+                payload = json.load(file) or {}
+            for code, name in payload.items():
+                normalized_code = str(code or "").strip().zfill(6)
+                if CSVManager.STOCK_CODE_PATTERN.match(normalized_code):
+                    result[normalized_code] = str(name or "").strip()
+        except Exception:
+            result = {}
+
+    meta_file = Path(data_dir) / "tushare_stock_map.json"
+    if meta_file.exists():
+        try:
+            with open(meta_file, "r", encoding="utf-8") as file:
+                payload = json.load(file) or {}
+            for code, meta in payload.items():
+                normalized_code = str(code or "").strip().zfill(6)
+                name = meta.get("name") if isinstance(meta, dict) else None
+                if CSVManager.STOCK_CODE_PATTERN.match(normalized_code) and name:
+                    result[normalized_code] = str(name).strip()
+        except Exception:
+            pass
+    return result
 
 
 def default_tushare_token(config: Optional[dict] = None):

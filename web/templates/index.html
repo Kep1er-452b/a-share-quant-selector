@@ -298,12 +298,18 @@
                             <input type="text" id="watchlist-note" class="search-input watchlist-note-input" placeholder="NOTE">
                             <button class="btn btn-primary" id="watchlist-add-btn" type="button">ADD</button>
                             <button class="btn btn-ghost" id="watchlist-refresh-btn" type="button">REFRESH</button>
+                            <span class="panel-meta" id="watchlist-selected-label">已选 0</span>
+                            <button class="btn btn-secondary" id="watchlist-batch-wyckoff-btn" type="button" disabled>批量威科夫</button>
+                            <button class="btn btn-danger" id="watchlist-batch-delete-btn" type="button" disabled>批量删除</button>
                         </div>
                     </div>
                     <div class="table-wrap">
                         <table class="data-table stable-scroll-table" id="watchlist-table">
                             <thead>
                                 <tr>
+                                    <th class="select-cell">
+                                        <input id="watchlist-select-all" type="checkbox" aria-label="选择全部自选股">
+                                    </th>
                                     <th>代码</th>
                                     <th>名称</th>
                                     <th>板块</th>
@@ -317,7 +323,7 @@
                             </thead>
                             <tbody id="watchlist-tbody">
                                 <tr>
-                                    <td colspan="9" class="state-loading">加载中...</td>
+                                    <td colspan="10" class="state-loading">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -361,9 +367,22 @@
                                 </div>
                             </div>
                             <div class="terminal-list">
-                                <div class="terminal-row">01  F7 第一版只分析单只股票，读取本地 CSV，不抓远端数据。</div>
+                                <div class="terminal-row">01  可单只分析，也可从 F6 自选股批量送入队列逐只分析。</div>
                                 <div class="terminal-row">02  AI 只输出结构化威科夫标注，本地可信渲染器负责画图。</div>
-                                <div class="terminal-row">03  图表、JSON 与调试记录保存到 outputs/wyckoff。</div>
+                                <div class="terminal-row">03  图表、JSON 与调试记录按股票与分析时间归档。</div>
+                            </div>
+                            <div class="wyckoff-cache-actions">
+                                <button class="btn btn-ghost" id="wyckoff-cache-organize-btn" type="button">整理缓存</button>
+                                <button class="btn btn-ghost" id="wyckoff-cache-cleanup-btn" type="button">清理旧缓存</button>
+                            </div>
+                            <div class="wyckoff-batch-panel">
+                                <div class="wyckoff-batch-head">
+                                    <span>BATCH QUEUE</span>
+                                    <span id="wyckoff-batch-summary">未运行</span>
+                                </div>
+                                <div class="wyckoff-batch-list" id="wyckoff-batch-list">
+                                    <div class="wyckoff-batch-row">从 F6 自选股票选择后可批量送入威科夫分析。</div>
+                                </div>
                             </div>
                         </div>
                     </section>
