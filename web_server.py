@@ -1142,13 +1142,21 @@ def _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=100):
 
 def _refresh_market_caches_for_job(job_id, data_dir):
     _append_update_job_log(job_id, '开始刷新市场缓存。')
+    _append_system_log(
+        'update_cache_refresh_start',
+        '开始刷新市场缓存。',
+        {'job_id': job_id, 'data_dir': data_dir},
+    )
 
-    def cache_progress(payload):
+    def cache_progress(**payload):
         stage = payload.get('stage')
         if stage == 'snapshot':
             _emit_update_progress(job_id, payload, phase_offset=82, phase_weight=12)
+            if payload.get('processed_count') in {1, payload.get('total_count')}:
+                _append_update_job_log(job_id, payload.get('current_step') or '构建本地云图快照')
         elif stage == 'industry':
             _emit_update_progress(job_id, payload, phase_offset=94, phase_weight=5)
+            _append_update_job_log(job_id, payload.get('current_step') or '刷新行业映射')
 
     cache_result = rebuild_market_caches(
         data_dir=data_dir,
@@ -1161,8 +1169,18 @@ def _refresh_market_caches_for_job(job_id, data_dir):
             job_id,
             f"缓存刷新完成，但存在降级项: {cache_result['errors']}"
         )
+        _append_system_log(
+            'update_cache_refresh_degraded',
+            '缓存刷新完成，但存在降级项。',
+            {'job_id': job_id, 'errors': cache_result.get('errors')},
+        )
     else:
         _append_update_job_log(job_id, '市场缓存刷新完成。')
+        _append_system_log(
+            'update_cache_refresh_completed',
+            '市场缓存刷新完成。',
+            {'job_id': job_id},
+        )
 
     _update_update_job(job_id, cache_refresh=cache_result.get('errors') or {})
 
@@ -1186,6 +1204,11 @@ def _run_update_job(job_id, provider_name, provider_token):
             progress_pct=1,
         )
         _append_update_job_log(job_id, f'开始执行数据更新，数据源: {provider_name}。')
+        _append_system_log(
+            'update_job_start',
+            f'开始执行数据更新，数据源: {provider_name}。',
+            {'job_id': job_id, 'provider': provider_name},
+        )
 
         provider = create_data_provider(
             provider_name=provider_name,
@@ -1238,6 +1261,11 @@ def _run_update_job(job_id, provider_name, provider_token):
             finished_at=_job_timestamp(),
         )
         _append_update_job_log(job_id, '数据更新与缓存重建已完成。')
+        _append_system_log(
+            'update_job_completed',
+            '数据更新与缓存重建已完成。',
+            {'job_id': job_id, 'provider': provider_name},
+        )
     except InterruptedError:
         _update_update_job(
             job_id,
@@ -1256,6 +1284,11 @@ def _run_update_job(job_id, provider_name, provider_token):
             finished_at=_job_timestamp(),
         )
         _append_update_job_log(job_id, f'更新失败: {exc}')
+        _append_system_log(
+            'update_job_error',
+            f'更新失败: {exc}',
+            {'job_id': job_id, 'provider': provider_name},
+        )
     except Exception as exc:
         _update_update_job(
             job_id,
@@ -1265,6 +1298,11 @@ def _run_update_job(job_id, provider_name, provider_token):
             finished_at=_job_timestamp(),
         )
         _append_update_job_log(job_id, f'更新失败: {exc}')
+        _append_system_log(
+            'update_job_error',
+            f'更新失败: {exc}',
+            {'job_id': job_id, 'provider': provider_name},
+        )
 
 
 def _warm_market_caches_background():
