@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -36,6 +38,9 @@ CNINFO_STANDARD_PRIORITY = [
 ]
 
 INDUSTRY_FETCH_MAX_WORKERS = 12
+INDUSTRY_CACHE_REUSE_MIN_RATIO = 0.95
+INDUSTRY_FETCH_TIMEOUT_SECONDS = 12
+INDUSTRY_FETCH_MAX_SECONDS = 120
 
 HIDDEN_MARKET_STOCK_CODES = {"300391"}
 HIDDEN_MARKET_STOCK_NAMES = {"长药退"}
@@ -273,6 +278,53 @@ def build_snapshot_cache(data_dir: str = "data", progress_callback: Optional[Cal
     return payload
 
 
+def _emit_industry_progress(
+    progress_callback: Optional[Callable],
+    current_step: str,
+    processed_count: int,
+    total_count: int,
+    code: str = "",
+) -> None:
+    if not progress_callback:
+        return
+    progress_callback(
+        stage="industry",
+        current_step=current_step,
+        processed_count=processed_count,
+        total_count=total_count,
+        progress_pct=int((processed_count / max(total_count, 1)) * 100),
+        current_stock={"code": code, "name": ""},
+    )
+
+
+def _run_industry_fetch_pool(fetch_func, code_list: List[str], max_workers: int):
+    mapping: Dict[str, str] = {}
+    source_map: Dict[str, str] = {}
+    pending = set()
+    executor = ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(code_list) or 1)))
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(INDUSTRY_FETCH_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + INDUSTRY_FETCH_MAX_SECONDS
+    try:
+        pending = {executor.submit(fetch_func, code): code for code in code_list}
+        while pending and time.monotonic() < deadline:
+            done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    code, industry_name, source = future.result(timeout=0)
+                except Exception:
+                    continue
+                if industry_name:
+                    mapping[code] = industry_name
+                    source_map[code] = source
+        for future in pending:
+            future.cancel()
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+        executor.shutdown(wait=False, cancel_futures=True)
+    return mapping, source_map, len(pending)
+
+
 def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Callable] = None) -> dict:
     try:
         import akshare as ak
@@ -283,41 +335,60 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
     previous_cache = load_industry_cache(data_dir)
     previous_items = previous_cache.get("items", {})
     csv_codes = {path.stem for path in data_path.rglob("*.csv")}
+    previous_mapping = {
+        code: _safe_text(previous_items.get(code))
+        for code in csv_codes
+        if _safe_text(previous_items.get(code))
+    }
+    previous_ratio = len(previous_mapping) / max(len(csv_codes), 1)
+
+    if previous_mapping and previous_ratio >= INDUSTRY_CACHE_REUSE_MIN_RATIO:
+        _emit_industry_progress(
+            progress_callback,
+            "复用本地行业映射",
+            len(previous_mapping),
+            len(csv_codes),
+        )
+        payload = {
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "previous_cache",
+            "mapped_count": len(previous_mapping),
+            "eastmoney_count": 0,
+            "cninfo_count": 0,
+            "reused_count": len(previous_mapping),
+            "unmapped_count": len(csv_codes - set(previous_mapping)),
+            "items": previous_mapping,
+        }
+        _write_json(industry_cache_path(data_dir), payload)
+        return payload
+
     mapping: Dict[str, str] = {}
     source_map: Dict[str, str] = {}
 
-    def fetch_eastmoney_industry(code: str) -> tuple[str, str]:
+    def fetch_eastmoney_industry(code: str) -> tuple[str, str, str]:
         try:
             info_df = ak.stock_individual_info_em(symbol=code)
         except Exception:
-            return code, ""
+            return code, "", "eastmoney"
         if info_df is None or info_df.empty or not {"item", "value"}.issubset(info_df.columns):
-            return code, ""
+            return code, "", "eastmoney"
         rows = info_df[info_df["item"].astype(str).str.strip() == "行业"]
         if rows.empty:
-            return code, ""
-        return code, _safe_text(rows.iloc[0].get("value"))
+            return code, "", "eastmoney"
+        return code, _safe_text(rows.iloc[0].get("value")), "eastmoney"
 
     code_list = sorted(csv_codes)
-    processed = 0
-    with ThreadPoolExecutor(max_workers=INDUSTRY_FETCH_MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_eastmoney_industry, code): code for code in code_list}
-        for future in as_completed(futures):
-            processed += 1
-            code, industry_name = future.result()
-            if industry_name:
-                mapping[code] = industry_name
-                source_map[code] = "eastmoney"
-
-            if progress_callback and (processed == 1 or processed == len(code_list) or processed % 150 == 0):
-                progress_callback(
-                    stage="industry",
-                    current_step="按交易软件口径刷新行业映射",
-                    processed_count=processed,
-                    total_count=len(code_list),
-                    progress_pct=int((processed / max(len(code_list), 1)) * 100),
-                    current_stock={"code": code, "name": ""},
-                )
+    mapping, source_map, eastmoney_pending = _run_industry_fetch_pool(
+        fetch_eastmoney_industry,
+        code_list,
+        INDUSTRY_FETCH_MAX_WORKERS,
+    )
+    _emit_industry_progress(
+        progress_callback,
+        "按交易软件口径刷新行业映射",
+        len(code_list) - eastmoney_pending,
+        len(code_list),
+    )
 
     missing_codes = sorted(csv_codes - set(mapping))
 
@@ -348,7 +419,7 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
                     return value
         return ""
 
-    def fetch_cninfo_industry(code: str) -> tuple[str, str]:
+    def fetch_cninfo_industry(code: str) -> tuple[str, str, str]:
         try:
             detail_df = ak.stock_industry_change_cninfo(
                 symbol=code,
@@ -357,28 +428,23 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
             )
         except Exception:
             detail_df = pd.DataFrame()
-        return code, choose_cninfo_industry(detail_df)
+        return code, choose_cninfo_industry(detail_df), "cninfo"
 
     cninfo_total = len(missing_codes)
     if missing_codes:
-        processed = 0
-        with ThreadPoolExecutor(max_workers=INDUSTRY_FETCH_MAX_WORKERS) as executor:
-            futures = {executor.submit(fetch_cninfo_industry, code): code for code in missing_codes}
-            for future in as_completed(futures):
-                processed += 1
-                resolved_code, industry_name = future.result()
-                if industry_name:
-                    mapping[resolved_code] = industry_name
-                    source_map[resolved_code] = "cninfo"
-                if progress_callback and cninfo_total and (processed == 1 or processed == cninfo_total or processed % 25 == 0):
-                    progress_callback(
-                        stage="industry",
-                        current_step="补充分散的未分类股票行业",
-                        processed_count=processed,
-                        total_count=cninfo_total,
-                        progress_pct=int((processed / max(cninfo_total, 1)) * 100),
-                        current_stock={"code": resolved_code, "name": ""},
-                    )
+        cninfo_mapping, cninfo_source_map, cninfo_pending = _run_industry_fetch_pool(
+            fetch_cninfo_industry,
+            missing_codes,
+            INDUSTRY_FETCH_MAX_WORKERS,
+        )
+        mapping.update(cninfo_mapping)
+        source_map.update(cninfo_source_map)
+        _emit_industry_progress(
+            progress_callback,
+            "补充分散的未分类股票行业",
+            cninfo_total - cninfo_pending,
+            cninfo_total,
+        )
 
     missing_codes = sorted(csv_codes - set(mapping))
     reused_count = 0
@@ -409,7 +475,12 @@ def build_index_cache(data_dir: str = "data") -> dict:
     except ImportError as exc:
         raise RuntimeError("未安装 akshare，无法构建指数缓存") from exc
 
-    index_df = ak.stock_zh_index_spot_sina()
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(INDUSTRY_FETCH_TIMEOUT_SECONDS)
+    try:
+        index_df = ak.stock_zh_index_spot_sina()
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
     index_df["代码"] = index_df["代码"].astype(str)
     items = []
     for target in INDEX_TARGETS:

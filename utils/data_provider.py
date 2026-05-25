@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -28,6 +28,7 @@ BOARD_LABELS = {
 
 MAX_REASONABLE_MARKET_CAP_YUAN = 20_000_000_000_000
 MIN_REASONABLE_MARKET_CAP_YUAN = 1_000_000
+DATA_SYNC_IDLE_TIMEOUT_SECONDS = 90
 
 
 def normalize_market_cap_yuan(value, source_unit: str = "yuan") -> Optional[int]:
@@ -207,24 +208,53 @@ class BaseDataProvider:
         ok_list = []
         fallback_list = []
         max_workers = min(self._sync_max_workers, max(len(items), 1))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {pool.submit(self._sync_one_incremental, item, latest_trade_date, status_map, market_cap_map): item for item in items}
-            for future in as_completed(futures):
+            pending = set(futures)
+            last_completion = time.monotonic()
+            while pending:
                 if halt_checker and halt_checker():
                     raise InterruptedError("系统已急停")
-                result = future.result()
-                if result["ok"]:
-                    ok_list.append(result)
-                elif result.get("fallback_full"):
-                    fallback_list.append(futures[future])
-                self._emit_batch_progress(
-                    item=futures[future],
-                    result=result,
-                    stage="sync",
-                    current_step="增量补齐",
-                    progress_callback=progress_callback,
-                    progress_state=progress_state,
-                )
+                done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                if not done:
+                    if time.monotonic() - last_completion < DATA_SYNC_IDLE_TIMEOUT_SECONDS:
+                        continue
+                    for future in pending:
+                        future.cancel()
+                        item = futures[future]
+                        result = {
+                            "code": item.get("code"),
+                            "name": item.get("name", ""),
+                            "ok": False,
+                            "timeout": True,
+                        }
+                        self._emit_batch_progress(
+                            item=item,
+                            result=result,
+                            stage="sync",
+                            current_step="增量补齐超时跳过",
+                            progress_callback=progress_callback,
+                            progress_state=progress_state,
+                        )
+                    break
+                last_completion = time.monotonic()
+                for future in done:
+                    result = future.result()
+                    if result["ok"]:
+                        ok_list.append(result)
+                    elif result.get("fallback_full"):
+                        fallback_list.append(futures[future])
+                    self._emit_batch_progress(
+                        item=futures[future],
+                        result=result,
+                        stage="sync",
+                        current_step="增量补齐",
+                        progress_callback=progress_callback,
+                        progress_state=progress_state,
+                    )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         return ok_list, fallback_list
 
     def _sync_full_parallel_batch(
@@ -242,24 +272,54 @@ class BaseDataProvider:
         ok_list = []
         failed_list = []
         max_workers = min(self._sync_max_workers, max(len(items), 1))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {pool.submit(self._sync_one_full_refresh, item, latest_trade_date, market_cap_map): item for item in items}
-            for future in as_completed(futures):
+            pending = set(futures)
+            last_completion = time.monotonic()
+            while pending:
                 if halt_checker and halt_checker():
                     raise InterruptedError("系统已急停")
-                result = future.result()
-                if result["ok"]:
-                    ok_list.append(result)
-                else:
-                    failed_list.append(result)
-                self._emit_batch_progress(
-                    item=futures[future],
-                    result=result,
-                    stage="sync",
-                    current_step="全量重抓",
-                    progress_callback=progress_callback,
-                    progress_state=progress_state,
-                )
+                done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                if not done:
+                    if time.monotonic() - last_completion < DATA_SYNC_IDLE_TIMEOUT_SECONDS:
+                        continue
+                    for future in pending:
+                        future.cancel()
+                        item = futures[future]
+                        result = {
+                            "code": item.get("code"),
+                            "name": item.get("name", ""),
+                            "ok": False,
+                            "timeout": True,
+                        }
+                        failed_list.append(result)
+                        self._emit_batch_progress(
+                            item=item,
+                            result=result,
+                            stage="sync",
+                            current_step="全量重抓超时跳过",
+                            progress_callback=progress_callback,
+                            progress_state=progress_state,
+                        )
+                    break
+                last_completion = time.monotonic()
+                for future in done:
+                    result = future.result()
+                    if result["ok"]:
+                        ok_list.append(result)
+                    else:
+                        failed_list.append(result)
+                    self._emit_batch_progress(
+                        item=futures[future],
+                        result=result,
+                        stage="sync",
+                        current_step="全量重抓",
+                        progress_callback=progress_callback,
+                        progress_state=progress_state,
+                    )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         return ok_list, failed_list
 
     @staticmethod
