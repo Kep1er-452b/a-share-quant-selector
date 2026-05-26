@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+from .data import normalize_ohlcv
 from .schema import to_chart_annotations
 
 
@@ -34,7 +35,7 @@ def render_chart(csv_path: str | Path, analysis: dict, output_path: str | Path, 
     output.parent.mkdir(parents=True, exist_ok=True)
     module = _load_chart_module()
     try:
-        prices = module.load_prices(str(csv_path), lookback=500)
+        prices = normalize_ohlcv(module.load_prices(str(csv_path), lookback=500), min_rows=2)
         annotations = to_chart_annotations(analysis)
         if not any(annotations.get(key) for key in ("events", "ranges", "phases")) and hasattr(module, "choose_structure"):
             annotations = module.choose_structure(prices)
