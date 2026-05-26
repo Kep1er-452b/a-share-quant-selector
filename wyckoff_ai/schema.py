@@ -18,9 +18,63 @@ VALID_MODES = {
     "unclear",
 }
 
+MODE_ALIASES = {
+    "acc": "accumulation",
+    "accumulate": "accumulation",
+    "accumulating": "accumulation",
+    "reacc": "reaccumulation",
+    "reaccumulate": "reaccumulation",
+    "redist": "redistribution",
+    "redistribute": "redistribution",
+    "dist": "distribution",
+    "distribute": "distribution",
+    "distributing": "distribution",
+    "distriction": "distribution",
+    "distribuition": "distribution",
+    "distributon": "distribution",
+    "distribtion": "distribution",
+    "mark-up": "markup",
+    "uptrend": "markup",
+    "mark-down": "markdown",
+    "downtrend": "markdown",
+    "decline": "markdown",
+    "unknown": "unclear",
+    "neutral": "unclear",
+}
+
+MAX_DATE_SNAP_DAYS = 10
+
 
 class WyckoffSchemaError(ValueError):
     """Raised when model output is not safe or coherent enough to render."""
+
+
+def _normalize_mode(value: Any) -> str:
+    raw = str(value or "unclear").strip().lower()
+    compact = raw.replace("_", "").replace("-", "").replace(" ", "")
+    if raw in VALID_MODES:
+        return raw
+    if compact in VALID_MODES:
+        return compact
+    if raw in MODE_ALIASES:
+        return MODE_ALIASES[raw]
+    if compact in MODE_ALIASES:
+        return MODE_ALIASES[compact]
+    if "redis" in compact:
+        return "redistribution"
+    if "reacc" in compact:
+        return "reaccumulation"
+    if compact.startswith("distri") or compact.startswith("distrib") or "distribution" in compact:
+        return "distribution"
+    if "accumul" in compact:
+        return "accumulation"
+    if "markdown" in compact or "downtrend" in compact:
+        return "markdown"
+    if "markup" in compact or "uptrend" in compact:
+        return "markup"
+    if "unclear" in compact or "unknown" in compact:
+        return "unclear"
+    return compact
 
 
 def _require_text(payload: dict[str, Any], key: str, default: str = "") -> str:
@@ -43,14 +97,45 @@ def _date_index(df: pd.DataFrame) -> dict[str, dict[str, float]]:
     return rows
 
 
-def _normalize_date(value: Any, available_dates: set[str], field_name: str) -> str:
+def _parse_date(value: Any, field_name: str) -> str:
     try:
-        date = pd.to_datetime(value, errors="raise").strftime("%Y-%m-%d")
+        return pd.to_datetime(value, errors="raise").strftime("%Y-%m-%d")
     except Exception as exc:
         raise WyckoffSchemaError(f"{field_name} 日期无法解析: {value}") from exc
+
+
+def _candidate_dates(value: Any, available_dates: set[str], field_name: str) -> list[str]:
+    date = _parse_date(value, field_name)
     if date not in available_dates:
-        raise WyckoffSchemaError(f"{field_name} 日期不在 CSV 真实交易日中: {date}")
-    return date
+        target = pd.Timestamp(date)
+        candidates = sorted(
+            available_dates,
+            key=lambda item: (
+                abs((pd.Timestamp(item) - target).days),
+                0 if pd.Timestamp(item) <= target else 1,
+            ),
+        )
+        if not candidates:
+            raise WyckoffSchemaError("CSV 中没有可用交易日")
+        nearest = candidates[0]
+        if abs((pd.Timestamp(nearest) - target).days) > MAX_DATE_SNAP_DAYS:
+            raise WyckoffSchemaError(f"{field_name} 日期不在 CSV 真实交易日中: {date}")
+        return candidates[:5]
+
+    target = pd.Timestamp(date)
+    nearby = sorted(
+        available_dates,
+        key=lambda item: (
+            abs((pd.Timestamp(item) - target).days),
+            0 if item == date else 1,
+            0 if pd.Timestamp(item) <= target else 1,
+        ),
+    )
+    return [item for item in nearby if abs((pd.Timestamp(item) - target).days) <= MAX_DATE_SNAP_DAYS][:5]
+
+
+def _normalize_date(value: Any, available_dates: set[str], field_name: str) -> str:
+    return _candidate_dates(value, available_dates, field_name)[0]
 
 
 def _validate_price(date: str, price: Any, prices_by_date: dict[str, dict[str, float]], field_name: str) -> float:
@@ -81,8 +166,19 @@ def _validate_events(events: Any, prices_by_date: dict[str, dict[str, float]]) -
         reason = str(item.get("reason") or "").strip()
         if not term or not reason:
             raise WyckoffSchemaError(f"第 {index} 个事件缺少 term 或 reason")
-        date = _normalize_date(item.get("date"), available_dates, f"event[{index}]")
-        price = _validate_price(date, item.get("price"), prices_by_date, f"event[{index}]")
+        price_error = None
+        date = None
+        price = None
+        for candidate_date in _candidate_dates(item.get("date"), available_dates, f"event[{index}]"):
+            try:
+                candidate_price = _validate_price(candidate_date, item.get("price"), prices_by_date, f"event[{index}]")
+                date = candidate_date
+                price = candidate_price
+                break
+            except WyckoffSchemaError as exc:
+                price_error = exc
+        if date is None or price is None:
+            raise price_error or WyckoffSchemaError(f"event[{index}] 日期或价格无法校验")
         normalized.append({
             "term": term[:24],
             "date": date,
@@ -177,7 +273,7 @@ def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, An
         raise WyckoffSchemaError("AI 输出必须是 JSON 对象")
     prices_by_date = _date_index(df)
     available_dates = set(prices_by_date)
-    mode = str(payload.get("mode") or "unclear").strip().lower()
+    mode = _normalize_mode(payload.get("mode"))
     if mode not in VALID_MODES:
         raise WyckoffSchemaError(f"不支持的威科夫结构: {mode}")
 

@@ -41,9 +41,17 @@ def build_messages(symbol: str, stock_name: str, df) -> list[dict[str, str]]:
             "recent_60_close_max": round(float(recent_60["close"].max()), 4),
         },
     }
+    adjustment_repairs = getattr(df, "attrs", {}).get("adjustment_repairs") or []
+    if adjustment_repairs:
+        payload["data_quality"] = {
+            "adjustment_repairs": adjustment_repairs,
+            "note": "本地 CSV 存在疑似除权/复权口径断层，威科夫分析已使用临时连续复权价格，不改变源 CSV。",
+        }
     user_content = (
         "请基于下面本地 CSV 清洗后的真实行情数据做威科夫结构分析。"
-        "只能引用数据中真实存在的日期，事件价格必须贴近当天 OHLC。"
+        "只能引用数据中真实存在的日期；ranges/phases/events 的日期都不能使用周末或节假日。"
+        "mode 只能逐字使用固定枚举: accumulation/distribution/markup/markdown/reaccumulation/redistribution/unclear。"
+        "事件价格必须贴近当天 OHLC。"
         "证据不足时请输出 unclear，不要强行凑 Phase 或事件。"
         "请输出接近专业人工读图的长分析，不要只给摘要；summary_text 至少覆盖背景、事件链、价位、确认条件和失效条件。"
         "必须返回非空 JSON 对象。\n\n"

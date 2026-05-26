@@ -114,6 +114,7 @@ class WyckoffPipeline:
                 "latest_date": data_date,
                 "rows_total": int(len(df)),
                 "rows_sent": int(len(recent)),
+                "adjustment_repairs": df.attrs.get("adjustment_repairs", []),
             },
             "analysis": analysis,
             "analysis_text": self._format_analysis_text(analysis),
