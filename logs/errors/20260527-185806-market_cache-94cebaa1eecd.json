@@ -1,0 +1,16 @@
+{
+  "error_id": "94cebaa1eecd",
+  "module": "market_cache",
+  "created_at": "2026-05-27T18:58:06",
+  "pid": 85805,
+  "error_type": "RuntimeError",
+  "error_message": "市场缓存刷新存在降级项",
+  "traceback": "NoneType: None\n",
+  "context": {
+    "job_id": "94cebaa1eecd",
+    "data_dir": "data/providers/tushare",
+    "errors": {
+      "indices": "HTTPConnectionPool(host='0.0.0.0', port=80): Max retries exceeded with url: / (Caused by NewConnectionError(\"HTTPConnection(host='0.0.0.0', port=80): Failed to establish a new connection: [Errno 61] Connection refused\"))"
+    }
+  }
+}

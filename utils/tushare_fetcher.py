@@ -613,7 +613,7 @@ class TushareFetcher(BaseDataProvider):
                 df = self.pro.stock_basic(
                     exchange="",
                     list_status="L",
-                    fields="ts_code,symbol,name,market,exchange,list_date"
+                    fields="ts_code,symbol,name,area,industry,market,exchange,list_date"
                 )
 
                 if df is None or df.empty:
@@ -630,6 +630,8 @@ class TushareFetcher(BaseDataProvider):
                     row["symbol"]: {
                         "ts_code": row["ts_code"],
                         "name": row["name"],
+                        "area": row.get("area", ""),
+                        "industry": row.get("industry", ""),
                         "exchange": row["exchange"],
                         "market": row["market"],
                         "list_date": row["list_date"],

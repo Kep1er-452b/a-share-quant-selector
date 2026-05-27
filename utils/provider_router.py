@@ -71,6 +71,10 @@ def _stock_csv_files(path: Path) -> list[Path]:
     return sorted(path.glob("[0-9][0-9]/*.csv"))
 
 
+def _has_stock_csv_file(path: Path) -> bool:
+    return next(path.glob("[0-9][0-9]/*.csv"), None) is not None
+
+
 def _latest_csv_date(path: Path) -> Optional[str]:
     latest = None
     for csv_path in _stock_csv_files(path):
@@ -192,7 +196,7 @@ def active_data_dir(data_dir: str | Path, allow_legacy_fallback: bool = True) ->
     provider = payload.get("active_provider")
     if provider in VALID_PROVIDERS:
         path = provider_data_dir(data_dir, provider)
-        if path.exists() and _stock_csv_files(path):
+        if path.exists() and _has_stock_csv_file(path):
             return path
         if not allow_legacy_fallback:
             return path
