@@ -649,9 +649,20 @@
         <div class="modal-body update-modal-body">
             <div class="update-modal-step active" id="update-provider-step">
                 <div class="update-modal-note">请选择本次更新要使用的数据源。</div>
+                <div class="update-legacy-note" id="update-legacy-note">旧数据仓状态读取中</div>
                 <div class="update-provider-grid">
-                    <button class="update-provider-btn" data-provider="akshare" type="button">AKSHARE</button>
-                    <button class="update-provider-btn" data-provider="tushare" type="button">TUSHARE</button>
+                    <button class="update-provider-btn" data-provider="tushare" type="button">
+                        <span class="provider-name">TUSHARE</span>
+                        <span class="provider-meta" data-provider-meta="tushare">状态读取中</span>
+                    </button>
+                    <button class="update-provider-btn" data-provider="akshare" type="button">
+                        <span class="provider-name">AKSHARE</span>
+                        <span class="provider-meta" data-provider-meta="akshare">状态读取中</span>
+                    </button>
+                    <button class="update-provider-btn" data-provider="tencent" type="button">
+                        <span class="provider-name">TENCENT</span>
+                        <span class="provider-meta" data-provider-meta="tencent">状态读取中</span>
+                    </button>
                 </div>
             </div>
 

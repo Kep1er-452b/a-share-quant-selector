@@ -54,6 +54,9 @@ const state = {
     updateProvider: null,
     updateHasTushareToken: false,
     updateDefaultProvider: 'akshare',
+    updateActiveProvider: null,
+    updateProviderStatuses: [],
+    updateLegacyProvider: null,
     globalTickerText: '',
     currentStockDetail: null,
     pendingExportStock: null,
@@ -2346,7 +2349,7 @@ async function pollWyckoffJob() {
             return;
         }
         if (job.status === 'error') {
-            throw new Error(job.error || job.message || '威科夫分析失败');
+            throw new Error(`${job.error || job.message || '威科夫分析失败'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`);
         }
     } catch (error) {
         stopWyckoffProgress();
@@ -2616,7 +2619,7 @@ async function waitForWyckoffJob(jobId) {
             return job.result;
         }
         if (job.status === 'error' || job.status === 'halted') {
-            throw new Error(job.error || job.message || '威科夫分析失败');
+            throw new Error(`${job.error || job.message || '威科夫分析失败'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`);
         }
         await delay(1200);
     }
@@ -2848,10 +2851,43 @@ async function loadUpdateOptions() {
         const data = result.data || {};
         state.updateHasTushareToken = Boolean(data.has_tushare_token);
         state.updateDefaultProvider = data.default_provider || 'akshare';
+        state.updateActiveProvider = data.active_provider || null;
+        state.updateProviderStatuses = Array.isArray(data.providers) ? data.providers : [];
+        state.updateLegacyProvider = data.legacy_provider || null;
+        renderUpdateProviderOptions();
         renderUpdateTokenPrompt();
     } catch (error) {
         console.error('loadUpdateOptions failed:', error);
     }
+}
+
+function renderUpdateProviderOptions() {
+    const statuses = new Map((state.updateProviderStatuses || []).map(item => [item.provider, item]));
+    const legacy = state.updateLegacyProvider || {};
+    const legacyNote = document.getElementById('update-legacy-note');
+    if (legacyNote) {
+        const count = Number(legacy.stock_count || 0);
+        const latest = legacy.latest_trade_date || '--';
+        const status = count ? '旧数据仓可用' : '旧数据仓为空';
+        const activeText = state.updateActiveProvider === 'legacy' ? '当前系统正在使用旧数据仓。' : '新分仓首次完整更新成功后会自动切换。';
+        legacyNote.textContent = `${status}: ${formatNumber(count)} 只 · 最新交易日 ${latest}。${activeText}`;
+    }
+    document.querySelectorAll('.update-provider-btn[data-provider]').forEach(button => {
+        const provider = button.dataset.provider;
+        const meta = button.querySelector('[data-provider-meta]');
+        const status = statuses.get(provider) || {};
+        button.classList.toggle('active', provider === state.updateActiveProvider);
+        if (!meta) {
+            return;
+        }
+        const latest = status.latest_trade_date || '--';
+        const updated = status.updated_at ? String(status.updated_at).replace('T', ' ').slice(0, 16) : '--';
+        const failed = Number(status.failed_count || 0);
+        const warnings = Number(status.warning_count || 0);
+        const count = Number(status.stock_count || 0);
+        const flag = provider === state.updateActiveProvider ? 'ACTIVE' : (status.status || 'EMPTY').toUpperCase();
+        meta.textContent = `${flag} · ${latest} · ${formatNumber(count)}只 · 失败${failed}/警告${warnings} · ${updated}`;
+    });
 }
 
 function openUpdateModal() {
@@ -2862,6 +2898,7 @@ function openUpdateModal() {
     state.updateProvider = null;
     document.getElementById('update-tushare-token').value = '';
     renderUpdateTokenPrompt();
+    renderUpdateProviderOptions();
     setUpdateModalStep('provider');
     document.getElementById('update-modal').classList.add('active');
     loadUpdateOptions();
@@ -2919,7 +2956,7 @@ function renderUpdateJob(job) {
     document.getElementById('update-elapsed-value').textContent = formatElapsed(job.elapsed_seconds || 0);
     document.getElementById('update-progress-status').textContent = String(job.status || 'queued').toUpperCase();
     document.getElementById('update-progress-headline').textContent = job.error
-        ? `更新失败: ${job.error}`
+        ? `更新失败: ${job.error}${job.error_report_path ? ` · 日志 ${job.error_report_path}` : ''}`
         : (job.current_stock
             ? `当前处理: ${job.current_stock.name || '未知'} (${job.current_stock.code || '--'})`
             : (job.current_step || '更新任务进行中...'));
@@ -2975,7 +3012,7 @@ async function pollUpdateJobStatus() {
             if (updateButton) {
                 updateButton.disabled = false;
             }
-            toast(`更新失败: ${job.error || '未知错误'}`, 'error');
+            toast(`更新失败: ${job.error || '未知错误'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`, 'error');
             return;
         }
 
@@ -3470,8 +3507,9 @@ async function pollSelectionJobStatus() {
             setStatus('error');
             document.getElementById('selection-results-headline').textContent = '执行失败';
             document.getElementById('selection-results-meta').textContent = 'Error';
-            document.getElementById('selection-results').innerHTML = `<div class="state-empty">执行失败: ${escapeHtml(job.error || '未知错误')}</div>`;
-            toast(`执行失败: ${job.error || '未知错误'}`, 'error');
+            const logText = job.error_report_path ? `<br>错误日志: ${escapeHtml(job.error_report_path)}` : '';
+            document.getElementById('selection-results').innerHTML = `<div class="state-empty">执行失败: ${escapeHtml(job.error || '未知错误')}${logText}</div>`;
+            toast(`执行失败: ${job.error || '未知错误'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`, 'error');
             return;
         }
 

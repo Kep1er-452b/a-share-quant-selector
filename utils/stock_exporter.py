@@ -17,6 +17,7 @@ from utils.csv_manager import CSVManager
 from utils.data_provider import create_data_provider, get_config_value
 from utils.local_config import load_config_file
 from utils.market_overview import is_hidden_market_stock
+from utils.provider_router import get_active_provider_name, provider_data_dir
 from utils.strategy_labels import fallback_stock_name
 
 
@@ -213,27 +214,32 @@ class StockExportService:
         config: Optional[dict] = None,
         tushare_token: Optional[str] = None,
         downloads_dir: Path = DOWNLOADS_DIR,
+        provider_name: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.config = config or load_config_file("config/config.yaml")
-        self.csv_manager = CSVManager(data_dir)
+        self.provider_name = (provider_name or get_active_provider_name(data_dir)).strip().lower()
+        self.storage_dir = provider_data_dir(data_dir, self.provider_name)
+        if not self.storage_dir.exists():
+            self.storage_dir = Path(data_dir)
+        self.csv_manager = CSVManager(self.storage_dir)
         self.downloads_dir = Path(downloads_dir)
         self.tushare_token = (tushare_token or "").strip()
 
     def resolve(self, query: str) -> dict:
-        match = resolve_stock_query(query, data_dir=self.data_dir)
+        match = resolve_stock_query(query, data_dir=str(self.storage_dir))
         if not match:
             raise ValueError(f"未找到匹配股票: {query}")
         return match
 
     def _provider(self):
         token = self.tushare_token
-        if not token:
+        if self.provider_name == "tushare" and not token:
             token, _ = default_tushare_token(self.config)
-        if not token:
+        if self.provider_name == "tushare" and not token:
             raise ValueError("未找到默认 Tushare Token，无法校验或更新数据")
         return create_data_provider(
-            provider_name="tushare",
+            provider_name=self.provider_name,
             data_dir=self.data_dir,
             config=self.config,
             token=token,
@@ -259,6 +265,8 @@ class StockExportService:
         provider = self._provider()
         target = [{"code": code, "name": name or fallback_stock_name(code)}]
         provider.sync_target_data(target, board="all", max_stocks=None, purpose="export")
+        self.storage_dir = Path(provider.full_data_dir)
+        self.csv_manager = CSVManager(self.storage_dir)
         return self.assess_freshness(code, name=name)
 
     def _copy_csv(self, code: str, name: str) -> Path:

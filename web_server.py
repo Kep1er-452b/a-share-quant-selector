@@ -27,6 +27,7 @@ sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
+from utils.error_logging import append_system_log as shared_append_system_log, write_error_report
 from utils.config_schema import atomic_write_yaml, validate_strategy_params
 from utils.local_config import load_config_file
 from utils.market_overview import (
@@ -38,6 +39,16 @@ from utils.market_overview import (
     market_cache_needs_refresh,
     is_hidden_market_stock,
 )
+from utils.provider_router import (
+    activate_provider,
+    active_data_dir as routed_active_data_dir,
+    get_active_provider_name,
+    legacy_summary,
+    list_provider_statuses,
+    load_active_provider,
+    provider_data_dir,
+    warehouse_summary,
+)
 from utils.selection_worker import (
     build_worker_context,
     initialize_selection_worker,
@@ -46,6 +57,7 @@ from utils.selection_worker import (
 from utils.strategy_labels import fallback_stock_name, is_invalid_stock_name
 from utils.stock_exporter import (
     StockExportService,
+    load_stock_names as load_stock_names_from_dir,
     resolve_stock_query,
     search_stocks,
 )
@@ -59,8 +71,7 @@ app = Flask(__name__,
             template_folder='web/templates',
             static_folder='web/static')
 
-# 全局实例
-csv_manager = CSVManager("data")
+# 全局状态
 halt_event = Event()
 shutdown_event = Event()
 WEB_SESSION_TOKEN = secrets.token_urlsafe(32)
@@ -99,6 +110,23 @@ registry = _reload_registry()
 
 def _load_config(config_path="config/config.yaml"):
     return load_config_file(config_path)
+
+
+def _data_root_dir():
+    config = _load_config()
+    return Path(str(_config_value(config, 'data_dir', default='data')))
+
+
+def _active_data_dir():
+    return routed_active_data_dir(_data_root_dir())
+
+
+def _active_provider_name():
+    return get_active_provider_name(_data_root_dir())
+
+
+def _active_csv_manager():
+    return CSVManager(_active_data_dir())
 
 
 def _index_kline_cache_path(data_dir='data'):
@@ -322,16 +350,7 @@ def _sanitize_for_log(value):
 
 
 def _append_system_log(event, message, detail=None):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "time": _job_timestamp(),
-        "event": event,
-        "message": message,
-    }
-    if detail is not None:
-        payload["detail"] = _sanitize_for_log(detail)
-    with open(SYSTEM_LOG_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+    shared_append_system_log(event, message, detail)
 
 
 def _compact_job_snapshot(job, fields):
@@ -519,28 +538,9 @@ def _parse_requested_strategies(raw_value):
 
 
 def _load_stock_names():
-    names_file = Path("data/stock_names.json")
-    result = {}
-    if names_file.exists():
-        with open(names_file, 'r', encoding='utf-8') as f:
-            payload = json.load(f) or {}
-        for code, name in payload.items():
-            normalized_code = str(code or "").strip().zfill(6)
-            if CSVManager.STOCK_CODE_PATTERN.match(normalized_code):
-                result[normalized_code] = str(name or "").strip()
-
-    tushare_meta_file = Path("data/tushare_stock_map.json")
-    if tushare_meta_file.exists():
-        try:
-            with open(tushare_meta_file, 'r', encoding='utf-8') as f:
-                payload = json.load(f) or {}
-            for code, meta in payload.items():
-                normalized_code = str(code or "").strip().zfill(6)
-                name = meta.get('name') if isinstance(meta, dict) else None
-                if CSVManager.STOCK_CODE_PATTERN.match(normalized_code) and name:
-                    result[normalized_code] = str(name).strip()
-        except Exception:
-            pass
+    result = load_stock_names_from_dir(str(_data_root_dir()))
+    active_names = load_stock_names_from_dir(str(_active_data_dir()))
+    result.update(active_names)
     return result
 
 
@@ -630,7 +630,7 @@ def _save_selection_markdown(results, time_text, meta=None):
 
 
 def _watchlist_path():
-    return Path(csv_manager.data_dir) / 'watchlist.json'
+    return _data_root_dir() / 'watchlist.json'
 
 
 def _load_watchlist():
@@ -695,7 +695,7 @@ def _safe_int_arg(name, default, minimum=1, maximum=1000):
 
 def _stock_table_row(code, stock_names=None):
     stock_names = stock_names or _load_stock_names()
-    df = csv_manager.read_stock(code)
+    df = _active_csv_manager().read_stock_for_analysis(code)
     if df.empty:
         return {
             'code': code,
@@ -726,6 +726,7 @@ def _export_service():
     return StockExportService(
         data_dir=str(_config_value(config, 'data_dir', default='data')),
         config=config,
+        provider_name=_active_provider_name(),
     )
 
 
@@ -982,8 +983,9 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
             error=None,
         )
 
+        manager = _active_csv_manager()
         stock_codes = [
-            code for code in csv_manager.list_all_stocks()
+            code for code in manager.list_all_stocks()
             if _classify_board(code) in requested_boards
         ]
         stock_names = _load_stock_names()
@@ -998,7 +1000,7 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
                 continue
             candidates.append((code, name))
 
-        data_dir = str(csv_manager.data_dir)
+        data_dir = str(manager.data_dir)
         settings = _get_web_selection_settings()
         settings['backend'] = 'thread'
         backend = _resolve_selection_backend(len(candidates), settings)
@@ -1113,13 +1115,20 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
         )
         _append_job_log_by_id(job_id, f"选股记录已保存: {report_path}")
     except Exception as exc:
+        error_report_path = write_error_report(
+            'selection',
+            exc,
+            {'job_id': job_id, 'boards': requested_boards, 'strategies': requested_strategies},
+            error_id=job_id,
+        )
         _update_job(
             job_id,
             status='error',
             error=str(exc),
+            error_report_path=str(error_report_path),
             current_stock=None,
         )
-        _append_job_log_by_id(job_id, f"执行失败: {exc}")
+        _append_job_log_by_id(job_id, f"执行失败: {exc}；错误日志: {error_report_path}")
 
 
 def _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=100):
@@ -1165,14 +1174,20 @@ def _refresh_market_caches_for_job(job_id, data_dir):
     )
 
     if cache_result.get('errors'):
+        error_report_path = write_error_report(
+            'market_cache',
+            RuntimeError('市场缓存刷新存在降级项'),
+            {'job_id': job_id, 'data_dir': data_dir, 'errors': cache_result.get('errors')},
+            error_id=job_id,
+        )
         _append_update_job_log(
             job_id,
-            f"缓存刷新完成，但存在降级项: {cache_result['errors']}"
+            f"缓存刷新完成，但存在降级项: {cache_result['errors']}；错误日志: {error_report_path}"
         )
         _append_system_log(
             'update_cache_refresh_degraded',
             '缓存刷新完成，但存在降级项。',
-            {'job_id': job_id, 'errors': cache_result.get('errors')},
+            {'job_id': job_id, 'errors': cache_result.get('errors'), 'error_report_path': str(error_report_path)},
         )
     else:
         _append_update_job_log(job_id, '市场缓存刷新完成。')
@@ -1226,6 +1241,23 @@ def _run_update_job(job_id, provider_name, provider_token):
 
         def progress_callback(payload):
             _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=82)
+            if payload.get('stage') == 'data_quality':
+                stock = payload.get('current_stock') or {}
+                message = (
+                    f"{payload.get('current_step')}: "
+                    f"{stock.get('name', '未知')}({stock.get('code', '--')})"
+                )
+                _append_update_job_log(job_id, message)
+                _append_system_log(
+                    'data_quality_adjustment_gap',
+                    message,
+                    {
+                        'job_id': job_id,
+                        'provider': provider_name,
+                        'stock': stock,
+                        'adjustment_gaps': payload.get('adjustment_gaps', []),
+                    },
+                )
             if payload.get('current_stock') and payload.get('stage') == 'sync':
                 stock = payload['current_stock']
                 step = payload.get('current_step') or '同步数据中'
@@ -1237,7 +1269,7 @@ def _run_update_job(job_id, provider_name, provider_token):
                         f"{step}: {stock.get('name', '未知')}({stock.get('code', '--')}) {processed}/{max(total, 1)}"
                     )
 
-        provider.sync_target_data(
+        sync_summary = provider.sync_target_data(
             target_universe,
             board='all',
             max_stocks=None,
@@ -1251,7 +1283,29 @@ def _run_update_job(job_id, provider_name, provider_token):
             _append_update_job_log(job_id, '任务因系统急停而终止。')
             return
 
-        _refresh_market_caches_for_job(job_id, data_dir)
+        provider_dir = str(provider.full_data_dir)
+        _refresh_market_caches_for_job(job_id, provider_dir)
+        provider_state = warehouse_summary(data_dir, provider_name)
+        switch_allowed = (
+            provider_state.get('stock_count', 0) > 0
+            and (provider_state.get('coverage_ratio') or 0) >= 0.98
+            and (provider_state.get('failed_count') or 0) <= max(5, int((provider_state.get('target_count') or 0) * 0.02))
+        )
+        if switch_allowed:
+            activate_provider(data_dir, provider_name, provider_state)
+            _append_update_job_log(job_id, f"active provider 已切换为 {provider_name}。")
+            _append_system_log(
+                'active_provider_switched',
+                f'active provider 已切换为 {provider_name}。',
+                {'job_id': job_id, 'provider': provider_name, 'summary': provider_state},
+            )
+        else:
+            _append_update_job_log(job_id, 'active provider 未切换，更新结果未达到覆盖率/失败数阈值。')
+            _append_system_log(
+                'active_provider_switch_skipped',
+                'active provider 未切换，更新结果未达到覆盖率/失败数阈值。',
+                {'job_id': job_id, 'provider': provider_name, 'summary': provider_state, 'sync_summary': sync_summary},
+            )
         _update_update_job(
             job_id,
             status='completed',
@@ -1264,7 +1318,7 @@ def _run_update_job(job_id, provider_name, provider_token):
         _append_system_log(
             'update_job_completed',
             '数据更新与缓存重建已完成。',
-            {'job_id': job_id, 'provider': provider_name},
+            {'job_id': job_id, 'provider': provider_name, 'provider_state': provider_state},
         )
     except InterruptedError:
         _update_update_job(
@@ -1276,38 +1330,51 @@ def _run_update_job(job_id, provider_name, provider_token):
         )
         _append_update_job_log(job_id, '任务因系统急停而终止。')
     except DataProviderError as exc:
+        error_report_path = write_error_report(
+            'update',
+            exc,
+            {'job_id': job_id, 'provider': provider_name, 'stage': 'data_provider'},
+            error_id=job_id,
+        )
         _update_update_job(
             job_id,
             status='error',
             error=str(exc),
+            error_report_path=str(error_report_path),
             current_stock=None,
             finished_at=_job_timestamp(),
         )
-        _append_update_job_log(job_id, f'更新失败: {exc}')
+        _append_update_job_log(job_id, f'更新失败: {exc}；错误日志: {error_report_path}')
         _append_system_log(
             'update_job_error',
             f'更新失败: {exc}',
-            {'job_id': job_id, 'provider': provider_name},
+            {'job_id': job_id, 'provider': provider_name, 'error_report_path': str(error_report_path)},
         )
     except Exception as exc:
+        error_report_path = write_error_report(
+            'update',
+            exc,
+            {'job_id': job_id, 'provider': provider_name, 'stage': 'unexpected'},
+            error_id=job_id,
+        )
         _update_update_job(
             job_id,
             status='error',
             error=str(exc),
+            error_report_path=str(error_report_path),
             current_stock=None,
             finished_at=_job_timestamp(),
         )
-        _append_update_job_log(job_id, f'更新失败: {exc}')
+        _append_update_job_log(job_id, f'更新失败: {exc}；错误日志: {error_report_path}')
         _append_system_log(
             'update_job_error',
             f'更新失败: {exc}',
-            {'job_id': job_id, 'provider': provider_name},
+            {'job_id': job_id, 'provider': provider_name, 'error_report_path': str(error_report_path)},
         )
 
 
 def _warm_market_caches_background():
-    config = _load_config()
-    data_dir = str(_config_value(config, 'data_dir', default='data'))
+    data_dir = str(_active_data_dir())
     try:
         if market_cache_needs_refresh(data_dir=data_dir):
             rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
@@ -1328,7 +1395,8 @@ def index():
 def get_stocks():
     """获取股票列表"""
     try:
-        stocks = csv_manager.list_all_stocks()
+        manager = _active_csv_manager()
+        stocks = manager.list_all_stocks()
         stock_names = _load_stock_names()
         stocks = _filter_hidden_stock_codes(stocks, stock_names)
 
@@ -1359,7 +1427,12 @@ def get_stocks():
             'total_pages': (len(stocks) + per_page - 1) // per_page
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        error_report_path = write_error_report(
+            'selection',
+            e,
+            {'mode': 'sync_select', 'path': request.path},
+        )
+        return jsonify({'success': False, 'error': str(e), 'error_report_path': str(error_report_path)})
 
 
 @app.route('/api/stocks/search')
@@ -1368,14 +1441,18 @@ def search_stock_api():
     try:
         query = request.args.get('q', '')
         limit = _safe_int_arg('limit', 20, minimum=1, maximum=50)
-        config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         return jsonify({
             'success': True,
             'data': search_stocks(query, data_dir=data_dir, limit=limit),
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        error_report_path = write_error_report(
+            'selection',
+            e,
+            {'mode': 'sync_select', 'path': request.path},
+        )
+        return jsonify({'success': False, 'error': str(e), 'error_report_path': str(error_report_path)})
 
 
 @app.route('/api/stock/<code>')
@@ -1385,7 +1462,7 @@ def get_stock_detail(code):
         code = CSVManager.validate_stock_code(code)
         stock_names = _load_stock_names()
         stock_name = _stock_display_name(code, stock_names)
-        df = csv_manager.read_stock(code)
+        df = _active_csv_manager().read_stock_for_analysis(code)
         if df.empty:
             return jsonify({'success': False, 'error': '股票不存在'})
         
@@ -1696,14 +1773,24 @@ def analyze_wyckoff_stock():
             return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音'}), 400
 
         config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
         result = pipeline.analyze_stock(query)
         return jsonify(_attach_wyckoff_chart_url(result))
     except WyckoffPipelineError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+        error_report_path = write_error_report(
+            'wyckoff',
+            e,
+            {'query': query, 'path': request.path},
+        )
+        return jsonify({'success': False, 'error': str(e), 'error_report_path': str(error_report_path)}), 400
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        error_report_path = write_error_report(
+            'wyckoff',
+            e,
+            {'query': query, 'path': request.path},
+        )
+        return jsonify({'success': False, 'error': str(e), 'error_report_path': str(error_report_path)}), 500
 
 
 def _update_wyckoff_job(job_id, **updates):
@@ -1735,7 +1822,7 @@ def _run_wyckoff_job(job_id, query):
             )
 
         config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
         result = pipeline.analyze_stock(query, progress_callback=progress_callback)
         _attach_wyckoff_chart_url(result)
@@ -1748,20 +1835,34 @@ def _run_wyckoff_job(job_id, query):
             result=result,
         )
     except WyckoffPipelineError as e:
+        error_report_path = write_error_report(
+            'wyckoff',
+            e,
+            {'job_id': job_id, 'query': query, 'stage': 'pipeline'},
+            error_id=job_id,
+        )
         _update_wyckoff_job(
             job_id,
             status='error',
             current_step='失败',
-            message=str(e),
+            message=f"{e}；错误日志: {error_report_path}",
             error=str(e),
+            error_report_path=str(error_report_path),
         )
     except Exception as e:
+        error_report_path = write_error_report(
+            'wyckoff',
+            e,
+            {'job_id': job_id, 'query': query, 'stage': 'unexpected'},
+            error_id=job_id,
+        )
         _update_wyckoff_job(
             job_id,
             status='error',
             current_step='失败',
-            message=str(e),
+            message=f"{e}；错误日志: {error_report_path}",
             error=str(e),
+            error_report_path=str(error_report_path),
         )
 
 
@@ -1887,8 +1988,7 @@ def serve_wyckoff_file(filename):
 def get_dashboard_pulse():
     """获取首页市场强弱快照。"""
     try:
-        config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily', refresh=False)
         health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
@@ -1922,8 +2022,9 @@ def run_selection():
         requested_boards = _parse_requested_boards(request.args.get('boards'))
         requested_strategies = _parse_requested_strategies(request.args.get('strategies'))
 
+        manager = _active_csv_manager()
         stock_codes = [
-            code for code in csv_manager.list_all_stocks()
+            code for code in manager.list_all_stocks()
             if _classify_board(code) in requested_boards
         ]
         stock_names = _load_stock_names()
@@ -1937,7 +2038,7 @@ def run_selection():
                 continue
             candidates.append((code, name))
 
-        data_dir = str(csv_manager.data_dir)
+        data_dir = str(manager.data_dir)
         settings = _get_web_selection_settings()
         backend = _resolve_selection_backend(len(candidates), settings)
         candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
@@ -2087,7 +2188,7 @@ def get_selection_options():
     """获取选股页需要的板块和策略选项。"""
     try:
         stock_names = _load_stock_names()
-        stock_codes = _filter_hidden_stock_codes(csv_manager.list_all_stocks(), stock_names)
+        stock_codes = _filter_hidden_stock_codes(_active_csv_manager().list_all_stocks(), stock_names)
         board_counts = _build_board_counts(stock_codes)
         boards = [
             {
@@ -2136,13 +2237,14 @@ def get_stats():
     """获取系统统计信息"""
     try:
         stock_names = _load_stock_names()
-        stocks = _filter_hidden_stock_codes(csv_manager.list_all_stocks(), stock_names)
+        manager = _active_csv_manager()
+        stocks = _filter_hidden_stock_codes(manager.list_all_stocks(), stock_names)
         board_counts = _build_board_counts(stocks)
         
         # 计算数据日期范围
         dates = []
         for code in stocks[:50]:  # 采样
-            df = csv_manager.read_stock(code)
+            df = manager.read_stock_for_analysis(code)
             if not df.empty:
                 dates.append(df.iloc[0]['date'])
         
@@ -2166,8 +2268,7 @@ def get_stats():
 def get_index_kline():
     """获取首页指数日K线。"""
     try:
-        config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         symbol = _normalize_csv_value(request.args.get('symbol')) or 'sh000001'
         if symbol not in INDEX_KLINE_TARGETS:
             symbol = 'sh000001'
@@ -2191,8 +2292,7 @@ def get_index_kline():
 def get_heatmap():
     """获取市场云图数据。"""
     try:
-        config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         force_refresh = str(request.args.get('refresh') or '').lower() in {'1', 'true', 'yes'}
         scope = _normalize_csv_value(request.args.get('scope')) or 'all'
         if scope not in {'all', 'main', 'chinext', 'star'}:
@@ -2240,8 +2340,7 @@ def get_heatmap():
 def get_heatmap_health():
     """快速检查市场云图缓存健康状态，不触发重建。"""
     try:
-        config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         return jsonify({'success': True, 'data': market_cache_health(data_dir=data_dir)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -2252,7 +2351,7 @@ def get_heatmap_meta():
     """获取市场云图元信息。"""
     try:
         config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         cache_bundle = load_market_caches(data_dir=data_dir)
         health = market_cache_health(data_dir=data_dir)
         snapshot_stocks = cache_bundle.get('snapshot', {}).get('stocks', []) or []
@@ -2326,8 +2425,10 @@ def get_update_options():
             os.getenv('TUSHARE_TOKEN')
             or get_config_value(config, 'data_source', 'tushare', 'token')
         )
+        data_root = str(_config_value(config, 'data_dir', default='data'))
+        active_state = load_active_provider(data_root)
         latest_date = ensure_market_caches(
-            data_dir=str(_config_value(config, 'data_dir', default='data'))
+            data_dir=str(_active_data_dir())
         ).get('snapshot', {}).get('latest_date')
 
         return jsonify({
@@ -2336,6 +2437,10 @@ def get_update_options():
                 'default_provider': str(default_provider or 'akshare').lower(),
                 'has_tushare_token': has_tushare_token,
                 'latest_date': latest_date,
+                'active_provider': active_state.get('active_provider'),
+                'active_provider_state': active_state,
+                'providers': list_provider_statuses(data_root),
+                'legacy_provider': legacy_summary(data_root),
             }
         })
     except Exception as e:
@@ -2367,7 +2472,7 @@ def start_update_job():
 
         payload = request.get_json(silent=True) or {}
         provider = _normalize_csv_value(payload.get('provider')) or 'akshare'
-        if provider not in {'akshare', 'tushare'}:
+        if provider not in {'akshare', 'tushare', 'tencent'}:
             return jsonify({'success': False, 'error': '不支持的数据源'}), 400
 
         tushare_token = str(payload.get('tushare_token') or '').strip()
@@ -2452,8 +2557,7 @@ def add_watchlist_item():
         if not query:
             return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音首字母'}), 400
 
-        config = _load_config()
-        data_dir = str(_config_value(config, 'data_dir', default='data'))
+        data_dir = str(_active_data_dir())
         match = resolve_stock_query(query, data_dir=data_dir)
         if not match:
             return jsonify({'success': False, 'error': f'未找到匹配股票: {query}'}), 404
@@ -2596,6 +2700,7 @@ def get_system_status():
         'success': True,
         'halted': _is_halted(),
         'shutdown_requested': shutdown_event.is_set(),
+        'active_provider': load_active_provider(str(_data_root_dir())),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     })
 

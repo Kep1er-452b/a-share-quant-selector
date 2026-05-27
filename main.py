@@ -33,6 +33,7 @@ from strategy.strategy_registry import get_registry
 from utils.kline_chart import generate_kline_chart
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.progress import ProgressTracker
+from utils.provider_router import activate_provider, active_data_dir, warehouse_summary
 from utils.selection_worker import build_worker_context, process_selection_chunk, initialize_selection_worker
 from utils.strategy_labels import CATEGORY_DISPLAY_ORDER, category_label, is_invalid_stock_name
 from utils.local_config import load_config_file
@@ -41,19 +42,20 @@ from utils.local_config import load_config_file
 def prompt_for_provider(default_provider="akshare"):
     """交互式选择数据源"""
     default_provider = (default_provider or "akshare").strip().lower()
-    default_choice = "1" if default_provider == "akshare" else "2"
+    choices = {"1": "akshare", "2": "tushare", "3": "tencent"}
+    reverse_choices = {value: key for key, value in choices.items()}
+    default_choice = reverse_choices.get(default_provider, "1")
 
     print("\n请选择数据源：")
     print("  1. akshare")
     print("  2. tushare")
+    print("  3. tencent")
 
     while True:
-        choice = input(f"输入 1 或 2 (默认: {default_choice}): ").strip() or default_choice
-        if choice == "1":
-            return "akshare"
-        if choice == "2":
-            return "tushare"
-        print("请输入 1 或 2。")
+        choice = input(f"输入 1 / 2 / 3 (默认: {default_choice}): ").strip() or default_choice
+        if choice in choices:
+            return choices[choice]
+        print("请输入 1、2 或 3。")
 
 
 def prompt_yes_no(message, default=True):
@@ -151,7 +153,7 @@ class QuantSystem:
     def __init__(self, config_file="config/config.yaml", provider_name="akshare", provider_token=None):
         self.config = load_config_file(config_file)
         self.data_dir = self.config.get('data_dir', 'data')
-        self.csv_manager = CSVManager(self.data_dir)
+        self.csv_manager = CSVManager(active_data_dir(self.data_dir))
         self.provider_name = provider_name
         self.fetcher = create_data_provider(
             provider_name=provider_name,
@@ -162,6 +164,15 @@ class QuantSystem:
         self.notifier = self._init_notifier()
         self.registry = get_registry("config/strategy_params.yaml")
         self._strategies_loaded = False
+
+    def _refresh_active_csv_manager(self):
+        self.csv_manager = CSVManager(active_data_dir(self.data_dir))
+
+    def _activate_fetcher_provider(self):
+        summary = warehouse_summary(self.data_dir, self.provider_name)
+        if summary.get("stock_count", 0) > 0 and (summary.get("coverage_ratio") or 0) >= 0.98:
+            activate_provider(self.data_dir, self.provider_name, summary)
+        self._refresh_active_csv_manager()
     
     def _init_notifier(self):
         """初始化通知器"""
@@ -224,11 +235,12 @@ class QuantSystem:
             max_stocks=max_stocks,
             purpose=purpose,
         )
+        self._activate_fetcher_provider()
         return target_universe
     
     def _load_stock_names(self, stock_data):
         """加载股票名称（优先从CSV文件）"""
-        names_file = Path(self.data_dir) / 'stock_names.json'
+        names_file = Path(self.csv_manager.data_dir) / 'stock_names.json'
 
         # 优先使用本地缓存，避免每次选股都额外请求远端接口
         if names_file.exists():
@@ -337,7 +349,7 @@ class QuantSystem:
 
     def _analyze_single_stock(self, code, name, selected_strategies, category='all', return_data=False):
         """单只股票的多策略分析入口。"""
-        df = self.csv_manager.read_stock(code)
+        df = self.csv_manager.read_stock_for_analysis(code)
         if df.empty or len(df) < 60:
             return {
                 'code': code,
@@ -513,7 +525,7 @@ class QuantSystem:
             with ProcessPoolExecutor(
                 max_workers=effective_workers,
                 initializer=initialize_selection_worker,
-                initargs=(self.data_dir, selected_strategy_names, str(self.registry.params_file)),
+                initargs=(str(self.csv_manager.data_dir), selected_strategy_names, str(self.registry.params_file)),
             ) as executor:
                 futures = [
                     executor.submit(
@@ -528,7 +540,7 @@ class QuantSystem:
                     consume_chunk(future.result())
         elif execution_backend == 'thread':
             worker_context = build_worker_context(
-                self.data_dir,
+                str(self.csv_manager.data_dir),
                 selected_strategy_names,
                 str(self.registry.params_file),
             )
@@ -547,7 +559,7 @@ class QuantSystem:
                     consume_chunk(future.result())
         else:
             worker_context = build_worker_context(
-                self.data_dir,
+                str(self.csv_manager.data_dir),
                 selected_strategy_names,
                 str(self.registry.params_file),
             )
@@ -876,6 +888,7 @@ class QuantSystem:
             message = "检测到本地数据不是最新，是否先抓取/补齐目标股票池再筛选？"
             if is_interactive and prompt_yes_no(message, default=True):
                 self.fetcher.sync_target_data(target_universe, board=board, max_stocks=max_stocks, purpose='run')
+                self._activate_fetcher_provider()
             else:
                 print("⚠️ 本地数据不是最新，已停止筛选。可使用 `select --force-select` 强制按现有数据筛选。")
                 return {}
@@ -971,7 +984,7 @@ def prompt_export_stale_choice(result):
     print("⚠️ 检测到本地 CSV 不是最新。")
     print(f"   {result.get('message')}")
     print("\n请选择：")
-    print("  1. 先用 Tushare 单独更新这只股票，再导出")
+    print("  1. 先用当前 active provider 单独更新这只股票，再导出")
     print("  2. 直接导出当前本地 CSV，不管是否最新")
     while True:
         choice = input("输入 1 或 2 (默认: 1): ").strip() or "1"
@@ -1056,7 +1069,7 @@ B1完美图形匹配:
 
     parser.add_argument(
         '--provider',
-        choices=['akshare', 'tushare'],
+        choices=['akshare', 'tushare', 'tencent'],
         default=None,
         help='指定数据源，不指定时交互式终端会先询问'
     )
@@ -1163,7 +1176,7 @@ B1完美图形匹配:
 
     parser.add_argument(
         '--provider-smoke',
-        choices=['akshare', 'tushare'],
+        choices=['akshare', 'tushare', 'tencent'],
         default=None,
         help='doctor 命令执行小批联网数据源验证'
     )

@@ -74,7 +74,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     for code, name in candidates:
         last_processed_code = code
         last_processed_name = name
-        df = csv_manager.read_stock(code)
+        df = csv_manager.read_stock_for_analysis(code)
         if df.empty or len(df) < 60:
             skipped_count += 1
             continue
