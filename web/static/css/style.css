@@ -1929,6 +1929,32 @@ body.heatmap-focus-active #heatmap-chart {
     display: block;
 }
 
+.stock-period-toolbar {
+    display: flex;
+    gap: 1px;
+    width: max-content;
+    margin: 8px 0;
+    border: 1px solid var(--grid-line);
+    background: var(--grid-line);
+}
+
+.stock-period-btn {
+    min-width: 44px;
+    min-height: 26px;
+    padding: 0 10px;
+    border: 0;
+    background: var(--bg-raised);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.stock-period-btn:hover,
+.stock-period-btn.active {
+    background: var(--accent);
+    color: var(--bg-void);
+}
+
 .stock-export-status.success {
     border-color: var(--up);
     color: var(--up);

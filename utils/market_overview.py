@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -14,7 +15,8 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
-from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, normalize_market_cap_yuan
+from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, get_config_value, normalize_market_cap_yuan
+from utils.local_config import load_config_file
 from utils.price_adjustment import repair_adjustment_gaps
 
 
@@ -40,8 +42,12 @@ CNINFO_STANDARD_PRIORITY = [
 
 INDUSTRY_FETCH_MAX_WORKERS = 12
 INDUSTRY_CACHE_REUSE_MIN_RATIO = 0.95
+INDUSTRY_READY_MAX_UNMAPPED = 100
+INDUSTRY_READY_MAX_UNMAPPED_RATIO = 0.02
 INDUSTRY_FETCH_TIMEOUT_SECONDS = 12
 INDUSTRY_FETCH_MAX_SECONDS = 120
+HEATMAP_SCOPES = ("all", "main", "chinext", "star")
+HEATMAP_METRICS = ("daily", "weekly", "monthly", "five_day")
 
 HIDDEN_MARKET_STOCK_CODES = {"300391"}
 HIDDEN_MARKET_STOCK_NAMES = {"长药退"}
@@ -173,6 +179,7 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
         "latest_date": latest_date.strftime("%Y-%m-%d"),
         "latest_price": round(latest_close, 2),
         "market_cap": round(market_cap or 0.0, 2),
+        "data_count": len(df),
         "metrics": metrics,
     }
 
@@ -189,6 +196,16 @@ def index_cache_path(data_dir: str = "data") -> Path:
     return Path(data_dir) / "index_snapshot.json"
 
 
+def heatmap_payload_cache_dir(data_dir: str = "data") -> Path:
+    return Path(data_dir) / "heatmap_payloads"
+
+
+def heatmap_payload_cache_path(data_dir: str = "data", scope: str = "all", metric: str = "daily") -> Path:
+    scope = scope if scope in HEATMAP_SCOPES else "all"
+    metric = metric if metric in HEATMAP_METRICS else "daily"
+    return heatmap_payload_cache_dir(data_dir) / f"{scope}-{metric}.json"
+
+
 def load_snapshot_cache(data_dir: str = "data") -> dict:
     return _load_json(snapshot_cache_path(data_dir), {})
 
@@ -197,8 +214,92 @@ def load_industry_cache(data_dir: str = "data") -> dict:
     return _load_json(industry_cache_path(data_dir), {})
 
 
+def _is_tushare_provider_dir(data_path: Path) -> bool:
+    parts = data_path.resolve().parts
+    return len(parts) >= 2 and parts[-2] == "providers" and parts[-1] == "tushare"
+
+
+def _load_tushare_token() -> str:
+    token = os.getenv("TUSHARE_TOKEN") or ""
+    if token.strip():
+        return token.strip()
+
+    value = get_config_value(load_config_file(), "data_source", "tushare", "token")
+    if value:
+        return str(value).strip()
+    return ""
+
+
+def _load_tushare_metadata_industries(data_path: Path, csv_codes: set[str]) -> tuple[Dict[str, str], Dict[str, str], str]:
+    meta_path = data_path / "tushare_stock_map.json"
+    mapping: Dict[str, str] = {}
+    source_map: Dict[str, str] = {}
+    metadata = _load_json(meta_path, {})
+
+    if isinstance(metadata, dict):
+        for code, item in metadata.items():
+            if code not in csv_codes or not isinstance(item, dict):
+                continue
+            industry = _safe_text(item.get("industry"))
+            if industry:
+                mapping[code] = industry
+                source_map[code] = "tushare_stock_map"
+
+    if mapping or not _is_tushare_provider_dir(data_path):
+        return mapping, source_map, ""
+
+    token = _load_tushare_token()
+    if not token:
+        return mapping, source_map, "missing_tushare_token"
+
+    try:
+        import tushare as ts
+
+        ts.set_token(token)
+        pro = ts.pro_api(token)
+        df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,area,industry,market,exchange,list_date",
+        )
+    except Exception as exc:
+        return mapping, source_map, str(exc)
+
+    if df is None or df.empty or "symbol" not in df.columns:
+        return mapping, source_map, "empty_stock_basic"
+
+    df = df.copy()
+    df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+    df = df[df["symbol"].isin(csv_codes)]
+    updated_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+
+    for _, row in df.iterrows():
+        code = str(row.get("symbol", "")).zfill(6)
+        industry = _safe_text(row.get("industry"))
+        if industry:
+            mapping[code] = industry
+            source_map[code] = "tushare_stock_basic"
+        updated_metadata[code] = {
+            "ts_code": _safe_text(row.get("ts_code")),
+            "name": _safe_text(row.get("name")),
+            "area": _safe_text(row.get("area")),
+            "industry": industry,
+            "exchange": _safe_text(row.get("exchange")),
+            "market": _safe_text(row.get("market")),
+            "list_date": _safe_text(row.get("list_date")),
+        }
+
+    if updated_metadata:
+        _write_json(meta_path, updated_metadata)
+    return mapping, source_map, ""
+
+
 def load_index_cache(data_dir: str = "data") -> dict:
     return _load_json(index_cache_path(data_dir), {})
+
+
+def load_heatmap_payload_cache(data_dir: str = "data", scope: str = "all", metric: str = "daily") -> dict:
+    return _load_json(heatmap_payload_cache_path(data_dir, scope, metric), {})
 
 
 def _stock_csv_files(data_dir: str = "data") -> List[Path]:
@@ -255,20 +356,36 @@ def build_snapshot_cache(data_dir: str = "data", progress_callback: Optional[Cal
     csv_files = _stock_csv_files(data_dir)
     records = []
     total_files = len(csv_files)
+    max_workers = min(max((os.cpu_count() or 4) * 2, 4), 32, max(total_files, 1))
+    processed = 0
 
-    for index, csv_path in enumerate(csv_files, start=1):
-        record = _read_stock_snapshot(csv_path, stock_names)
-        if record:
-            records.append(record)
-        if progress_callback and (index == 1 or index == total_files or index % 150 == 0):
-            progress_callback(
-                stage="snapshot",
-                current_step="构建本地云图快照",
-                processed_count=index,
-                total_count=total_files,
-                progress_pct=int((index / max(total_files, 1)) * 100),
-                current_stock={"code": csv_path.stem, "name": stock_names.get(csv_path.stem, "未知")},
-            )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        pending = {
+            executor.submit(_read_stock_snapshot, csv_path, stock_names): csv_path
+            for csv_path in csv_files
+        }
+        while pending:
+            done, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for future in done:
+                csv_path = pending.pop(future)
+                processed += 1
+                try:
+                    record = future.result()
+                except Exception:
+                    record = None
+                if record:
+                    records.append(record)
+                if progress_callback and (processed == 1 or processed == total_files or processed % 150 == 0):
+                    progress_callback(
+                        stage="snapshot",
+                        current_step="并行构建本地云图快照",
+                        processed_count=processed,
+                        total_count=total_files,
+                        progress_pct=int((processed / max(total_files, 1)) * 100),
+                        current_stock={"code": csv_path.stem, "name": stock_names.get(csv_path.stem, "未知")},
+                    )
 
     latest_date = max((item["latest_date"] for item in records), default=None)
     payload = {
@@ -365,8 +482,21 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         _write_json(industry_cache_path(data_dir), payload)
         return payload
 
-    mapping: Dict[str, str] = {}
-    source_map: Dict[str, str] = {}
+    mapping, source_map, provider_error = _load_tushare_metadata_industries(data_path, csv_codes)
+    provider_count = len(mapping)
+
+    for code, label in previous_mapping.items():
+        if code not in mapping:
+            mapping[code] = label
+            source_map[code] = "previous_cache"
+
+    if mapping:
+        _emit_industry_progress(
+            progress_callback,
+            "复用数据源行业映射",
+            len(mapping),
+            len(csv_codes),
+        )
 
     def fetch_eastmoney_industry(code: str) -> tuple[str, str, str]:
         try:
@@ -380,17 +510,19 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
             return code, "", "eastmoney"
         return code, _safe_text(rows.iloc[0].get("value")), "eastmoney"
 
-    code_list = sorted(csv_codes)
-    mapping, source_map, eastmoney_pending = _run_industry_fetch_pool(
+    code_list = sorted(csv_codes - set(mapping))
+    eastmoney_mapping, eastmoney_source_map, eastmoney_pending = _run_industry_fetch_pool(
         fetch_eastmoney_industry,
         code_list,
         INDUSTRY_FETCH_MAX_WORKERS,
     )
+    mapping.update(eastmoney_mapping)
+    source_map.update(eastmoney_source_map)
     _emit_industry_progress(
         progress_callback,
         "按交易软件口径刷新行业映射",
-        len(code_list) - eastmoney_pending,
-        len(code_list),
+        len(csv_codes) - eastmoney_pending,
+        len(csv_codes),
     )
 
     missing_codes = sorted(csv_codes - set(mapping))
@@ -450,7 +582,7 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         )
 
     missing_codes = sorted(csv_codes - set(mapping))
-    reused_count = 0
+    reused_count = sum(1 for source in source_map.values() if source == "previous_cache")
     for code in list(missing_codes):
         cached_label = _safe_text(previous_items.get(code))
         if cached_label:
@@ -460,14 +592,17 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
 
     payload = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "akshare:stock_individual_info_em + akshare:stock_industry_change_cninfo",
+        "source": "provider_metadata + akshare:stock_individual_info_em + akshare:stock_industry_change_cninfo",
         "mapped_count": len(mapping),
+        "provider_count": provider_count,
         "eastmoney_count": sum(1 for source in source_map.values() if source == "eastmoney"),
         "cninfo_count": sum(1 for source in source_map.values() if source == "cninfo"),
         "reused_count": reused_count,
         "unmapped_count": len(csv_codes - set(mapping)),
         "items": mapping,
     }
+    if provider_error:
+        payload["provider_error"] = provider_error
     _write_json(industry_cache_path(data_dir), payload)
     return payload
 
@@ -548,6 +683,17 @@ def rebuild_market_caches(
             raise
         result["errors"]["indices"] = str(exc)
 
+    try:
+        result["heatmap_payloads"] = build_heatmap_payload_cache(
+            data_dir=data_dir,
+            caches=result,
+            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        if not preserve_existing:
+            raise
+        result["errors"]["heatmap_payloads"] = str(exc)
+
     return result
 
 
@@ -591,10 +737,19 @@ def market_cache_needs_refresh(data_dir: str = "data") -> bool:
     industry = load_industry_cache(data_dir)
     if not industry:
         return True
+    local_status = _local_stock_data_status(data_dir)
+    local_count = int(local_status.get("stock_count") or 0)
+    unmapped_count = int(industry.get("unmapped_count") or 0)
+    allowed_unmapped = max(
+        INDUSTRY_READY_MAX_UNMAPPED,
+        int(local_count * INDUSTRY_READY_MAX_UNMAPPED_RATIO),
+    )
     return not (
         "unmapped_count" in industry
         and "mapped_count" in industry
         and bool(industry.get("source"))
+        and unmapped_count <= allowed_unmapped
+        and heatmap_payload_cache_ready(data_dir)
     )
 
 
@@ -638,8 +793,16 @@ def market_cache_health(data_dir: str = "data") -> dict:
         and "mapped_count" in industry
         and industry.get("source")
     )
+    unmapped_count = int(industry.get("unmapped_count") or 0)
+    allowed_unmapped = max(
+        INDUSTRY_READY_MAX_UNMAPPED,
+        int((local_count or snapshot_count or 0) * INDUSTRY_READY_MAX_UNMAPPED_RATIO),
+    )
+    if industry_ready and unmapped_count > allowed_unmapped:
+        industry_ready = False
     indices_ready = bool(indices and indices.get("items"))
-    refresh_pending = snapshot_stale or not industry_ready or not indices_ready
+    payloads_ready = heatmap_payload_cache_ready(data_dir)
+    refresh_pending = snapshot_stale or not industry_ready or not indices_ready or not payloads_ready
 
     return {
         "local_latest_date": local_latest,
@@ -649,11 +812,13 @@ def market_cache_health(data_dir: str = "data") -> dict:
         "snapshot_updated_at": snapshot.get("updated_at"),
         "industry_updated_at": industry.get("updated_at"),
         "industry_mapped_count": int(industry.get("mapped_count") or 0),
-        "industry_unmapped_count": int(industry.get("unmapped_count") or 0),
+        "industry_unmapped_count": unmapped_count,
+        "industry_allowed_unmapped_count": allowed_unmapped,
         "indices_updated_at": indices.get("updated_at"),
         "snapshot_stale": snapshot_stale,
         "industry_ready": industry_ready,
         "indices_ready": indices_ready,
+        "heatmap_payloads_ready": payloads_ready,
         "refresh_pending": refresh_pending,
         "market_cap_anomaly_count": count_market_cap_anomalies(data_dir),
     }
@@ -716,8 +881,22 @@ def _build_market_stats(stocks: List[dict], metric: str) -> dict:
     }
 
 
-def build_heatmap_payload(data_dir: str = "data", scope: str = "all", metric: str = "daily", refresh: bool = True) -> dict:
-    caches = ensure_market_caches(data_dir=data_dir) if refresh else load_market_caches(data_dir=data_dir)
+def _heatmap_payload_signature(snapshot: dict, industry_cache: dict, index_cache: dict) -> dict:
+    return {
+        "snapshot_updated_at": snapshot.get("updated_at"),
+        "snapshot_latest_date": snapshot.get("latest_date"),
+        "industry_updated_at": industry_cache.get("updated_at"),
+        "industry_mapped_count": industry_cache.get("mapped_count"),
+        "industry_unmapped_count": industry_cache.get("unmapped_count"),
+        "index_updated_at": index_cache.get("updated_at"),
+    }
+
+
+def _heatmap_payload_cache_is_current(payload: dict, snapshot: dict, industry_cache: dict, index_cache: dict) -> bool:
+    return bool(payload and payload.get("signature") == _heatmap_payload_signature(snapshot, industry_cache, index_cache))
+
+
+def _build_heatmap_payload_from_caches(caches: dict, scope: str = "all", metric: str = "daily") -> dict:
     snapshot = caches.get("snapshot") or {}
     industry_cache = caches.get("industry") or {}
     index_cache = caches.get("indices") or {}
@@ -749,3 +928,75 @@ def build_heatmap_payload(data_dir: str = "data", scope: str = "all", metric: st
             "errors": caches.get("errors", {}),
         },
     }
+
+
+def build_heatmap_payload_cache(
+    data_dir: str = "data",
+    scopes: tuple[str, ...] = HEATMAP_SCOPES,
+    metrics: tuple[str, ...] = HEATMAP_METRICS,
+    caches: Optional[dict] = None,
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    caches = caches or load_market_caches(data_dir=data_dir)
+    snapshot = caches.get("snapshot") or {}
+    industry_cache = caches.get("industry") or {}
+    index_cache = caches.get("indices") or {}
+    signature = _heatmap_payload_signature(snapshot, industry_cache, index_cache)
+    total = max(len(scopes) * len(metrics), 1)
+    processed = 0
+    paths = {}
+
+    for scope in scopes:
+        for metric in metrics:
+            processed += 1
+            payload = _build_heatmap_payload_from_caches(caches, scope=scope, metric=metric)
+            wrapper = {
+                "success": True,
+                "data": payload,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "scope": scope,
+                "metric": metric,
+                "signature": signature,
+            }
+            path = heatmap_payload_cache_path(data_dir, scope, metric)
+            _write_json(path, wrapper)
+            paths[f"{scope}:{metric}"] = str(path)
+            if progress_callback:
+                progress_callback(
+                    stage="heatmap_payload",
+                    current_step="预生成云图视图缓存",
+                    processed_count=processed,
+                    total_count=total,
+                    progress_pct=int((processed / total) * 100),
+                    current_stock={"code": scope, "name": metric},
+                )
+
+    return {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "count": len(paths),
+        "paths": paths,
+        "signature": signature,
+    }
+
+
+def heatmap_payload_cache_ready(data_dir: str = "data") -> bool:
+    caches = load_market_caches(data_dir=data_dir)
+    snapshot = caches.get("snapshot") or {}
+    industry_cache = caches.get("industry") or {}
+    index_cache = caches.get("indices") or {}
+    payload = load_heatmap_payload_cache(data_dir, "all", "daily")
+    return _heatmap_payload_cache_is_current(payload, snapshot, industry_cache, index_cache)
+
+
+def build_heatmap_payload(data_dir: str = "data", scope: str = "all", metric: str = "daily", refresh: bool = True) -> dict:
+    caches = ensure_market_caches(data_dir=data_dir) if refresh else load_market_caches(data_dir=data_dir)
+    if not refresh:
+        cached = load_heatmap_payload_cache(data_dir, scope, metric)
+        if _heatmap_payload_cache_is_current(
+            cached,
+            caches.get("snapshot") or {},
+            caches.get("industry") or {},
+            caches.get("indices") or {},
+        ):
+            return cached.get("data") or cached.get("payload") or {}
+    return _build_heatmap_payload_from_caches(caches, scope=scope, metric=metric)

@@ -1,7 +1,7 @@
 """
 Web 服务器 - A股量化选股系统前端
 """
-from flask import Flask, render_template, jsonify, request, send_from_directory, has_request_context
+from flask import Flask, Response, render_template, jsonify, request, send_from_directory, has_request_context
 import json
 import sys
 import socket
@@ -32,6 +32,7 @@ from utils.config_schema import atomic_write_yaml, validate_strategy_params
 from utils.local_config import load_config_file
 from utils.market_overview import (
     build_heatmap_payload,
+    heatmap_payload_cache_path,
     rebuild_market_caches,
     ensure_market_caches,
     load_market_caches,
@@ -142,6 +143,17 @@ def _load_index_kline_cache(data_dir='data'):
             return json.load(file) or {}
     except Exception:
         return {}
+
+
+def _load_json_file(path, default=None):
+    target = Path(path)
+    if not target.exists():
+        return {} if default is None else default
+    try:
+        with open(target, 'r', encoding='utf-8') as file:
+            return json.load(file) or ({} if default is None else default)
+    except Exception:
+        return {} if default is None else default
 
 
 def _save_index_kline_cache(cache, data_dir='data'):
@@ -721,6 +733,48 @@ def _stock_table_row(code, stock_names=None):
     }
 
 
+def _stock_table_row_from_snapshot(stock, stock_names=None, row_counts=None):
+    stock_names = stock_names or {}
+    row_counts = row_counts or {}
+    code = str(stock.get('code') or '').zfill(6)
+    return {
+        'code': code,
+        'name': stock.get('name') or _stock_display_name(code, stock_names),
+        'board': stock.get('board') or _classify_board(code),
+        'latest_price': stock.get('latest_price'),
+        'latest_date': stock.get('latest_date'),
+        'market_cap': round(float(stock.get('market_cap') or 0) / 1e8, 2),
+        'data_count': stock.get('data_count') or row_counts.get(code) or '--',
+    }
+
+
+def _load_stock_row_counts(data_dir):
+    state_path = Path(data_dir) / 'fetch_state.json'
+    payload = _load_json_file(state_path, {}) or {}
+    profiles = payload.get('profiles') or {}
+    if not profiles:
+        return {}
+
+    preferred = None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        if profile.get('updated_at') and (
+            preferred is None
+            or str(profile.get('updated_at')) > str(preferred.get('updated_at'))
+        ):
+            preferred = profile
+    if preferred is None:
+        preferred = next((item for item in profiles.values() if isinstance(item, dict)), {})
+
+    local_status = preferred.get('local_status') or preferred.get('code_status') or {}
+    return {
+        str(code).zfill(6): int(info.get('row_count') or 0)
+        for code, info in local_status.items()
+        if isinstance(info, dict)
+    }
+
+
 def _export_service():
     config = _load_config()
     return StockExportService(
@@ -1166,6 +1220,8 @@ def _refresh_market_caches_for_job(job_id, data_dir):
         elif stage == 'industry':
             _emit_update_progress(job_id, payload, phase_offset=94, phase_weight=5)
             _append_update_job_log(job_id, payload.get('current_step') or '刷新行业映射')
+        elif stage == 'heatmap_payload':
+            _emit_update_progress(job_id, payload, phase_offset=99, phase_weight=1)
 
     cache_result = rebuild_market_caches(
         data_dir=data_dir,
@@ -1395,19 +1451,43 @@ def index():
 def get_stocks():
     """获取股票列表"""
     try:
-        manager = _active_csv_manager()
-        stocks = manager.list_all_stocks()
+        data_dir = str(_active_data_dir())
         stock_names = _load_stock_names()
-        stocks = _filter_hidden_stock_codes(stocks, stock_names)
-
         requested_board = _normalize_csv_value(request.args.get('board'))
-        if requested_board in {"main", "chinext", "star"}:
-            stocks = [code for code in stocks if _classify_board(code) == requested_board]
-        
+
         # 获取每只股票的基本信息 - 支持分页
         page = _safe_int_arg('page', 1, minimum=1, maximum=100000)
-        per_page = _safe_int_arg('per_page', 500, minimum=1, maximum=1000)  # 默认每页500只
-        
+        per_page = _safe_int_arg('per_page', 1000, minimum=1, maximum=10000)
+
+        snapshot_stocks = (load_market_caches(data_dir=data_dir).get('snapshot') or {}).get('stocks') or []
+        if snapshot_stocks:
+            row_counts = _load_stock_row_counts(data_dir)
+            rows = [
+                _stock_table_row_from_snapshot(stock, stock_names, row_counts)
+                for stock in snapshot_stocks
+                if not is_hidden_market_stock(stock.get('code'), stock.get('name'))
+            ]
+            if requested_board in {"main", "chinext", "star"}:
+                rows = [row for row in rows if row.get('board') == requested_board]
+
+            start_idx = (page - 1) * per_page
+            end_idx = start_idx + per_page
+            return jsonify({
+                'success': True,
+                'data': rows[start_idx:end_idx],
+                'total': len(rows),
+                'page': page,
+                'per_page': per_page,
+                'total_pages': (len(rows) + per_page - 1) // per_page,
+                'source': 'snapshot',
+            })
+
+        manager = _active_csv_manager()
+        stocks = manager.list_all_stocks()
+        stocks = _filter_hidden_stock_codes(stocks, stock_names)
+        if requested_board in {"main", "chinext", "star"}:
+            stocks = [code for code in stocks if _classify_board(code) == requested_board]
+
         start_idx = (page - 1) * per_page
         end_idx = start_idx + per_page
         paginated_stocks = stocks[start_idx:end_idx]
@@ -1424,7 +1504,8 @@ def get_stocks():
             'total': len(stocks),
             'page': page,
             'per_page': per_page,
-            'total_pages': (len(stocks) + per_page - 1) // per_page
+            'total_pages': (len(stocks) + per_page - 1) // per_page,
+            'source': 'csv',
         })
     except Exception as e:
         error_report_path = write_error_report(
@@ -1455,16 +1536,64 @@ def search_stock_api():
         return jsonify({'success': False, 'error': str(e), 'error_report_path': str(error_report_path)})
 
 
+STOCK_PERIODS = {
+    'daily': {'label': '日K', 'freq': None, 'limit': 160},
+    'weekly': {'label': '周K', 'freq': 'W-FRI', 'limit': 160},
+    'monthly': {'label': '月K', 'freq': 'ME', 'limit': 120},
+}
+
+
+def _resample_stock_period(df, period):
+    period = period if period in STOCK_PERIODS else 'daily'
+    if period == 'daily' or df.empty:
+        return df.copy(), period
+
+    ascending = df.copy()
+    ascending['date'] = pd.to_datetime(ascending['date'], errors='coerce')
+    ascending = ascending.dropna(subset=['date']).sort_values('date')
+    if ascending.empty:
+        return ascending, period
+
+    for column in ['open', 'high', 'low', 'close', 'volume', 'amount', 'turnover', 'market_cap']:
+        if column in ascending.columns:
+            ascending[column] = pd.to_numeric(ascending[column], errors='coerce')
+        else:
+            ascending[column] = 0
+
+    grouped = (
+        ascending
+        .groupby(pd.Grouper(key='date', freq=STOCK_PERIODS[period]['freq']))
+        .agg(
+            date=('date', 'max'),
+            open=('open', 'first'),
+            high=('high', 'max'),
+            low=('low', 'min'),
+            close=('close', 'last'),
+            volume=('volume', 'sum'),
+            amount=('amount', 'sum'),
+            turnover=('turnover', 'sum'),
+            market_cap=('market_cap', 'last'),
+        )
+        .dropna(subset=['date', 'open', 'high', 'low', 'close'])
+        .reset_index(drop=True)
+    )
+    return grouped.sort_values('date', ascending=False).reset_index(drop=True), period
+
+
 @app.route('/api/stock/<code>')
 def get_stock_detail(code):
     """获取单只股票详情"""
     try:
         code = CSVManager.validate_stock_code(code)
+        requested_period = _normalize_csv_value(request.args.get('period')) or 'daily'
         stock_names = _load_stock_names()
         stock_name = _stock_display_name(code, stock_names)
         df = _active_csv_manager().read_stock_for_analysis(code)
         if df.empty:
             return jsonify({'success': False, 'error': '股票不存在'})
+        df, period = _resample_stock_period(df, requested_period)
+        if df.empty:
+            return jsonify({'success': False, 'error': '股票周期数据为空'})
         
         # 计算KDJ指标与动态 Min J
         from utils.technical import KDJ, calculate_zhixing_main_overlay
@@ -1479,7 +1608,8 @@ def get_stock_detail(code):
         
         # 转换为列表格式
         data = []
-        for i, (_, row) in enumerate(df.head(100).iterrows()):  # 返回最近100条
+        limit = STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['limit']
+        for i, (_, row) in enumerate(df.head(limit).iterrows()):
             data.append({
                 'date': row['date'].strftime('%Y-%m-%d'),
                 'open': round(row['open'], 2),
@@ -1504,7 +1634,14 @@ def get_stock_detail(code):
                 'VIOLENT_K_Y': round(overlay_df.iloc[i]['VIOLENT_K_Y'], 2),
             })
         
-        return jsonify({'success': True, 'code': code, 'name': stock_name, 'data': data})
+        return jsonify({
+            'success': True,
+            'code': code,
+            'name': stock_name,
+            'period': period,
+            'period_label': STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['label'],
+            'data': data,
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -2302,6 +2439,22 @@ def get_heatmap():
         if metric not in {'daily', 'weekly', 'monthly', 'five_day'}:
             metric = 'daily'
 
+        payload_path = heatmap_payload_cache_path(data_dir, scope, metric)
+        cache_refs = [
+            Path(data_dir) / 'heatmap_snapshot.json',
+            Path(data_dir) / 'industry_map.json',
+            Path(data_dir) / 'index_snapshot.json',
+        ]
+        if (
+            not force_refresh
+            and payload_path.exists()
+            and payload_path.stat().st_mtime >= max(
+                (path.stat().st_mtime for path in cache_refs if path.exists()),
+                default=0,
+            )
+        ):
+            return Response(payload_path.read_text(encoding='utf-8'), mimetype='application/json')
+
         refresh_errors = {}
         if force_refresh:
             cache_result = rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
@@ -2326,6 +2479,9 @@ def get_heatmap():
                     'reason': 'refresh_pending',
                     'data': health,
                 })
+
+        if payload_path.exists() and not refresh_errors:
+            return Response(payload_path.read_text(encoding='utf-8'), mimetype='application/json')
 
         payload = build_heatmap_payload(data_dir=data_dir, scope=scope, metric=metric, refresh=False)
         if refresh_errors:
