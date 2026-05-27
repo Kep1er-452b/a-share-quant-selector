@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional
 import pandas as pd
 
 from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, normalize_market_cap_yuan
+from utils.price_adjustment import repair_adjustment_gaps
 
 
 INDEX_TARGETS = [
@@ -141,12 +142,14 @@ def _metric_base_close(df: pd.DataFrame, metric: str) -> Optional[float]:
 
 def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optional[dict]:
     try:
-        df = pd.read_csv(csv_path, usecols=["date", "close", "market_cap"])
+        df = pd.read_csv(csv_path)
     except Exception:
         return None
 
     if df.empty:
         return None
+    if {"date", "open", "high", "low", "close"}.issubset(df.columns):
+        df, _ = repair_adjustment_gaps(df)
 
     latest_date = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
     latest_close = _safe_float(df.iloc[0]["close"])

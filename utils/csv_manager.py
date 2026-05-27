@@ -7,6 +7,8 @@ import tempfile
 import pandas as pd
 from pathlib import Path
 
+from utils.price_adjustment import repair_adjustment_gaps
+
 
 class CSVManager:
     """CSV文件管理器"""
@@ -53,6 +55,15 @@ class CSVManager:
         except Exception as e:
             print(f"  读取 {stock_code} 数据失败: {e}")
             return pd.DataFrame()
+
+    def read_stock_for_analysis(self, stock_code):
+        """读取股票数据并返回技术分析用的复权修复视图。"""
+        df = self.read_stock(stock_code)
+        if df.empty:
+            return df
+        repaired, repairs = repair_adjustment_gaps(df)
+        repaired.attrs["adjustment_repairs"] = repairs
+        return repaired
 
     def _validate_stock_dataframe(self, df):
         """Validate and normalize stock OHLCV data before writing."""

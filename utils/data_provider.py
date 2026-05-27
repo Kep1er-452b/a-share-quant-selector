@@ -16,6 +16,11 @@ import pandas as pd
 
 from utils.csv_manager import CSVManager
 from utils.local_config import load_config_file
+from utils.price_adjustment import detect_adjustment_gaps
+from utils.provider_router import (
+    provider_data_dir,
+    write_provider_state,
+)
 from utils.progress import ProgressTracker
 
 
@@ -77,6 +82,7 @@ class BaseDataProvider:
     def __init__(self, data_dir: str = "data"):
         self.csv_manager = CSVManager(data_dir)
         self.full_data_dir = Path(data_dir)
+        self.storage_root_dir = Path(data_dir)
         self.stock_names_file = self.full_data_dir / "stock_names.json"
         self.fetch_state_file = self.full_data_dir / "fetch_state.json"
         self.trade_calendar_cache_file = self.full_data_dir / "trade_calendar_cache.json"
@@ -84,6 +90,14 @@ class BaseDataProvider:
         self._local_trade_calendar_cache = None
         self._sync_lock = Lock()
         self._sync_max_workers = min(max(os.cpu_count() or 4, 1), 24)
+        self.last_sync_summary = None
+
+    def configure_storage(self, root_dir: str | Path, provider_name: str | None = None):
+        """Attach the provider to the shared storage root used for active routing."""
+        self.storage_root_dir = Path(root_dir)
+        if provider_name:
+            self.provider_name = provider_name
+        return self
 
     def _load_local_trade_calendar(self) -> dict:
         """Load seed/user trade calendar caches for providers without a live calendar API."""
@@ -164,6 +178,7 @@ class BaseDataProvider:
         """抓取单只股票的增量数据（线程安全）。"""
         code = item["code"]
         name = item.get("name", "")
+        existing_df = self.csv_manager.read_stock(code)
         latest_local = status_map[code].get("latest_date")
         latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
         missing_trade_dates = self.get_missing_trade_dates(latest_local_date, latest_trade_date)
@@ -172,6 +187,19 @@ class BaseDataProvider:
         df = self._apply_market_cap_override(code, df, market_cap_map)
         if df is not None and not df.empty:
             self.csv_manager.update_stock(code, df)
+            merged_df = self.csv_manager.read_stock(code)
+            adjustment_gaps = detect_adjustment_gaps(merged_df, stock_code=code)
+            if adjustment_gaps:
+                if existing_df is not None and not existing_df.empty:
+                    self.csv_manager.write_stock(code, existing_df)
+                return {
+                    "code": code,
+                    "name": name,
+                    "ok": False,
+                    "fallback_full": True,
+                    "adjustment_gap": True,
+                    "gaps": adjustment_gaps[:5],
+                }
             refreshed = self._inspect_local_stock(code, latest_trade_date)
             refreshed["status"] = "incremental_updated"
             refreshed["reason"] = "incremental_ok"
@@ -182,9 +210,20 @@ class BaseDataProvider:
         """全量重抓单只股票（线程安全）。"""
         code = item["code"]
         name = item.get("name", "")
+        existing_df = self.csv_manager.read_stock(code)
         df = self.fetch_stock_history(code, years=6)
         df = self._apply_market_cap_override(code, df, market_cap_map)
         if df is not None and not df.empty:
+            adjustment_gaps = detect_adjustment_gaps(df, stock_code=code)
+            if adjustment_gaps:
+                return {
+                    "code": code,
+                    "name": name,
+                    "ok": False,
+                    "adjustment_warning": True,
+                    "preserved_existing": bool(existing_df is not None and not existing_df.empty),
+                    "gaps": adjustment_gaps[:5],
+                }
             self.csv_manager.write_stock(code, df)
             refreshed = self._inspect_local_stock(code, latest_trade_date)
             refreshed["status"] = "full_refreshed"
@@ -244,7 +283,10 @@ class BaseDataProvider:
                     if result["ok"]:
                         ok_list.append(result)
                     elif result.get("fallback_full"):
-                        fallback_list.append(futures[future])
+                        fallback_item = dict(futures[future])
+                        if result.get("adjustment_gap"):
+                            fallback_item["_adjustment_gap_result"] = result
+                        fallback_list.append(fallback_item)
                     self._emit_batch_progress(
                         item=futures[future],
                         result=result,
@@ -612,6 +654,51 @@ class BaseDataProvider:
         }
         self._save_fetch_state(state)
 
+    def _write_provider_state(
+        self,
+        board: str,
+        max_stocks,
+        target_universe: List[dict],
+        latest_trade_date,
+        status_map: Dict[str, dict],
+        final_summary: Dict[str, int],
+        success_count: int,
+        failed_count: int,
+        warning_count: int,
+    ) -> dict:
+        target_count = len(target_universe)
+        good_statuses = {"up_to_date", "incremental_updated", "full_refreshed"}
+        usable_count = sum(1 for info in status_map.values() if info.get("status") in good_statuses)
+        coverage_ratio = round(usable_count / max(target_count, 1), 6)
+        latest_date_text = pd.to_datetime(latest_trade_date).date().isoformat() if latest_trade_date else None
+        warnings = {
+            code: {
+                "reason": info.get("reason"),
+                "adjustment_gaps": info.get("adjustment_gaps", []),
+            }
+            for code, info in status_map.items()
+            if info.get("status") == "adjustment_warning"
+        }
+        payload = {
+            "provider": self.provider_name,
+            "status": "completed" if failed_count == 0 and warning_count == 0 else "partial",
+            "board": board,
+            "board_label": BOARD_LABELS.get(board, board),
+            "max_stocks": max_stocks,
+            "latest_trade_date": latest_date_text,
+            "target_count": target_count,
+            "stock_count": self.csv_manager.get_stock_count(),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "warning_count": warning_count,
+            "coverage_ratio": coverage_ratio,
+            "is_complete": failed_count == 0 and warning_count == 0,
+            "status_summary": final_summary,
+            "warnings": warnings,
+        }
+        write_provider_state(self.storage_root_dir, self.provider_name, payload)
+        return payload
+
     def assess_target_data(self, target_universe: List[dict]) -> dict:
         """
         非破坏性检查目标股票池本地数据状态。
@@ -711,6 +798,20 @@ class BaseDataProvider:
         if not incremental and not full_refresh:
             print("✓ 目标股票池已完整且为最新，无需继续抓取")
             self._write_profile_state(board, max_stocks, target_universe, latest_trade_date, status_map)
+            final_summary = {}
+            for info in status_map.values():
+                final_summary[info["status"]] = final_summary.get(info["status"], 0) + 1
+            self.last_sync_summary = self._write_provider_state(
+                board,
+                max_stocks,
+                target_universe,
+                latest_trade_date,
+                status_map,
+                final_summary,
+                0,
+                0,
+                0,
+            )
             emit_progress(
                 stage="completed",
                 current_step="本地数据已是最新",
@@ -719,7 +820,7 @@ class BaseDataProvider:
                 progress_pct=100,
                 current_stock=None,
             )
-            return
+            return self.last_sync_summary
 
         market_cap_targets = [item["code"] for item in incremental + full_refresh]
         market_cap_map = self.get_market_caps(market_cap_targets) if market_cap_targets else {}
@@ -776,7 +877,21 @@ class BaseDataProvider:
                     if item["code"] not in {i["code"] for i in full_refresh}:
                         full_refresh.append(item)
                     status_map[item["code"]]["status"] = "full_refresh"
-                    status_map[item["code"]]["reason"] = "incremental_failed"
+                    gap_result = item.get("_adjustment_gap_result")
+                    if gap_result:
+                        status_map[item["code"]]["reason"] = "adjustment_gap_full_refresh"
+                        status_map[item["code"]]["adjustment_gaps"] = gap_result.get("gaps", [])
+                        emit_progress(
+                            stage="data_quality",
+                            current_step="检测到复权断层，转为全量重抓",
+                            processed_count=progress_state.get("processed", 0),
+                            total_count=progress_state.get("total", 0),
+                            progress_pct=int((progress_state.get("processed", 0) / max(progress_state.get("total", 1), 1)) * 100),
+                            current_stock={"code": item.get("code"), "name": item.get("name", "")},
+                            adjustment_gaps=gap_result.get("gaps", []),
+                        )
+                    else:
+                        status_map[item["code"]]["reason"] = "incremental_failed"
 
         # ---- 全量重抓（并行） ----
         refresh_queue = []
@@ -802,10 +917,25 @@ class BaseDataProvider:
                 status_map[r["code"]] = r["refreshed"]
             for r in failed_results:
                 status_map[r["code"]]["status"] = "failed"
-                status_map[r["code"]]["reason"] = "fetch_failed"
+                if r.get("adjustment_warning"):
+                    status_map[r["code"]]["status"] = "adjustment_warning"
+                    status_map[r["code"]]["reason"] = "full_refresh_adjustment_gap"
+                    status_map[r["code"]]["adjustment_gaps"] = r.get("gaps", [])
+                    emit_progress(
+                        stage="data_quality",
+                        current_step="全量重抓后仍检测到复权断层",
+                        processed_count=progress_state.get("processed", 0),
+                        total_count=progress_state.get("total", 0),
+                        progress_pct=int((progress_state.get("processed", 0) / max(progress_state.get("total", 1), 1)) * 100),
+                        current_stock={"code": r.get("code"), "name": r.get("name", "")},
+                        adjustment_gaps=r.get("gaps", []),
+                    )
+                else:
+                    status_map[r["code"]]["reason"] = "fetch_failed"
 
         success_count = sum(1 for info in status_map.values() if info["status"] in {"incremental_updated", "full_refreshed"})
         failed_count = sum(1 for info in status_map.values() if info["status"] == "failed")
+        warning_count = sum(1 for info in status_map.values() if info["status"] == "adjustment_warning")
         processed = len(incremental) + len(refresh_queue)
         total_work = len(incremental) + len(refresh_queue)
 
@@ -829,10 +959,23 @@ class BaseDataProvider:
             current_stock=None,
             success_count=success_count,
             failed_count=failed_count,
+            warning_count=warning_count,
             summary=final_summary,
         )
 
         self._write_profile_state(board, max_stocks, target_universe, latest_trade_date, status_map)
+        self.last_sync_summary = self._write_provider_state(
+            board,
+            max_stocks,
+            target_universe,
+            latest_trade_date,
+            status_map,
+            final_summary,
+            success_count,
+            failed_count,
+            warning_count,
+        )
+        return self.last_sync_summary
 
     def init_full_data(self, max_stocks=None, skip_failed: bool = True):
         """
@@ -862,11 +1005,20 @@ def get_config_value(config: Optional[dict], *keys, default=None):
 def create_data_provider(provider_name: str, data_dir: str = "data", config: Optional[dict] = None, token: Optional[str] = None):
     """根据名称创建数据源实例"""
     normalized = (provider_name or "akshare").strip().lower()
+    if normalized not in {"akshare", "tushare", "tencent"}:
+        raise DataProviderError(f"不支持的数据源: {provider_name}")
+    storage_root = Path(data_dir)
+    storage_dir = provider_data_dir(storage_root, normalized)
 
     if normalized == "akshare":
         from utils.akshare_fetcher import AKShareFetcher
 
-        return AKShareFetcher(data_dir=data_dir, config=config)
+        return AKShareFetcher(data_dir=str(storage_dir), config=config).configure_storage(storage_root, normalized)
+
+    if normalized == "tencent":
+        from utils.tencent_fetcher import TencentFetcher
+
+        return TencentFetcher(data_dir=str(storage_dir), config=config).configure_storage(storage_root, normalized)
 
     if normalized == "tushare":
         from utils.tushare_fetcher import TushareFetcher
@@ -879,6 +1031,6 @@ def create_data_provider(provider_name: str, data_dir: str = "data", config: Opt
         if not resolved_token:
             local_config = load_config_file()
             resolved_token = get_config_value(local_config, "data_source", "tushare", "token")
-        return TushareFetcher(data_dir=data_dir, token=resolved_token)
+        return TushareFetcher(data_dir=str(storage_dir), token=resolved_token).configure_storage(storage_root, normalized)
 
     raise DataProviderError(f"不支持的数据源: {provider_name}")

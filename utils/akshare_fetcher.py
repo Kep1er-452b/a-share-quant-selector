@@ -589,35 +589,30 @@ class AKShareFetcher(BaseDataProvider):
         
         return df
     
+    def _normalize_akshare_history(self, stock_code, df, source):
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns={
+            '日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low',
+            '收盘': 'close', '成交量': 'volume', '成交额': 'amount', '换手率': 'turnover'
+        })
+        required = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turnover']
+        missing = [column for column in required if column not in df.columns]
+        if missing:
+            print(f"  akshare 行情缺少字段: {missing}")
+            return None
+        df = df[required]
+        market_cap = self._get_realtime_market_cap(stock_code)
+        df['market_cap'] = market_cap if market_cap else 0
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date', ascending=False)
+        return self._mark_data_source(df, source)
+
     def fetch_stock_history(self, stock_code, years=6):
         """
         抓取单只股票历史数据
         前复权，按日期倒序排列
         """
-        partial_http_df = None
-
-        # 方法1: 直接HTTP请求
-        try:
-            df = self._fetch_stock_history_http(stock_code, years)
-            if df is not None and not df.empty:
-                coverage = self._history_coverage_report(df, years=years)
-                if coverage['strict_ok']:
-                    print(f"✓ (HTTP获取 {len(df)}条)")
-                    return df
-                if coverage['ok']:
-                    partial_http_df = df
-                    print(
-                        f"  HTTP覆盖不足({coverage['rows']}条/{coverage['span_days']}天)，"
-                        "继续尝试akshare..."
-                    )
-                else:
-                    print(f"  HTTP历史数据不足，尝试akshare...")
-            else:
-                print(f"  HTTP返回空数据，尝试akshare...")
-        except Exception as e:
-            print(f"  HTTP异常: {e}，尝试akshare...")
-        
-        # 方法2: akshare
         try:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=365 * years)
@@ -633,27 +628,13 @@ class AKShareFetcher(BaseDataProvider):
             )
             
             if df is not None and not df.empty:
-                df = df.rename(columns={
-                    '日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low',
-                    '收盘': 'close', '成交量': 'volume', '成交额': 'amount', '换手率': 'turnover'
-                })
-                df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turnover']]
-                # 从实时数据获取总市值
-                market_cap = self._get_realtime_market_cap(stock_code)
-                df['market_cap'] = market_cap if market_cap else 0
-                df['date'] = pd.to_datetime(df['date'])
-                df = df.sort_values('date', ascending=False)
-                df = self._mark_data_source(df, 'akshare:stock_zh_a_hist')
+                df = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist')
                 coverage = self._history_coverage_report(df, years=years)
                 if coverage['ok']:
                     return df
                 print(f"  akshare历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
         except Exception as e:
             print(f"  akshare获取失败: {e}")
-
-        if partial_http_df is not None:
-            print("  使用真实但覆盖不足的腾讯历史数据")
-            return partial_http_df
 
         if self.allow_mock_data:
             print("  ⚠️ 已显式启用模拟数据，将生成 demo 行情")
@@ -662,10 +643,9 @@ class AKShareFetcher(BaseDataProvider):
         print("  ✗ 真实历史数据不可用，已拒绝写入模拟行情")
         return None
     
-    def fetch_stock_update(self, stock_code, days=10):
+    def _fetch_stock_update_http(self, stock_code, days=10):
         """
-        抓取近期数据用于增量更新
-        market_cap 由调用方通过 _apply_market_cap_override 批量注入，此处不再逐股请求。
+        使用腾讯 HTTP 抓取近期数据。TencentFetcher 会显式调用该路径。
         """
         try:
             import requests
@@ -731,6 +711,26 @@ class AKShareFetcher(BaseDataProvider):
             return None
         except Exception as e:
             print(f"  获取更新数据失败: {e}")
+            return None
+
+    def fetch_stock_update(self, stock_code, days=10):
+        """
+        抓取近期数据用于增量更新。
+        market_cap 由调用方通过 _apply_market_cap_override 批量注入，此处不再逐股请求。
+        """
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=max(days * 4 + 10, 20))
+            df = ak.stock_zh_a_hist(
+                symbol=stock_code,
+                period="daily",
+                start_date=start_date.strftime("%Y%m%d"),
+                end_date=end_date.strftime("%Y%m%d"),
+                adjust="qfq"
+            )
+            return self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist:update')
+        except Exception as e:
+            print(f"  akshare获取更新数据失败: {e}")
             return None
     
     def init_full_data(self, max_stocks=None, skip_failed=True):

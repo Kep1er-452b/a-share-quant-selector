@@ -766,6 +766,7 @@ select {
 .nav-item:hover,
 .quote-action:hover,
 .update-provider-btn:hover,
+.update-provider-btn.active,
 .modal-close:hover,
 .text-action:hover {
     background: var(--accent);
@@ -1144,7 +1145,17 @@ select {
 }
 
 .update-provider-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.update-legacy-note {
+    margin-bottom: 8px;
+    padding: 8px;
+    border: 1px solid var(--grid-line);
+    background: var(--bg-raised);
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.4;
 }
 
 .board-option,
@@ -1168,6 +1179,26 @@ select {
     padding: 8px;
     background: var(--bg-raised);
     border: 1px solid transparent;
+}
+
+.provider-name {
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.provider-meta {
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.35;
+    text-transform: none;
+}
+
+.update-provider-btn:hover .provider-name,
+.update-provider-btn:hover .provider-meta,
+.update-provider-btn.active .provider-name,
+.update-provider-btn.active .provider-meta {
+    color: var(--bg-void);
 }
 
 .board-option-name,
