@@ -51,24 +51,21 @@ def HHV(series, n):
 
 def SMA(X, n, m):
     """
-    移动平均 - 通达信风格（向量化版本）
+    移动平均 - 通达信风格
     SMA(X,N,M): X的N日移动平均, M为权重
     公式: Y = (X*M + Y'*(N-M)) / N
     """
     if len(X) == 0:
         return pd.Series(index=X.index, dtype=float)
 
-    # 转换为 numpy 数组进行计算，比 pandas .iloc 快 50x+
-    arr = X.iloc[::-1].reset_index(drop=True).values.astype(float)
-    length = len(arr)
-    result = np.empty(length)
-    result[0] = arr[0]
-    
-    # numpy 数组访问比 pandas .iloc 快得多
-    for i in range(1, length):
-        result[i] = (arr[i] * m + result[i - 1] * (n - m)) / n
+    # 统一在正序数据上计算，避免倒序数据时权重方向错误
+    reversed_series = X.iloc[::-1].reset_index(drop=True)
+    result_reversed = pd.Series(index=reversed_series.index, dtype=float)
+    result_reversed.iloc[0] = reversed_series.iloc[0]
+    for i in range(1, len(reversed_series)):
+        result_reversed.iloc[i] = (reversed_series.iloc[i] * m + result_reversed.iloc[i - 1] * (n - m)) / n
 
-    return pd.Series(result[::-1], index=X.index)
+    return result_reversed.iloc[::-1].reset_index(drop=True).set_axis(X.index)
 
 
 def REF(series, n):
@@ -123,7 +120,7 @@ def FINANCE(df, field_code):
 
 def KDJ(df, n=9, m1=3, m2=3):
     """
-    KDJ指标计算 - 标准实现（向量化版本）
+    KDJ指标计算 - 标准实现
     通达信公式：
     RSV = (CLOSE - LLV(LOW,N)) / (HHV(HIGH,N) - LLV(LOW,N)) * 100
     K = SMA(RSV,M1,1)
@@ -141,32 +138,33 @@ def KDJ(df, n=9, m1=3, m2=3):
     else:
         df_calc = df.copy().reset_index(drop=True)
 
-    length = len(df_calc)
-    
-    # 转换为 numpy 数组进行向量化计算
-    close_arr = df_calc['close'].values.astype(float)
-    low_arr = df_calc['low'].values.astype(float)
-    high_arr = df_calc['high'].values.astype(float)
-    
-    # 计算RSV - 向量化
-    low_min = pd.Series(low_arr).rolling(window=n, min_periods=1).min().values
-    high_max = pd.Series(high_arr).rolling(window=n, min_periods=1).max().values
+    # 计算RSV
+    low_min = df_calc['low'].rolling(window=n, min_periods=1).min()
+    high_max = df_calc['high'].rolling(window=n, min_periods=1).max()
+
     range_val = high_max - low_min
-    
+    rsv = pd.Series(index=df_calc.index, dtype=float)
+
     # RSV计算，前n-1个周期不足时用50填充
-    rsv = np.full(length, 50.0)
-    valid_mask = (np.arange(length) >= n - 1) & (range_val != 0)
-    rsv[valid_mask] = (close_arr[valid_mask] - low_min[valid_mask]) / range_val[valid_mask] * 100
+    for i in range(len(df_calc)):
+        if i < n - 1 or range_val.iloc[i] == 0:
+            rsv.iloc[i] = 50.0
+        else:
+            rsv.iloc[i] = (df_calc['close'].iloc[i] - low_min.iloc[i]) / range_val.iloc[i] * 100
 
-    # SMA计算 - 通达信风格（使用 numpy 数组，比 pandas .iloc 快 50x+）
+    # SMA计算 - 通达信风格
     # K = SMA(RSV, M1, 1): K = (RSV*1 + K'*(M1-1)) / M1
-    k = np.full(length, 50.0)
-    d = np.full(length, 50.0)
+    k = pd.Series(index=df_calc.index, dtype=float)
+    d = pd.Series(index=df_calc.index, dtype=float)
 
-    # 递归计算 - numpy 数组访问比 pandas .iloc 快得多
-    for i in range(1, length):
-        k[i] = (rsv[i] * 1 + k[i - 1] * (m1 - 1)) / m1
-        d[i] = (k[i] * 1 + d[i - 1] * (m2 - 1)) / m2
+    # 初始化第一日K、D值为50
+    k.iloc[0] = 50.0
+    d.iloc[0] = 50.0
+
+    # 递归计算
+    for i in range(1, len(df_calc)):
+        k.iloc[i] = (rsv.iloc[i] * 1 + k.iloc[i - 1] * (m1 - 1)) / m1
+        d.iloc[i] = (k.iloc[i] * 1 + d.iloc[i - 1] * (m2 - 1)) / m2
 
     # 计算J值
     j = 3 * k - 2 * d

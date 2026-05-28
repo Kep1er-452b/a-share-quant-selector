@@ -18,6 +18,7 @@ from utils.csv_manager import CSVManager
 from utils.local_config import load_config_file
 from utils.price_adjustment import detect_adjustment_gaps
 from utils.provider_router import (
+    VALID_PROVIDERS,
     provider_data_dir,
     write_provider_state,
 )
@@ -157,6 +158,63 @@ class BaseDataProvider:
                 json.dump(stock_dict, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"  保存股票名称失败: {e}")
+
+    @staticmethod
+    def _read_stock_names_file(path: Path) -> Dict[str, str]:
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        normalized = {}
+        for code, name in payload.items():
+            code_text = str(code).strip()
+            if not code_text:
+                continue
+            normalized[code_text.zfill(6)] = str(name or "").strip()
+        return normalized
+
+    def _load_shared_stock_names(self, min_count: int = 3000) -> tuple[Dict[str, str], Optional[Path]]:
+        """Bootstrap an empty provider warehouse from another local stock-name cache."""
+        candidate_paths = [
+            Path(self.stock_names_file),
+            Path(self.storage_root_dir) / "stock_names.json",
+        ]
+
+        active_path = Path(self.storage_root_dir) / "active_provider.json"
+        try:
+            active_payload = json.loads(active_path.read_text(encoding="utf-8")) if active_path.exists() else {}
+        except Exception:
+            active_payload = {}
+        active_provider = active_payload.get("active_provider")
+        if active_provider in VALID_PROVIDERS:
+            candidate_paths.append(provider_data_dir(self.storage_root_dir, active_provider) / "stock_names.json")
+
+        for provider in VALID_PROVIDERS:
+            candidate_paths.append(provider_data_dir(self.storage_root_dir, provider) / "stock_names.json")
+        candidate_paths.append(Path(self.storage_root_dir) / "stock_names.json")
+
+        seen = set()
+        candidates = []
+        for path in candidate_paths:
+            path = Path(path)
+            if path in seen:
+                continue
+            seen.add(path)
+            stock_names = self._read_stock_names_file(path)
+            candidates.append((path, stock_names))
+            if len(stock_names) >= min_count:
+                return stock_names, path
+
+        best_path, best_names = max(candidates, key=lambda item: len(item[1]), default=(None, {}))
+        if len(best_names) >= min_count:
+            return best_names, best_path
+        return {}, None
 
     def _load_fetch_state(self) -> dict:
         if self.fetch_state_file.exists():

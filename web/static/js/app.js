@@ -2916,6 +2916,12 @@ function openUpdateModal() {
         toast('系统已急停，无法继续更新数据', 'error');
         return;
     }
+    if (state.currentUpdateJobId) {
+        setUpdateModalStep('progress');
+        document.getElementById('update-modal').classList.add('active');
+        pollUpdateJobStatus();
+        return;
+    }
     state.updateProvider = null;
     document.getElementById('update-tushare-token').value = '';
     renderUpdateTokenPrompt();
@@ -2926,9 +2932,6 @@ function openUpdateModal() {
 }
 
 function closeUpdateModal() {
-    if (state.currentUpdateJobId && state.updateModalStep === 'progress') {
-        return;
-    }
     document.getElementById('update-modal').classList.remove('active');
 }
 
@@ -2967,7 +2970,7 @@ function renderUpdateJob(job) {
     const percent = Number(job.progress_pct || 0);
     const updateButton = document.getElementById('update-data-btn');
     if (updateButton) {
-        updateButton.disabled = ['queued', 'running'].includes(job.status);
+        updateButton.disabled = false;
     }
     document.getElementById('update-progress-bar-fill').style.width = `${Math.min(100, Math.max(0, percent))}%`;
     document.getElementById('update-progress-pct').textContent = `${percent}%`;

@@ -1287,11 +1287,18 @@ def _run_update_job(job_id, provider_name, provider_token):
             config=config,
             token=(provider_token or '').strip() or None,
         )
+        _update_update_job(
+            job_id,
+            current_step='获取股票列表',
+            progress_pct=2,
+        )
+        _append_update_job_log(job_id, f'正在获取 {provider_name} 目标股票池。')
         target_universe = provider.get_target_universe(board='all', max_stocks=None)
         _update_update_job(
             job_id,
             total_count=len(target_universe),
             current_step='分析目标股票池',
+            progress_pct=3,
         )
         _append_update_job_log(job_id, f'目标股票池 {len(target_universe)} 只，准备开始同步。')
 
