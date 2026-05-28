@@ -11,6 +11,7 @@ from pathlib import Path
 import json
 import requests
 import random
+import re
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -166,6 +167,49 @@ class AKShareFetcher(BaseDataProvider):
             print(f"  腾讯接口获取市值失败: {e}")
         
         return market_cap_map
+
+    @staticmethod
+    def _filter_a_share_stock_dict(stocks):
+        filtered = {}
+        code_pattern = re.compile(r'^(00|30|60|68|88)\d{4}$')
+        exclude_keywords = ['债', '基', 'ETF', 'LOF', '基金', '理财', '信托', 'B股', '指数', '国债', '企债', '转债', '回购', 'R-', 'GC']
+        for code, name in (stocks or {}).items():
+            code_text = str(code).zfill(6)
+            name_text = str(name or '').strip()
+            if not code_pattern.match(code_text):
+                continue
+            if any(keyword in name_text for keyword in exclude_keywords):
+                continue
+            filtered[code_text] = name_text
+        return filtered
+
+    def _fetch_stock_list_akshare_native(self):
+        """Use AKShare's own stock-list APIs before any cross-provider fallback."""
+        native_sources = []
+        if hasattr(ak, 'stock_info_a_code_name'):
+            native_sources.append(('akshare:stock_info_a_code_name', ak.stock_info_a_code_name))
+        native_sources.append(('akshare:stock_zh_a_spot_em', ak.stock_zh_a_spot_em))
+
+        for source_name, fetcher in native_sources:
+            try:
+                print(f"  尝试{source_name}...")
+                df = fetcher()
+                if df is None or df.empty:
+                    continue
+                code_column = 'code' if 'code' in df.columns else '代码'
+                name_column = 'name' if 'name' in df.columns else '名称'
+                if code_column not in df.columns or name_column not in df.columns:
+                    continue
+                stocks = dict(zip(df[code_column].astype(str), df[name_column].astype(str)))
+                filtered = self._filter_a_share_stock_dict(stocks)
+                if filtered:
+                    print(f"✓ akshare 原生股票池获取成功: {len(filtered)} 只A股股票")
+                    self._save_stock_names(filtered)
+                    return filtered
+            except Exception as e:
+                print(f"  {source_name} 失败: {e}")
+                time.sleep(1)
+        return {}
 
     def get_market_caps(self, stock_codes):
         """批量获取最新市值数据"""
@@ -353,6 +397,22 @@ class AKShareFetcher(BaseDataProvider):
     def get_all_stock_codes(self, max_retries=3):
         """获取所有A股股票代码（过滤债基、ETF、ST等）"""
         print("正在获取A股股票列表...")
+
+        local_stocks = self._load_local_stock_names()
+        if len(local_stocks) >= 3000:
+            print(f"✓ 从 akshare 本地缓存加载: {len(local_stocks)} 只股票")
+            return local_stocks
+
+        native_stocks = self._fetch_stock_list_akshare_native()
+        if native_stocks:
+            return native_stocks
+
+        bootstrap_stocks, bootstrap_path = self._load_shared_stock_names()
+        if bootstrap_stocks:
+            if Path(bootstrap_path) != Path(self.stock_names_file):
+                self._save_stock_names(bootstrap_stocks)
+            print(f"✓ akshare 原生股票池不可用，临时从本地中性股票池缓存加载: {len(bootstrap_stocks)} 只股票 ({bootstrap_path})")
+            return bootstrap_stocks
         
         # 方法1: 直接HTTP请求
         for attempt in range(max_retries):
@@ -360,17 +420,7 @@ class AKShareFetcher(BaseDataProvider):
                 print(f"  尝试HTTP直连 (第{attempt+1}/{max_retries}次)...")
                 stocks = self._fetch_stock_list_http()
                 if stocks:
-                    # 过滤
-                    filtered = {}
-                    code_pattern = r'^(00|30|60|68|88)\d{4}$'
-                    exclude_keywords = ['债', '基', 'ETF', 'LOF', '基金', '理财', '信托', 'B股', '指数', '国债', '企债', '转债', '回购', 'R-', 'GC']
-                    
-                    for code, name in stocks.items():
-                        if not pd.Series([code]).str.match(code_pattern).iloc[0]:
-                            continue
-                        if any(kw in name for kw in exclude_keywords):
-                            continue
-                        filtered[code] = name
+                    filtered = self._filter_a_share_stock_dict(stocks)
                     
                     if filtered:
                         print(f"✓ HTTP获取成功: {len(filtered)} 只A股股票")

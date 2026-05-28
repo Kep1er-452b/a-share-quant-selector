@@ -294,11 +294,11 @@ class QuantSystem:
             max_workers = default_workers
         max_workers = max(1, min(max_workers, 32))
 
-        raw_chunk_size = get_config_value(self.config, 'selection', 'chunk_size', default=50)
+        raw_chunk_size = get_config_value(self.config, 'selection', 'chunk_size', default=300)
         try:
             chunk_size = int(raw_chunk_size)
         except (TypeError, ValueError):
-            chunk_size = 50
+            chunk_size = 300
         chunk_size = max(1, min(chunk_size, 500))
 
         return {
