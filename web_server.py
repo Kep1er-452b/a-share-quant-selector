@@ -95,6 +95,9 @@ LOG_DIR = project_root / "logs"
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 EMERGENCY_EXIT_DELAY_SECONDS = 1.2
+UPDATE_FAILURE_MIN_COVERAGE = 0.20
+UPDATE_CACHE_REFRESH_MIN_COVERAGE = 0.90
+UPDATE_COVERAGE_GUARD_MIN_TARGETS = 100
 
 
 def _reload_registry():
@@ -1256,6 +1259,31 @@ def _refresh_market_caches_for_job(job_id, data_dir):
     _update_update_job(job_id, cache_refresh=cache_result.get('errors') or {})
 
 
+def _provider_update_coverage(summary):
+    try:
+        return float(summary.get('coverage_ratio') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _provider_update_target_count(summary):
+    try:
+        return int(summary.get('target_count') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _provider_update_stock_count(summary):
+    try:
+        return int(summary.get('stock_count') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coverage_guard_active(summary):
+    return _provider_update_target_count(summary) >= UPDATE_COVERAGE_GUARD_MIN_TARGETS
+
+
 def _run_update_job(job_id, provider_name, provider_token):
     config = _load_config()
     data_dir = str(_config_value(config, 'data_dir', default='data'))
@@ -1346,9 +1374,55 @@ def _run_update_job(job_id, provider_name, provider_token):
             _append_update_job_log(job_id, '任务因系统急停而终止。')
             return
 
-        provider_dir = str(provider.full_data_dir)
-        _refresh_market_caches_for_job(job_id, provider_dir)
         provider_state = warehouse_summary(data_dir, provider_name)
+        coverage_ratio = _provider_update_coverage(provider_state)
+        target_count = _provider_update_target_count(provider_state)
+        stock_count = _provider_update_stock_count(provider_state)
+        if (
+            _coverage_guard_active(provider_state)
+            and coverage_ratio < UPDATE_FAILURE_MIN_COVERAGE
+        ):
+            message = (
+                f"本次更新覆盖率过低 ({stock_count}/{target_count})，"
+                "疑似网络/代理或数据源连接异常；已跳过缓存刷新，保留当前 active provider。"
+            )
+            _append_update_job_log(job_id, message)
+            _append_system_log(
+                'update_job_failed_low_coverage',
+                message,
+                {'job_id': job_id, 'provider': provider_name, 'summary': provider_state, 'sync_summary': sync_summary},
+            )
+            _update_update_job(
+                job_id,
+                status='failed',
+                progress_pct=100,
+                current_step='更新失败',
+                current_stock=None,
+                error=message,
+                finished_at=_job_timestamp(),
+                cache_refresh={'skipped': 'low_coverage'},
+            )
+            return
+
+        provider_dir = str(provider.full_data_dir)
+        if (
+            _coverage_guard_active(provider_state)
+            and coverage_ratio < UPDATE_CACHE_REFRESH_MIN_COVERAGE
+        ):
+            message = (
+                f"本次更新覆盖率不足以刷新市场缓存 ({stock_count}/{target_count})，"
+                "已保留旧缓存。"
+            )
+            _append_update_job_log(job_id, message)
+            _append_system_log(
+                'update_cache_refresh_skipped',
+                message,
+                {'job_id': job_id, 'provider': provider_name, 'summary': provider_state},
+            )
+            _update_update_job(job_id, cache_refresh={'skipped': 'low_coverage'})
+        else:
+            _refresh_market_caches_for_job(job_id, provider_dir)
+            provider_state = warehouse_summary(data_dir, provider_name)
         switch_allowed = (
             provider_state.get('stock_count', 0) > 0
             and (provider_state.get('coverage_ratio') or 0) >= 0.98
@@ -2133,6 +2207,7 @@ def get_dashboard_pulse():
     """获取首页市场强弱快照。"""
     try:
         data_dir = str(_active_data_dir())
+        data_root = str(_data_root_dir())
         payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily', refresh=False)
         health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
@@ -2153,6 +2228,8 @@ def get_dashboard_pulse():
                 'laggards': laggards,
                 'header_indices': payload.get('header_indices', []),
                 'cache_health': health,
+                'active_provider': load_active_provider(data_root),
+                'provider_statuses': list_provider_statuses(data_root),
             }
         })
     except Exception as e:

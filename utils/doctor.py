@@ -20,6 +20,7 @@ from utils.config_schema import assert_strategy_params_file, load_yaml_file
 from utils.csv_manager import CSVManager
 from utils.data_provider import create_data_provider, get_config_value
 from utils.local_config import load_config_file
+from utils.provider_router import active_data_dir, load_active_provider
 from utils.selection_worker import initialize_selection_worker, process_selection_chunk
 from utils.strategy_labels import fallback_stock_name, is_invalid_stock_name
 
@@ -157,14 +158,16 @@ class Doctor:
         return names
 
     def check_local_data_shape(self, config):
-        data_dir = self.project_root / str(get_config_value(config, "data_dir", default="data"))
+        storage_root = self.project_root / str(get_config_value(config, "data_dir", default="data"))
+        data_dir = active_data_dir(storage_root)
+        active_provider = load_active_provider(storage_root).get("active_provider")
         manager = CSVManager(data_dir)
         codes = manager.list_all_stocks()
         if not codes:
-            self.fail("local stock CSV pool is empty")
+            self.fail(f"local stock CSV pool is empty for active provider={active_provider}")
             return
 
-        self.ok(f"local stock CSV pool={len(codes)}")
+        self.ok(f"local stock CSV pool={len(codes)} active_provider={active_provider}")
         checked = 0
         for code in codes[:200]:
             df = manager.read_stock(code)

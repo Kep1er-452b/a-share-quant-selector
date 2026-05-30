@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import logging
 import os
 import sys
@@ -30,6 +31,19 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "desktop_app_launcher.log"
+INCIDENT_DIR = LOG_DIR / "incidents"
+LOCAL_PROXY_BYPASS = "127.0.0.1,localhost,::1"
+
+
+def configure_local_proxy_bypass() -> None:
+    """Keep local desktop health checks away from the user's system proxy."""
+    for name in ("NO_PROXY", "no_proxy"):
+        existing = os.environ.get(name, "")
+        parts = [part.strip() for part in existing.split(",") if part.strip()]
+        for item in LOCAL_PROXY_BYPASS.split(","):
+            if item not in parts:
+                parts.append(item)
+        os.environ[name] = ",".join(parts)
 
 
 def setup_logging() -> None:
@@ -42,6 +56,41 @@ def setup_logging() -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+
+def append_system_log(event: str, message: str, detail: dict | None = None) -> None:
+    try:
+        from utils.error_logging import append_system_log as shared_append_system_log
+
+        shared_append_system_log(event, message, detail)
+    except Exception:
+        logging.exception("Failed to append system log")
+
+
+def write_startup_incident(error_detail: str) -> Path:
+    INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now()
+    incident_id = timestamp.strftime("%Y%m%d-%H%M%S")
+    incident_path = INCIDENT_DIR / f"{incident_id}-desktop-startup.json"
+    payload = {
+        "incident_id": incident_id,
+        "type": "desktop_startup_failure",
+        "created_at": timestamp.isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+        "project_root": str(PROJECT_ROOT),
+        "log_file": str(LOG_FILE),
+        "system_proxy": urllib.request.getproxies(),
+        "local_proxy_bypass": os.environ.get("NO_PROXY", ""),
+        "error": error_detail,
+    }
+    with open(incident_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    append_system_log(
+        "desktop_launcher_failed",
+        "桌面 App 启动失败，事故快照已写入。",
+        {"incident_path": str(incident_path), "pid": os.getpid()},
+    )
+    return incident_path
 
 
 def load_config() -> dict:
@@ -123,11 +172,13 @@ def status_html(title: str, body: str, detail: str = "") -> str:
 
 
 def wait_for_server(url: str, timeout: float = 30.0) -> bool:
+    health_url = f"{url.rstrip('/')}/api/system_status"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=1.5) as response:
-                if response.status < 500:
+            with opener.open(health_url, timeout=1.5) as response:
+                if response.status == 200:
                     return True
         except Exception:
             time.sleep(0.35)
@@ -166,6 +217,7 @@ def start_server(host: str, port: int) -> None:
 
 
 def launch_backend() -> tuple[str, threading.Thread]:
+    configure_local_proxy_bypass()
     errors = validate_environment(require_webview=False)
     if errors:
         raise RuntimeError("\n".join(errors))
@@ -188,6 +240,7 @@ def launch_backend() -> tuple[str, threading.Thread]:
 
 
 def run_check(require_webview: bool = False) -> int:
+    configure_local_proxy_bypass()
     setup_logging()
     errors = validate_environment(require_webview=require_webview)
     if errors:
@@ -218,6 +271,7 @@ def run_smoke_test() -> int:
 
 
 def run_gui() -> int:
+    configure_local_proxy_bypass()
     setup_logging()
     logging.info("Starting %s desktop launcher at %s", APP_NAME, datetime.now().isoformat())
 
@@ -246,11 +300,12 @@ def run_gui() -> int:
             window.load_url(url)
         except Exception:
             detail = traceback.format_exc()
+            incident_path = write_startup_incident(detail)
             logging.error("Desktop launcher failed\n%s", detail)
             window.load_html(status_html(
                 "启动失败",
                 "桌面 App 没有改动原系统。你仍然可以回到项目文件夹，用终端方式启动 Web。",
-                f"{detail}\n日志文件: {LOG_FILE}",
+                f"{detail}\n日志文件: {LOG_FILE}\n事故快照: {incident_path}",
             ))
 
     threading.Thread(target=boot, name="desktop-launcher-boot", daemon=True).start()

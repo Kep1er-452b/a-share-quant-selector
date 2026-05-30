@@ -171,7 +171,7 @@ class CSVManager:
     def list_all_stocks(self):
         """列出所有已保存的股票代码"""
         stocks = []
-        for csv_file in self.data_dir.rglob("*.csv"):
+        for csv_file in self.data_dir.glob("[0-9][0-9]/*.csv"):
             stock_code = csv_file.stem
             if self.STOCK_CODE_PATTERN.match(stock_code):
                 stocks.append(stock_code)

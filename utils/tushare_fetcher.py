@@ -4,8 +4,10 @@ A股数据抓取模块 - 使用 tushare
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
+import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -48,6 +50,8 @@ class TushareFetcher(BaseDataProvider):
         self.pro_bar_limit_per_minute = 360
         self.pro_bar_rate_limit_wait = 62
         self.pro_bar_lock = Lock()
+        self.proxy_fallback_lock = Lock()
+        self._prefer_direct_network = False
         self.daily_basic_by_date_cache = {}
         self.daily_basic_by_date_failures = set()
         self.daily_basic_date_cache_max_days = 40
@@ -61,6 +65,73 @@ class TushareFetcher(BaseDataProvider):
         self.trade_calendar_range_cache = {}
         self._trade_calendar_warning_emitted = False
         self._load_trade_calendar_cache()
+
+    def _has_proxy_configured(self) -> bool:
+        try:
+            proxies = urllib.request.getproxies()
+        except Exception:
+            return False
+        return any(proxies.get(key) for key in ("http", "https", "all")) and proxies.get("no") != "*"
+
+    @staticmethod
+    def _is_proxy_error(exc: Exception) -> bool:
+        current = exc
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if current.__class__.__name__ == "ProxyError":
+                return True
+            text = str(current)
+            if "ProxyError" in text or "Unable to connect to proxy" in text:
+                return True
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        return False
+
+    def _call_without_proxy(self, func, *args, **kwargs):
+        with self.proxy_fallback_lock:
+            proxy_keys = (
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy",
+                "NO_PROXY", "no_proxy",
+            )
+            previous = {key: os.environ.get(key) for key in proxy_keys}
+            for key in proxy_keys:
+                os.environ.pop(key, None)
+            os.environ["NO_PROXY"] = "*"
+            os.environ["no_proxy"] = "*"
+            try:
+                return func(*args, **kwargs)
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def _call_with_proxy_fallback(self, func, *args, retry_on_none=False, **kwargs):
+        if self._prefer_direct_network:
+            return self._call_without_proxy(func, *args, **kwargs)
+
+        try:
+            result = func(*args, **kwargs)
+        except Exception as exc:
+            proxy_configured = self._has_proxy_configured()
+            generic_sdk_error = str(exc).strip() == "ERROR."
+            if (not self._is_proxy_error(exc) and not generic_sdk_error) or not proxy_configured:
+                raise
+            try:
+                result = self._call_without_proxy(func, *args, **kwargs)
+            except Exception:
+                raise exc
+            self._prefer_direct_network = True
+            return result
+
+        if retry_on_none and result is None and self._has_proxy_configured():
+            direct_result = self._call_without_proxy(func, *args, **kwargs)
+            if direct_result is not None:
+                self._prefer_direct_network = True
+                return direct_result
+        return result
 
     def _load_trade_calendar_cache(self):
         merged_cache = {"years": {}, "updated_at": None}
@@ -134,7 +205,8 @@ class TushareFetcher(BaseDataProvider):
         print("  可执行 `python3 main.py calendar --provider tushare --update --years 2026` 更新日历缓存。")
 
     def _fetch_trade_calendar_year(self, year: int):
-        df = self.pro.trade_cal(
+        df = self._call_with_proxy_fallback(
+            self.pro.trade_cal,
             exchange="",
             start_date=f"{year}0101",
             end_date=f"{year}1231",
@@ -267,7 +339,8 @@ class TushareFetcher(BaseDataProvider):
             return self.trade_calendar_range_cache[cache_key]
 
         try:
-            df = self.pro.trade_cal(
+            df = self._call_with_proxy_fallback(
+                self.pro.trade_cal,
                 exchange="",
                 start_date=start.strftime("%Y%m%d"),
                 end_date=end.strftime("%Y%m%d"),
@@ -364,14 +437,19 @@ class TushareFetcher(BaseDataProvider):
     def _call_daily_basic(self, **kwargs):
         self._throttle_daily_basic()
         self.daily_basic_api_calls += 1
-        return self.pro.daily_basic(**kwargs)
+        return self._call_with_proxy_fallback(self.pro.daily_basic, **kwargs)
 
     def _call_pro_bar(self, **kwargs):
         last_error = None
         for attempt in range(4):
             try:
                 self._throttle_pro_bar()
-                return self.ts.pro_bar(**kwargs)
+                return self._call_with_proxy_fallback(
+                    self.ts.pro_bar,
+                    api=self.pro,
+                    retry_on_none=True,
+                    **kwargs,
+                )
             except Exception as e:
                 last_error = e
                 if self._is_rate_limit_error(e) and attempt < 3:
@@ -610,7 +688,8 @@ class TushareFetcher(BaseDataProvider):
 
         for attempt in range(max_retries):
             try:
-                df = self.pro.stock_basic(
+                df = self._call_with_proxy_fallback(
+                    self.pro.stock_basic,
                     exchange="",
                     list_status="L",
                     fields="ts_code,symbol,name,area,industry,market,exchange,list_date"

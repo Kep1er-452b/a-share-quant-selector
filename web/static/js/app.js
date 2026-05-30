@@ -780,6 +780,65 @@ function renderDashboardPulse(payload) {
     `;
 }
 
+function providerDisplayName(provider) {
+    const names = {
+        akshare: 'AKSHARE',
+        tushare: 'TUSHARE',
+        tencent: 'TENCENT',
+        legacy: 'LEGACY',
+    };
+    return names[provider] || String(provider || '--').toUpperCase();
+}
+
+function providerStatusClass(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'completed' || value === 'ready') {
+        return 'status-ok';
+    }
+    if (value === 'partial') {
+        return 'status-warn';
+    }
+    if (value === 'empty' || value === 'failed' || value === 'error') {
+        return 'status-bad';
+    }
+    return '';
+}
+
+function formatCoverageRatio(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    return `${Math.round(numeric * 1000) / 10}%`;
+}
+
+function providerSubText(status) {
+    const target = Number(status?.target_count || 0);
+    const count = Number(status?.stock_count || 0);
+    const failed = Number(status?.failed_count || 0);
+    const warnings = Number(status?.warning_count || 0);
+    const latest = status?.latest_trade_date || '--';
+    const coverage = status?.coverage_ratio != null ? formatCoverageRatio(status.coverage_ratio) : '--';
+    const base = target > 0
+        ? `${formatNumber(count)}/${formatNumber(target)} · ${coverage}`
+        : `${formatNumber(count)} 只`;
+    return `${base} · ${latest} · 失败 ${formatNumber(failed)} / 警告 ${formatNumber(warnings)}`;
+}
+
+function renderProviderHealthCard(status, activeProvider) {
+    const provider = status?.provider || '--';
+    const isActive = provider === activeProvider;
+    const label = isActive ? `${providerDisplayName(provider)} ACTIVE` : providerDisplayName(provider);
+    const state = isActive ? 'ACTIVE' : String(status?.status || 'EMPTY').toUpperCase();
+    return `
+        <div class="health-card provider-health-card ${isActive ? 'active' : ''}">
+            <div class="pulse-label">${escapeHtml(label)}</div>
+            <div class="pulse-value ${providerStatusClass(status?.status)}">${escapeHtml(state)}</div>
+            <div class="pulse-sub">${escapeHtml(providerSubText(status || {}))}</div>
+        </div>
+    `;
+}
+
 function renderDashboardHealth(payload) {
     const container = document.getElementById('dashboard-market-health');
     if (!container) {
@@ -787,13 +846,27 @@ function renderDashboardHealth(payload) {
     }
 
     const health = payload?.cache_health || {};
+    const providers = Array.isArray(payload?.provider_statuses) ? payload.provider_statuses : [];
+    const activeProviderState = payload?.active_provider || {};
+    const activeProvider = activeProviderState.active_provider || 'legacy';
+    const activeStatus = providers.find(item => item.provider === activeProvider) || activeProviderState.provider_state || {};
     const refreshPending = Boolean(health.refresh_pending);
     const anomalyCount = Number(health.market_cap_anomaly_count || 0);
     const cacheState = refreshPending ? 'REFRESH' : 'READY';
-    const cacheClass = refreshPending ? 'down' : 'up';
-    const capClass = anomalyCount > 0 ? 'down' : 'up';
+    const cacheClass = refreshPending ? 'status-warn' : 'status-ok';
+    const capClass = anomalyCount > 0 ? 'status-bad' : 'status-ok';
+    const providerMap = new Map(providers.map(item => [item.provider, item]));
+    const providerCards = ['akshare', 'tushare', 'tencent']
+        .map(provider => renderProviderHealthCard(providerMap.get(provider) || { provider, status: 'empty' }, activeProvider))
+        .join('');
 
     container.innerHTML = `
+        <div class="health-card provider-health-card active-source">
+            <div class="pulse-label">ACTIVE SOURCE</div>
+            <div class="pulse-value status-ok">${escapeHtml(providerDisplayName(activeProvider))}</div>
+            <div class="pulse-sub">${escapeHtml(providerSubText(activeStatus))}</div>
+        </div>
+        ${providerCards}
         <div class="health-card">
             <div class="pulse-label">LOCAL DATE</div>
             <div class="pulse-value">${escapeHtml(health.local_latest_date || '--')}</div>
