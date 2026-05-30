@@ -32,6 +32,38 @@ def b1_v242p_default_params(extra=None) -> dict:
     return params
 
 
+def apply_b1_v242p_signal(result: pd.DataFrame, params, j_ok_series=None) -> pd.DataFrame:
+    """Refresh B1(V2.42P) signal columns from already-computed base indicators."""
+    result["J_OK"] = j_ok_series if j_ok_series is not None else result["J"] <= params["J_MAX"]
+
+    branch_1 = (
+        result["PLRY_CNT"] &
+        result["YANGYIN_OK1"] &
+        result["J_OK"] &
+        result["MVOK"] &
+        result["GOOD28"] &
+        result["THREE_SUM_OK"] &
+        result["MAX14_OK"]
+    )
+    branch_2 = (
+        result["PLRY_CNT"] &
+        result["YANGYIN_OK2"] &
+        result["J_OK"] &
+        result["MVOK"] &
+        result["GOOD28"] &
+        result["MAX14_OK"]
+    )
+    result["A1"] = branch_1 | branch_2
+
+    tolerance = params["B1_TREND_TOLERANCE"]
+    result["B1_V242P_SIGNAL"] = (
+        (result["HMSHORTWL"] >= result["HMLONGYL"] * tolerance) &
+        (result["close"] >= result["HMLONGYL"] * tolerance) &
+        result["A1"]
+    )
+    return result
+
+
 def calculate_b1_v242p_indicators(df, params, j_ok_series=None) -> pd.DataFrame:
     """计算 B1(V2.42P) 条件列。
 
@@ -55,8 +87,6 @@ def calculate_b1_v242p_indicators(df, params, j_ok_series=None) -> pd.DataFrame:
         result["K"] = kdj_df["K"]
         result["D"] = kdj_df["D"]
         result["J"] = kdj_df["J"]
-
-    result["J_OK"] = j_ok_series if j_ok_series is not None else result["J"] <= params["J_MAX"]
 
     result["VOL_YANG1"] = SUM(result["volume"] * result["REAL_YANG"].astype(int), 28)
     result["VOL_YIN1"] = SUM(result["volume"] * result["REAL_YIN"].astype(int), 28)
@@ -107,25 +137,6 @@ def calculate_b1_v242p_indicators(df, params, j_ok_series=None) -> pd.DataFrame:
     result["MAX14_BAD"] = (result["volume"] == result["MAXVOL14"]) & result["REAL_YIN"]
     result["MAX14_OK"] = COUNT(result["MAX14_BAD"], 14) == 0
 
-    branch_1 = (
-        result["PLRY_CNT"] &
-        result["YANGYIN_OK1"] &
-        result["J_OK"] &
-        result["MVOK"] &
-        result["GOOD28"] &
-        result["THREE_SUM_OK"] &
-        result["MAX14_OK"]
-    )
-    branch_2 = (
-        result["PLRY_CNT"] &
-        result["YANGYIN_OK2"] &
-        result["J_OK"] &
-        result["MVOK"] &
-        result["GOOD28"] &
-        result["MAX14_OK"]
-    )
-    result["A1"] = branch_1 | branch_2
-
     result["HMSHORTWL"] = SMA(SMA(result["close"], 40, 4), 100, 50)
     result["HMLONGYL"] = 0.5 * (
         0.2 * MA(result["close"], 12) +
@@ -139,14 +150,7 @@ def calculate_b1_v242p_indicators(df, params, j_ok_series=None) -> pd.DataFrame:
         0.1 * MA(result["close"], 160)
     )
 
-    tolerance = params["B1_TREND_TOLERANCE"]
-    result["B1_V242P_SIGNAL"] = (
-        (result["HMSHORTWL"] >= result["HMLONGYL"] * tolerance) &
-        (result["close"] >= result["HMLONGYL"] * tolerance) &
-        result["A1"]
-    )
-
-    return result
+    return apply_b1_v242p_signal(result, params, j_ok_series=j_ok_series)
 
 
 def build_b1_v242p_signal(latest, category="b1_v242p", fallback_reason="满足 B1(V2.42P) 条件") -> dict:

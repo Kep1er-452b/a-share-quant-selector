@@ -4,6 +4,7 @@ CSV 数据管理工具
 import os
 import re
 import tempfile
+from threading import RLock
 import pandas as pd
 from pathlib import Path
 
@@ -16,10 +17,20 @@ class CSVManager:
     STOCK_CODE_PATTERN = re.compile(r"^\d{6}$")
     REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"}
     NUMERIC_COLUMNS = ["open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"]
+    _locks_guard = RLock()
+    _path_locks = {}
     
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def _lock_for_path(cls, path: Path):
+        key = str(Path(path).resolve())
+        with cls._locks_guard:
+            if key not in cls._path_locks:
+                cls._path_locks[key] = RLock()
+            return cls._path_locks[key]
     
     @classmethod
     def validate_stock_code(cls, stock_code):
@@ -50,7 +61,11 @@ class CSVManager:
             if path.stat().st_size == 0:
                 return pd.DataFrame()
 
-            df = pd.read_csv(path, parse_dates=['date'])
+            with self._lock_for_path(path):
+                df = pd.read_csv(path, parse_dates=['date'])
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                df = df.dropna(subset=['date']).sort_values('date', ascending=False).reset_index(drop=True)
             return df
         except Exception as e:
             print(f"  读取 {stock_code} 数据失败: {e}")
@@ -100,30 +115,31 @@ class CSVManager:
     def write_stock(self, stock_code, df):
         """写入股票数据（自动去重排序，原子写入）"""
         path = self.get_stock_path(stock_code)
-        df = self._validate_stock_dataframe(df)
-        
-        # 去重：按日期去重，保留最后出现的
-        df = df.drop_duplicates(subset=['date'], keep='last')
-        
-        # 按日期倒序排列（最新在前）
-        df = df.sort_values('date', ascending=False)
-        
-        # 确保目录存在
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 原子写入：先写临时文件，再 os.replace
-        tmp_fd, tmp_path = tempfile.mkstemp(
-            suffix='.csv', prefix=f'{stock_code}_', dir=str(path.parent)
-        )
-        try:
-            os.close(tmp_fd)
-            df.to_csv(tmp_path, index=False)
-            os.replace(tmp_path, str(path))
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
-        return path
+        with self._lock_for_path(path):
+            df = self._validate_stock_dataframe(df)
+
+            # 去重：按日期去重，保留最后出现的
+            df = df.drop_duplicates(subset=['date'], keep='last')
+
+            # 按日期倒序排列（最新在前）
+            df = df.sort_values('date', ascending=False)
+
+            # 确保目录存在
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 原子写入：先写临时文件，再 os.replace
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix='.csv', prefix=f'{stock_code}_', dir=str(path.parent)
+            )
+            try:
+                os.close(tmp_fd)
+                df.to_csv(tmp_path, index=False)
+                os.replace(tmp_path, str(path))
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
+            return path
 
     @staticmethod
     def _preserve_existing_metrics(existing_df, new_df):
@@ -157,16 +173,18 @@ class CSVManager:
     
     def update_stock(self, stock_code, new_df):
         """增量更新股票数据"""
-        existing_df = self.read_stock(stock_code)
-        
-        if existing_df.empty:
-            return self.write_stock(stock_code, new_df)
+        path = self.get_stock_path(stock_code)
+        with self._lock_for_path(path):
+            existing_df = self.read_stock(stock_code)
 
-        new_df = self._preserve_existing_metrics(existing_df, new_df)
-        
-        # 合并数据
-        combined = pd.concat([existing_df, new_df], ignore_index=True)
-        return self.write_stock(stock_code, combined)
+            if existing_df.empty:
+                return self.write_stock(stock_code, new_df)
+
+            new_df = self._preserve_existing_metrics(existing_df, new_df)
+
+            # 合并数据
+            combined = pd.concat([existing_df, new_df], ignore_index=True)
+            return self.write_stock(stock_code, combined)
     
     def list_all_stocks(self):
         """列出所有已保存的股票代码"""

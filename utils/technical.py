@@ -5,6 +5,32 @@ import pandas as pd
 import numpy as np
 
 
+def normalize_price_frame(df: pd.DataFrame, *, descending: bool = True) -> pd.DataFrame:
+    """
+    Return a date-sorted OHLCV frame.
+
+    Most project strategy formulas expect local CSV order: newest row first.
+    This helper makes that invariant explicit at module boundaries while keeping
+    the caller's index shape stable after sorting.
+    """
+    if df is None or df.empty or 'date' not in df.columns:
+        return df.copy() if df is not None else pd.DataFrame()
+
+    result = df.copy()
+    result['date'] = pd.to_datetime(result['date'], errors='coerce')
+    result = result.dropna(subset=['date'])
+    if result.empty:
+        return result
+    needs_sort = (
+        not result['date'].is_monotonic_decreasing
+        if descending
+        else not result['date'].is_monotonic_increasing
+    )
+    if needs_sort:
+        result = result.sort_values('date', ascending=not descending).reset_index(drop=True)
+    return result
+
+
 def MA(series, n):
     """
     简单移动平均 - 正确处理倒序排列的数据
@@ -132,6 +158,14 @@ def KDJ(df, n=9, m1=3, m2=3):
     
     注意：数据可能是倒序（最新在前）或正序，需要自动检测并处理
     """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date'])
+    if not df.empty and not (df['date'].is_monotonic_decreasing or df['date'].is_monotonic_increasing):
+        df = df.sort_values('date', ascending=False).reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame({'K': [], 'D': [], 'J': []}, index=df.index)
+
     # 检测数据顺序
     is_descending = df['date'].iloc[0] > df['date'].iloc[-1]
 
@@ -189,7 +223,7 @@ def prepare_selection_features(df, include_standard_trend=True):
     """
     预计算多策略共享的中间列，避免单只股票重复计算。
     """
-    result = df.copy()
+    result = normalize_price_frame(df, descending=True)
 
     if 'ref_close_1' not in result.columns:
         result['ref_close_1'] = REF(result['close'], 1)
@@ -229,6 +263,7 @@ def calculate_zhixing_trend(df, m1=14, m2=28, m3=57, m4=114):
     参数:
         m1, m2, m3, m4: 多空线计算用的MA周期，默认14, 28, 57, 114
     """
+    df = normalize_price_frame(df, descending=True)
     # 知行短期趋势线 = EMA(EMA(CLOSE,10),10)
     short_term_trend = EMA(EMA(df['close'], 10), 10)
     
@@ -243,7 +278,7 @@ def calculate_zhixing_trend(df, m1=14, m2=28, m3=57, m4=114):
 
 
 def _bars_last_count(cond: pd.Series) -> pd.Series:
-    """正序布尔序列的连续成立计数。"""
+    """正序布尔序列的连续成立计数；调用前必须先把行情转为旧到新。"""
     values = cond.fillna(False).astype(bool).tolist()
     counts = []
     current = 0
@@ -254,7 +289,7 @@ def _bars_last_count(cond: pd.Series) -> pd.Series:
 
 
 def _bars_last(cond: pd.Series) -> pd.Series:
-    """正序布尔序列距离上一次成立的周期数；未出现则为 -1。"""
+    """正序布尔序列距离上一次成立的周期数；调用前必须先把行情转为旧到新。"""
     values = cond.fillna(False).astype(bool).tolist()
     result = []
     last_index = None
@@ -270,7 +305,7 @@ def _bars_last(cond: pd.Series) -> pd.Series:
 
 
 def _backset(cond: pd.Series, counts: pd.Series) -> pd.Series:
-    """通达信 BACKSET 的正序近似实现：条件成立时向前标记指定数量 K 线。"""
+    """通达信 BACKSET 的正序近似实现；调用前必须先把行情转为旧到新。"""
     flags = [False] * len(cond)
     cond_values = cond.fillna(False).astype(bool).tolist()
     count_values = pd.to_numeric(counts, errors='coerce').fillna(0).astype(int).tolist()
@@ -304,6 +339,7 @@ def calculate_zhixing_main_overlay(df):
     if df.empty:
         return pd.DataFrame(index=df.index)
 
+    df = normalize_price_frame(df, descending=True)
     is_descending = df['date'].iloc[0] > df['date'].iloc[-1]
     df_calc = df.iloc[::-1].copy().reset_index(drop=True) if is_descending else df.copy().reset_index(drop=True)
 
