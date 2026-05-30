@@ -93,7 +93,7 @@ class B1PatternLibrary:
         # 取breakout_date之前lookback_days天
         return filtered.head(lookback_days)
     
-    def find_best_match(self, stock_code: str, stock_df: pd.DataFrame, lookback_days: int = 25) -> dict:
+    def find_best_match(self, stock_code: str, stock_df: pd.DataFrame, lookback_days: int = 25, as_of_date=None) -> dict:
         """
         为单只股票找到最匹配的B1完美图形案例
         
@@ -110,6 +110,10 @@ class B1PatternLibrary:
                 "candidate_features": {},
             }
         
+        if as_of_date is None and stock_df is not None and not stock_df.empty and "date" in stock_df.columns:
+            as_of_date = pd.to_datetime(stock_df["date"], errors="coerce").max()
+        as_of_date = pd.to_datetime(as_of_date, errors="coerce") if as_of_date is not None else None
+
         # 提取候选股特征（使用指定回看天数）
         candidate_features = self.extractor.extract(stock_df, lookback_days=lookback_days)
         
@@ -117,6 +121,9 @@ class B1PatternLibrary:
         matches = []
         for case_id, case_data in self.cases.items():
             try:
+                case_date = pd.to_datetime(case_data["meta"]["breakout_date"], errors="coerce")
+                if as_of_date is not None and not pd.isna(as_of_date) and not pd.isna(case_date) and case_date > as_of_date:
+                    continue
                 similarity = self.matcher.match(
                     candidate_features,
                     case_data["features"]
@@ -157,7 +164,11 @@ class B1PatternLibrary:
         
         for stock in stocks_data:
             try:
-                match_result = self.find_best_match(stock["code"], stock["df"])
+                match_result = self.find_best_match(
+                    stock["code"],
+                    stock["df"],
+                    as_of_date=stock.get("as_of_date"),
+                )
                 
                 if match_result["best_match"]:
                     results.append({
@@ -272,6 +283,7 @@ class B1PatternLibrary:
             "cases": B1_PERFECT_CASES,
             "weights": SIMILARITY_WEIGHTS,
             "tolerances": self.matcher.tolerances,
+            "as_of_guard": 1,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()

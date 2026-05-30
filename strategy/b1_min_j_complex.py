@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.base_strategy import BaseStrategy
 from strategy.b1_min_j_simple import calculate_min_j
 from strategy.b1_v242p import (
+    apply_b1_v242p_signal,
     build_b1_v242p_signal,
     b1_v242p_default_params,
     calculate_b1_v242p_indicators,
@@ -39,7 +40,7 @@ class B1MinJComplexStrategy(BaseStrategy):
             long_offset=self.params["LONG_OFFSET"],
         )
         result["J_OK"] = result["J"] <= result["MIN_J"]
-        result = calculate_b1_v242p_indicators(result, self.params, j_ok_series=result["J_OK"])
+        result = apply_b1_v242p_signal(result, self.params, j_ok_series=result["J_OK"])
         result["B1_MIN_J_COMPLEX_SIGNAL"] = result["B1_V242P_SIGNAL"]
         return result
 

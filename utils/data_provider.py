@@ -817,6 +817,25 @@ class BaseDataProvider:
         progress_callback=None,
         halt_checker=None,
     ):
+        with self._sync_lock:
+            return self._sync_target_data_unlocked(
+                target_universe,
+                board=board,
+                max_stocks=max_stocks,
+                purpose=purpose,
+                progress_callback=progress_callback,
+                halt_checker=halt_checker,
+            )
+
+    def _sync_target_data_unlocked(
+        self,
+        target_universe: List[dict],
+        board: str = "all",
+        max_stocks=None,
+        purpose: str = "init",
+        progress_callback=None,
+        halt_checker=None,
+    ):
         """
         智能续抓目标股票池：
         - 缺失/损坏/历史过短 -> 全量抓取

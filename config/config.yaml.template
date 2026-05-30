@@ -22,8 +22,8 @@ data_source:
 # 3. enabled=false 表示保留配置但默认不发送
 dingtalk:
   enabled: false
-  webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_HERE"
-  secret: "YOUR_SECRET_HERE"
+  webhook_url: ""
+  secret: ""
 
 # 定时任务配置
 schedule:

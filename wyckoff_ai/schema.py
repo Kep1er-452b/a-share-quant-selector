@@ -108,6 +108,10 @@ def _candidate_dates(value: Any, available_dates: set[str], field_name: str) -> 
     date = _parse_date(value, field_name)
     if date not in available_dates:
         target = pd.Timestamp(date)
+        min_date = pd.Timestamp(min(available_dates))
+        max_date = pd.Timestamp(max(available_dates))
+        if target < min_date or target > max_date:
+            raise WyckoffSchemaError(f"{field_name} 日期不在 CSV 真实交易日中: {date}")
         candidates = sorted(
             available_dates,
             key=lambda item: (

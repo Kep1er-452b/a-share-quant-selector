@@ -520,6 +520,22 @@ def _normalize_csv_value(raw_value):
     return value
 
 
+def _bounded_text(value, field_name, *, max_length=200, allow_empty=True):
+    text = str(value or "").strip()
+    if not text and not allow_empty:
+        raise ValueError(f"{field_name} 不能为空")
+    if len(text) > max_length:
+        raise ValueError(f"{field_name} 过长，最多 {max_length} 个字符")
+    return text
+
+
+def _validate_job_id(job_id):
+    try:
+        return str(uuid.UUID(str(job_id)))
+    except (TypeError, ValueError):
+        raise ValueError("任务 ID 格式无效")
+
+
 def _parse_requested_boards(raw_value):
     allowed = set(BOARD_LABELS.keys()) - {"all"}
     if raw_value is None or str(raw_value).strip() == "":
@@ -540,6 +556,9 @@ def _parse_requested_strategies(raw_value):
     invalid = []
     for item in str(raw_value).split(","):
         strategy_name = item.strip()
+        if len(strategy_name) > 80:
+            invalid.append(strategy_name[:80])
+            continue
         if strategy_name and strategy_name in registry.strategies:
             requested.append(strategy_name)
         elif strategy_name:
@@ -1723,6 +1742,8 @@ def get_stock_detail(code):
             'period_label': STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['label'],
             'data': data,
         })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -2236,12 +2257,17 @@ def get_dashboard_pulse():
         return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/api/select')
+@app.route('/api/select', methods=['POST'])
 def run_selection():
     """执行选股"""
     try:
-        requested_boards = _parse_requested_boards(request.args.get('boards'))
-        requested_strategies = _parse_requested_strategies(request.args.get('strategies'))
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+        requested_boards = _parse_requested_boards(payload.get('boards'))
+        requested_strategies = _parse_requested_strategies(payload.get('strategies'))
 
         manager = _active_csv_manager()
         stock_codes = [
@@ -2370,7 +2396,11 @@ def start_selection_job():
                 'job': running_job,
             }), 409
 
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
         requested_boards = _parse_requested_boards(payload.get('boards'))
         requested_strategies = _parse_requested_strategies(payload.get('strategies'))
 
@@ -2387,6 +2417,8 @@ def start_selection_job():
             'job_id': job_id,
             'data': _serialize_job(selection_jobs.get(job_id)),
         })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -2394,6 +2426,10 @@ def start_selection_job():
 @app.route('/api/select/status/<job_id>')
 def get_selection_job_status(job_id):
     """查询异步选股任务状态。"""
+    try:
+        job_id = _validate_job_id(job_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
     with selection_jobs_lock:
         job = selection_jobs.get(job_id)
         if not job:
@@ -2710,12 +2746,16 @@ def start_update_job():
                 'job': running_selection,
             }), 409
 
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
         provider = _normalize_csv_value(payload.get('provider')) or 'akshare'
         if provider not in {'akshare', 'tushare', 'tencent'}:
             return jsonify({'success': False, 'error': '不支持的数据源'}), 400
 
-        tushare_token = str(payload.get('tushare_token') or '').strip()
+        tushare_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
         job_id = _create_update_job(provider)
         thread = Thread(
             target=_run_update_job,
@@ -2731,6 +2771,8 @@ def start_update_job():
             'job_id': job_id,
             'data': _serialize_job(job),
         })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -2738,6 +2780,10 @@ def start_update_job():
 @app.route('/api/update/status/<job_id>')
 def get_update_job_status(job_id):
     """查询异步更新任务状态。"""
+    try:
+        job_id = _validate_job_id(job_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
     with update_jobs_lock:
         job = update_jobs.get(job_id)
         if not job:
@@ -2792,8 +2838,8 @@ def add_watchlist_item():
             return _halted_response()
 
         payload = request.get_json(silent=True) or {}
-        query = str(payload.get('query') or payload.get('code') or '').strip()
-        note = str(payload.get('note') or '').strip()
+        query = _bounded_text(payload.get('query') or payload.get('code'), '股票查询', max_length=80)
+        note = _bounded_text(payload.get('note'), '备注', max_length=200)
         if not query:
             return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音首字母'}), 400
 
@@ -2825,6 +2871,8 @@ def add_watchlist_item():
             'updated_at': items[code].get('updated_at'),
         })
         return jsonify({'success': True, 'data': row})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
