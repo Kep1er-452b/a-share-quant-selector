@@ -337,13 +337,25 @@ class BaseDataProvider:
                     break
                 last_completion = time.monotonic()
                 for future in done:
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        item = futures[future]
+                        result = {
+                            "code": item.get("code"),
+                            "name": item.get("name", ""),
+                            "ok": False,
+                            "fallback_full": True,
+                            "error": str(exc),
+                        }
                     if result["ok"]:
                         ok_list.append(result)
                     elif result.get("fallback_full"):
                         fallback_item = dict(futures[future])
                         if result.get("adjustment_gap"):
                             fallback_item["_adjustment_gap_result"] = result
+                        if result.get("error"):
+                            fallback_item["_worker_error"] = result.get("error")
                         fallback_list.append(fallback_item)
                     self._emit_batch_progress(
                         item=futures[future],
@@ -405,7 +417,16 @@ class BaseDataProvider:
                     break
                 last_completion = time.monotonic()
                 for future in done:
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        item = futures[future]
+                        result = {
+                            "code": item.get("code"),
+                            "name": item.get("name", ""),
+                            "ok": False,
+                            "error": str(exc),
+                        }
                     if result["ok"]:
                         ok_list.append(result)
                     else:
@@ -754,6 +775,9 @@ class BaseDataProvider:
             "status_summary": final_summary,
             "warnings": warnings,
         }
+        runtime_stats = self.get_runtime_stats()
+        if runtime_stats:
+            payload["runtime_stats"] = runtime_stats
         write_provider_state(self.storage_root_dir, self.provider_name, payload)
         return payload
 
@@ -989,7 +1013,12 @@ class BaseDataProvider:
                         adjustment_gaps=r.get("gaps", []),
                     )
                 else:
-                    status_map[r["code"]]["reason"] = "fetch_failed"
+                    if r.get("timeout"):
+                        status_map[r["code"]]["reason"] = "sync_timeout"
+                    elif r.get("error"):
+                        status_map[r["code"]]["reason"] = f"worker_error:{r.get('error')}"
+                    else:
+                        status_map[r["code"]]["reason"] = "fetch_failed"
 
         success_count = sum(1 for info in status_map.values() if info["status"] in {"incremental_updated", "full_refreshed"})
         failed_count = sum(1 for info in status_map.values() if info["status"] == "failed")

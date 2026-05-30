@@ -1,0 +1,89 @@
+{
+  "incident_id": "20260528-162735",
+  "type": "emergency_stop",
+  "reason": "用户手动触发事故急停",
+  "created_at": "2026-05-28T16:27:35",
+  "pid": 9433,
+  "shutdown_delay_seconds": 1.2,
+  "request": {
+    "remote_addr": "127.0.0.1",
+    "path": "/api/emergency_stop",
+    "method": "POST",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+  },
+  "tasks": {
+    "update_jobs": [
+      {
+        "job_id": "b9e681485f4c",
+        "status": "failed",
+        "created_at": "2026-05-28 16:21:59",
+        "updated_at": "2026-05-28 16:25:46",
+        "started_at": "2026-05-28 16:21:59",
+        "finished_at": "2026-05-28 16:25:46",
+        "elapsed_seconds": 335,
+        "error": "本次更新覆盖率过低 (5/5189)，疑似网络/代理或数据源连接异常；已跳过缓存刷新，保留当前 active provider。",
+        "progress_pct": 100,
+        "current_step": "更新失败",
+        "current_stock": null,
+        "provider": "akshare",
+        "processed_count": 5187,
+        "total_count": 5187,
+        "cache_refresh": {
+          "skipped": "low_coverage"
+        },
+        "logs": [
+          {
+            "time": "2026-05-28 16:24:52",
+            "message": "全量重抓: 中国铝业(601600) 3750/5187"
+          },
+          {
+            "time": "2026-05-28 16:24:57",
+            "message": "全量重抓: 麦加芯彩(603062) 3900/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:03",
+            "message": "全量重抓: 诺邦股份(603238) 4050/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:12",
+            "message": "全量重抓: 八方股份(603489) 4200/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:18",
+            "message": "全量重抓: 瑞斯康达(603803) 4350/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:23",
+            "message": "全量重抓: 派克新材(605123) 4500/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:28",
+            "message": "全量重抓: 晶品特装(688084) 4650/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:32",
+            "message": "全量重抓: 国芯科技(688262) 4800/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:37",
+            "message": "全量重抓: 芯联集成(688469) 4950/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:42",
+            "message": "全量重抓: 金迪克(688670) 5100/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:46",
+            "message": "全量重抓: 盛合晶微(688820) 5187/5187"
+          },
+          {
+            "time": "2026-05-28 16:25:46",
+            "message": "本次更新覆盖率过低 (5/5189)，疑似网络/代理或数据源连接异常；已跳过缓存刷新，保留当前 active provider。"
+          }
+        ]
+      }
+    ],
+    "selection_jobs": [],
+    "wyckoff_jobs": []
+  }
+}

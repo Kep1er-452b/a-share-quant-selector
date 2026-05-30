@@ -12,6 +12,7 @@ import json
 import requests
 import random
 import re
+from threading import Lock
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -96,10 +97,85 @@ class AKShareFetcher(BaseDataProvider):
         self.stock_names_file = Path(data_dir) / 'stock_names.json'
         data_source_config = (config or {}).get('data_source', {}) if isinstance(config, dict) else {}
         akshare_config = data_source_config.get('akshare', {}) if isinstance(data_source_config, dict) else {}
+        self.akshare_timeout = self._coerce_number(
+            akshare_config.get('timeout_seconds') or os.getenv('ASHARE_AK_TIMEOUT_SECONDS'),
+            default=12.0,
+            cast=float,
+        )
+        self.tencent_timeout = self._coerce_number(
+            akshare_config.get('fallback_timeout_seconds') or os.getenv('ASHARE_TENCENT_TIMEOUT_SECONDS'),
+            default=15.0,
+            cast=float,
+        )
+        self.network_retries = self._coerce_number(
+            akshare_config.get('network_retries') or os.getenv('ASHARE_NETWORK_RETRIES'),
+            default=2,
+            cast=int,
+        )
+        if self.provider_name == "akshare":
+            self._sync_max_workers = min(
+                self._sync_max_workers,
+                self._coerce_number(
+                    akshare_config.get('max_workers') or os.getenv('ASHARE_AK_MAX_WORKERS'),
+                    default=8,
+                    cast=int,
+                ),
+            )
         self.allow_mock_data = bool(
             akshare_config.get('allow_mock_data', False)
             or str(os.getenv('ASHARE_ALLOW_MOCK_DATA', '')).strip().lower() in {'1', 'true', 'yes'}
         )
+        self._runtime_stats = {}
+        self._runtime_lock = Lock()
+
+    @staticmethod
+    def _coerce_number(value, default, cast=float):
+        try:
+            return cast(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _note_runtime_stat(self, key, amount=1):
+        with self._runtime_lock:
+            self._runtime_stats[key] = self._runtime_stats.get(key, 0) + amount
+
+    def get_runtime_stats(self) -> dict:
+        with self._runtime_lock:
+            return dict(self._runtime_stats)
+
+    def _request_get(self, url, *, params=None, headers=None, timeout=None):
+        """
+        Try the user's normal network first, then direct mode.
+        This keeps VPN/proxy setups working when they are healthy, while still
+        surviving broken system proxies for quote endpoints.
+        """
+        timeout = timeout or self.tencent_timeout
+        headers = headers or {}
+        attempts = (
+            ("env", True),
+            ("direct", False),
+        )
+        last_error = None
+        for attempt in range(max(self.network_retries, 1)):
+            for mode, trust_env in attempts:
+                request_session = requests.Session()
+                request_session.trust_env = trust_env
+                try:
+                    response = request_session.get(
+                        url,
+                        params=params,
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    self._note_runtime_stat(f"http_{mode}_success")
+                    return response
+                except requests.RequestException as exc:
+                    last_error = exc
+                    self._note_runtime_stat(f"http_{mode}_error")
+            if attempt + 1 < max(self.network_retries, 1):
+                time.sleep(min(0.5 * (attempt + 1), 2.0))
+        raise last_error
     
     def _load_local_stock_names(self):
         """从本地文件加载股票名称"""
@@ -136,7 +212,7 @@ class AKShareFetcher(BaseDataProvider):
                         query_codes.append(f"sz{code}")
                 
                 url = f"https://qt.gtimg.cn/q={','.join(query_codes)}"
-                resp = requests.get(url, timeout=30, headers={
+                resp = self._request_get(url, timeout=self.tencent_timeout, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
                 
@@ -320,7 +396,7 @@ class AKShareFetcher(BaseDataProvider):
                 url = f"https://qt.gtimg.cn/q={query_codes}"
                 
                 try:
-                    resp = requests.get(url, timeout=30, headers={
+                    resp = self._request_get(url, timeout=self.tencent_timeout, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     })
                     
@@ -468,11 +544,9 @@ class AKShareFetcher(BaseDataProvider):
         print(f"✓ 加载默认列表: {len(DEFAULT_STOCK_LIST)} 只股票")
         return DEFAULT_STOCK_LIST.copy()
     
-    def _fetch_stock_history_http(self, stock_code, years=6):
+    def _fetch_stock_history_http(self, stock_code, years=6, source='tencent:fqkline'):
         """使用腾讯接口获取股票历史数据"""
         try:
-            import requests
-            
             # 判断市场前缀
             if stock_code.startswith('6') or stock_code.startswith('88'):
                 market_code = 'sh' + stock_code
@@ -484,7 +558,7 @@ class AKShareFetcher(BaseDataProvider):
             max_days = min(years * 365, 1000)  # 最多1000天
             url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={market_code},day,,,{max_days},qfq"
             
-            resp = requests.get(url, timeout=15, headers={
+            resp = self._request_get(url, timeout=self.tencent_timeout, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Referer': 'https://stock.finance.qq.com/'
             })
@@ -536,11 +610,9 @@ class AKShareFetcher(BaseDataProvider):
                 if records:
                     df = pd.DataFrame(records)
                     df['date'] = pd.to_datetime(df['date'])
-                    # 从实时数据获取总市值
-                    market_cap = self._get_realtime_market_cap(stock_code)
-                    df['market_cap'] = market_cap if market_cap else 0
+                    df['market_cap'] = 0
                     df = df.sort_values('date', ascending=False)
-                    return self._mark_data_source(df, 'tencent:fqkline')
+                    return self._mark_data_source(df, source)
             
             return None
         except Exception as e:
@@ -551,7 +623,7 @@ class AKShareFetcher(BaseDataProvider):
         """从实时数据获取总市值"""
         try:
             import akshare as ak
-            spot_df = ak.stock_individual_info_em(symbol=stock_code)
+            spot_df = ak.stock_individual_info_em(symbol=stock_code, timeout=self.akshare_timeout)
             if not spot_df.empty:
                 total_cap_row = spot_df[spot_df['item'] == '总市值']
                 if not total_cap_row.empty:
@@ -584,15 +656,23 @@ class AKShareFetcher(BaseDataProvider):
             return {'ok': False, 'strict_ok': False, 'rows': len(df), 'span_days': 0}
 
         rows = len(df)
+        latest_date = dates.max().date()
         span_days = int((dates.max() - dates.min()).days)
         minimum_rows = 120
         minimum_span_days = 180
+        minimum_recent_listing_rows = 5
+        recent_data_window_days = 14
         preferred_span_days = int(years * 365 * 0.75)
+        looks_like_recent_listing = (
+            rows >= minimum_recent_listing_rows
+            and (datetime.now().date() - latest_date).days <= recent_data_window_days
+        )
         return {
-            'ok': rows >= minimum_rows and span_days >= minimum_span_days,
+            'ok': (rows >= minimum_rows and span_days >= minimum_span_days) or looks_like_recent_listing,
             'strict_ok': rows >= minimum_rows and span_days >= preferred_span_days,
             'rows': rows,
             'span_days': span_days,
+            'recent_listing': looks_like_recent_listing,
         }
     
     def _generate_mock_data(self, stock_code, years=6):
@@ -652,8 +732,7 @@ class AKShareFetcher(BaseDataProvider):
             print(f"  akshare 行情缺少字段: {missing}")
             return None
         df = df[required]
-        market_cap = self._get_realtime_market_cap(stock_code)
-        df['market_cap'] = market_cap if market_cap else 0
+        df['market_cap'] = 0
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date', ascending=False)
         return self._mark_data_source(df, source)
@@ -674,32 +753,47 @@ class AKShareFetcher(BaseDataProvider):
                 period="daily",
                 start_date=start_str,
                 end_date=end_str,
-                adjust="qfq"
+                adjust="qfq",
+                timeout=self.akshare_timeout,
             )
             
             if df is not None and not df.empty:
                 df = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist')
                 coverage = self._history_coverage_report(df, years=years)
                 if coverage['ok']:
+                    self._note_runtime_stat('akshare_history_success')
                     return df
                 print(f"  akshare历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
         except Exception as e:
+            self._note_runtime_stat('akshare_history_error')
             print(f"  akshare获取失败: {e}")
+
+        fallback_df = self._fetch_stock_history_http(
+            stock_code,
+            years=years,
+            source='tencent:fqkline:fallback',
+        )
+        coverage = self._history_coverage_report(fallback_df, years=years)
+        if coverage['ok']:
+            self._note_runtime_stat('tencent_history_fallback_success')
+            return fallback_df
+        if fallback_df is not None and not fallback_df.empty:
+            self._note_runtime_stat('tencent_history_fallback_short')
+            print(f"  腾讯兜底历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
 
         if self.allow_mock_data:
             print("  ⚠️ 已显式启用模拟数据，将生成 demo 行情")
             return self._generate_mock_data(stock_code, years)
 
         print("  ✗ 真实历史数据不可用，已拒绝写入模拟行情")
+        self._note_runtime_stat('history_fetch_failed')
         return None
     
-    def _fetch_stock_update_http(self, stock_code, days=10):
+    def _fetch_stock_update_http(self, stock_code, days=10, source='tencent:fqkline:update'):
         """
         使用腾讯 HTTP 抓取近期数据。TencentFetcher 会显式调用该路径。
         """
         try:
-            import requests
-            
             # 判断市场前缀
             if stock_code.startswith('6') or stock_code.startswith('88'):
                 market_code = 'sh' + stock_code
@@ -711,7 +805,7 @@ class AKShareFetcher(BaseDataProvider):
             fetch_days = min(days + 2, 1000)
             url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={market_code},day,,,{fetch_days},qfq"
             
-            resp = requests.get(url, timeout=15, headers={
+            resp = self._request_get(url, timeout=self.tencent_timeout, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Referer': 'https://stock.finance.qq.com/'
             })
@@ -756,7 +850,7 @@ class AKShareFetcher(BaseDataProvider):
                     df['turnover'] = 0
                     df['market_cap'] = 0
                     df = df.sort_values('date', ascending=False)
-                    return self._mark_data_source(df, 'tencent:fqkline:update')
+                    return self._mark_data_source(df, source)
             
             return None
         except Exception as e:
@@ -776,12 +870,27 @@ class AKShareFetcher(BaseDataProvider):
                 period="daily",
                 start_date=start_date.strftime("%Y%m%d"),
                 end_date=end_date.strftime("%Y%m%d"),
-                adjust="qfq"
+                adjust="qfq",
+                timeout=self.akshare_timeout,
             )
-            return self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist:update')
+            normalized = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist:update')
+            if normalized is not None and not normalized.empty:
+                self._note_runtime_stat('akshare_update_success')
+                return normalized
         except Exception as e:
+            self._note_runtime_stat('akshare_update_error')
             print(f"  akshare获取更新数据失败: {e}")
-            return None
+
+        fallback_df = self._fetch_stock_update_http(
+            stock_code,
+            days=days,
+            source='tencent:fqkline:update:fallback',
+        )
+        if fallback_df is not None and not fallback_df.empty:
+            self._note_runtime_stat('tencent_update_fallback_success')
+            return fallback_df
+        self._note_runtime_stat('update_fetch_failed')
+        return None
     
     def init_full_data(self, max_stocks=None, skip_failed=True):
         """

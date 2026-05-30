@@ -11,6 +11,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from statistics import median
+from threading import Lock
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
@@ -41,6 +42,7 @@ CNINFO_STANDARD_PRIORITY = [
 ]
 
 INDUSTRY_FETCH_MAX_WORKERS = 12
+CNINFO_FETCH_MAX_WORKERS = 1
 INDUSTRY_CACHE_REUSE_MIN_RATIO = 0.95
 INDUSTRY_READY_MAX_UNMAPPED = 100
 INDUSTRY_READY_MAX_UNMAPPED_RATIO = 0.02
@@ -51,6 +53,7 @@ HEATMAP_METRICS = ("daily", "weekly", "monthly", "five_day")
 
 HIDDEN_MARKET_STOCK_CODES = {"300391"}
 HIDDEN_MARKET_STOCK_NAMES = {"长药退"}
+_CNINFO_FETCH_LOCK = Lock()
 
 
 def _load_json(path: Path, default):
@@ -306,6 +309,33 @@ def _stock_csv_files(data_dir: str = "data") -> List[Path]:
     return sorted(Path(data_dir).glob("[0-9][0-9]/*.csv"))
 
 
+def _load_related_industry_items(data_path: Path, csv_codes: set[str]) -> tuple[Dict[str, str], Dict[str, str]]:
+    candidates = []
+    if data_path.parent.name == "providers":
+        providers_root = data_path.parent
+        storage_root = providers_root.parent
+        for provider_name in ("tushare", "tencent", "akshare"):
+            provider_path = providers_root / provider_name
+            if provider_path == data_path:
+                continue
+            candidates.append((provider_path / "industry_map.json", f"{provider_name}_industry_cache"))
+        candidates.append((storage_root / "industry_map.json", "legacy_industry_cache"))
+
+    items: Dict[str, str] = {}
+    sources: Dict[str, str] = {}
+    for path, source in candidates:
+        payload = _load_json(path, {})
+        for code, label in (payload.get("items") or {}).items():
+            code = str(code).zfill(6)
+            if code not in csv_codes or code in items:
+                continue
+            text = _safe_text(label)
+            if text:
+                items[code] = text
+                sources[code] = source
+    return items, sources
+
+
 def _local_stock_data_status(data_dir: str = "data") -> dict:
     data_path = Path(data_dir)
     stock_names = _load_json(data_path / "stock_names.json", {})
@@ -454,12 +484,18 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
     data_path = Path(data_dir)
     previous_cache = load_industry_cache(data_dir)
     previous_items = previous_cache.get("items", {})
-    csv_codes = {path.stem for path in data_path.rglob("*.csv")}
+    csv_codes = {path.stem for path in _stock_csv_files(data_dir)}
     previous_mapping = {
         code: _safe_text(previous_items.get(code))
         for code in csv_codes
         if _safe_text(previous_items.get(code))
     }
+    previous_source_map = {code: "previous_cache" for code in previous_mapping}
+    related_items, related_sources = _load_related_industry_items(data_path, csv_codes)
+    for code, label in related_items.items():
+        if code not in previous_mapping:
+            previous_mapping[code] = label
+            previous_source_map[code] = related_sources.get(code, "related_industry_cache")
     previous_ratio = len(previous_mapping) / max(len(csv_codes), 1)
 
     if previous_mapping and previous_ratio >= INDUSTRY_CACHE_REUSE_MIN_RATIO:
@@ -476,8 +512,10 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
             "eastmoney_count": 0,
             "cninfo_count": 0,
             "reused_count": len(previous_mapping),
+            "related_reused_count": sum(1 for source in previous_source_map.values() if source != "previous_cache"),
             "unmapped_count": len(csv_codes - set(previous_mapping)),
             "items": previous_mapping,
+            "item_sources": previous_source_map,
         }
         _write_json(industry_cache_path(data_dir), payload)
         return payload
@@ -488,7 +526,7 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
     for code, label in previous_mapping.items():
         if code not in mapping:
             mapping[code] = label
-            source_map[code] = "previous_cache"
+            source_map[code] = previous_source_map.get(code, "previous_cache")
 
     if mapping:
         _emit_industry_progress(
@@ -556,11 +594,12 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
 
     def fetch_cninfo_industry(code: str) -> tuple[str, str, str]:
         try:
-            detail_df = ak.stock_industry_change_cninfo(
-                symbol=code,
-                start_date="20000101",
-                end_date="20300101",
-            )
+            with _CNINFO_FETCH_LOCK:
+                detail_df = ak.stock_industry_change_cninfo(
+                    symbol=code,
+                    start_date="20000101",
+                    end_date="20300101",
+                )
         except Exception:
             detail_df = pd.DataFrame()
         return code, choose_cninfo_industry(detail_df), "cninfo"
@@ -570,7 +609,7 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         cninfo_mapping, cninfo_source_map, cninfo_pending = _run_industry_fetch_pool(
             fetch_cninfo_industry,
             missing_codes,
-            INDUSTRY_FETCH_MAX_WORKERS,
+            CNINFO_FETCH_MAX_WORKERS,
         )
         mapping.update(cninfo_mapping)
         source_map.update(cninfo_source_map)
@@ -583,6 +622,7 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
 
     missing_codes = sorted(csv_codes - set(mapping))
     reused_count = sum(1 for source in source_map.values() if source == "previous_cache")
+    related_reused_count = sum(1 for source in source_map.values() if source.endswith("_industry_cache"))
     for code in list(missing_codes):
         cached_label = _safe_text(previous_items.get(code))
         if cached_label:
@@ -598,8 +638,10 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         "eastmoney_count": sum(1 for source in source_map.values() if source == "eastmoney"),
         "cninfo_count": sum(1 for source in source_map.values() if source == "cninfo"),
         "reused_count": reused_count,
+        "related_reused_count": related_reused_count,
         "unmapped_count": len(csv_codes - set(mapping)),
         "items": mapping,
+        "item_sources": source_map,
     }
     if provider_error:
         payload["provider_error"] = provider_error
@@ -773,10 +815,16 @@ def count_market_cap_anomalies(data_dir: str = "data") -> int:
 
 
 def market_cache_health(data_dir: str = "data") -> dict:
-    local_status = _local_stock_data_status(data_dir)
     snapshot = load_snapshot_cache(data_dir)
     industry = load_industry_cache(data_dir)
     indices = load_index_cache(data_dir)
+    if snapshot:
+        local_status = {
+            "latest_date": snapshot.get("latest_date"),
+            "stock_count": int(snapshot.get("stock_count") or 0),
+        }
+    else:
+        local_status = _local_stock_data_status(data_dir)
 
     local_latest = local_status.get("latest_date")
     snapshot_latest = snapshot.get("latest_date")

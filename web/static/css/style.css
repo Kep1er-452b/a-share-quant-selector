@@ -11,12 +11,13 @@
     --down: #ff3131;
     --price-up: #ff3131;
     --price-down: #00c853;
-    --neutral: #888888;
+    --neutral: #b0b0b0;
     --accent: #ff6600;
     --gold: #ffd700;
-    --white: #e0e0e0;
-    --dim: #555555;
-    --verydim: #333333;
+    --white: #f0f0f0;
+    --dim: #8c8c8c;
+    --verydim: #4a4a4a;
+    --text-muted: #b8b8b8;
     --green-panel: #001a00;
     --red-panel: #1a0000;
     --hover-green: #0d1a0d;
@@ -629,7 +630,7 @@ select {
 }
 
 .market-health-grid {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(9, minmax(0, 1fr));
 }
 
 .board-card,
@@ -681,7 +682,7 @@ select {
 }
 
 .pulse-label {
-    color: var(--dim);
+    color: var(--neutral);
     font-size: 9px;
     line-height: 1.35;
     text-transform: uppercase;
@@ -692,6 +693,7 @@ select {
     font-size: 14px;
     font-weight: 700;
     line-height: 1.3;
+    overflow-wrap: anywhere;
 }
 
 .pulse-value.up {
@@ -703,9 +705,30 @@ select {
 }
 
 .pulse-sub {
-    color: var(--dim);
+    color: var(--text-muted);
     font-size: 9px;
     line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+.pulse-value.status-ok {
+    color: var(--up);
+}
+
+.pulse-value.status-warn {
+    color: var(--gold);
+}
+
+.pulse-value.status-bad {
+    color: var(--down);
+}
+
+.provider-health-card {
+    min-width: 0;
+}
+
+.provider-health-card.active {
+    box-shadow: inset 0 2px 0 var(--accent);
 }
 
 .terminal-list {

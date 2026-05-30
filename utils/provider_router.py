@@ -117,6 +117,8 @@ def warehouse_summary(data_dir: str | Path, provider: str) -> dict:
         "coverage_ratio": state.get("coverage_ratio"),
         "is_complete": bool(state.get("is_complete", False)),
         "last_error_report_path": state.get("last_error_report_path"),
+        "status_summary": state.get("status_summary") or {},
+        "runtime_stats": state.get("runtime_stats") or {},
     }
 
 
