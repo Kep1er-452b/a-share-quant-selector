@@ -51,10 +51,12 @@ class B1V242BStrategy(BaseStrategy):
             result["J"] = kdj_df["J"]
         result["J_OK"] = result["J"] <= self.params["J_MAX"]
 
-        result["VOL_YANG1"] = SUM(result["volume"] * result["REAL_YANG"].astype(int), 57)
-        result["VOL_YIN1"] = SUM(result["volume"] * result["REAL_YIN"].astype(int), 57)
-        result["VOL_YANG2"] = SUM(result["volume"] * result["REAL_YANG"].astype(int), 14)
-        result["VOL_YIN2"] = SUM(result["volume"] * result["REAL_YIN"].astype(int), 14)
+        real_yang_volume = result["volume"] * result["REAL_YANG"].astype(int)
+        real_yin_volume = result["volume"] * result["REAL_YIN"].astype(int)
+        result["VOL_YANG1"] = result["VOL_REAL_YANG_57"] if "VOL_REAL_YANG_57" in result.columns else SUM(real_yang_volume, 57)
+        result["VOL_YIN1"] = result["VOL_REAL_YIN_57"] if "VOL_REAL_YIN_57" in result.columns else SUM(real_yin_volume, 57)
+        result["VOL_YANG2"] = result["VOL_REAL_YANG_14"] if "VOL_REAL_YANG_14" in result.columns else SUM(real_yang_volume, 14)
+        result["VOL_YIN2"] = result["VOL_REAL_YIN_14"] if "VOL_REAL_YIN_14" in result.columns else SUM(real_yin_volume, 14)
 
         result["YANGYIN_OK1"] = result["VOL_YANG1"] > self.params["YANGYIN_RATIO_57"] * result["VOL_YIN1"]
         result["YANGYIN_OK2"] = result["VOL_YANG2"] > self.params["YANGYIN_RATIO_14"] * result["VOL_YIN2"]
@@ -64,8 +66,8 @@ class B1V242BStrategy(BaseStrategy):
         result["MV"] = market_cap / 1e8
         result["MVOK"] = market_cap >= mv_min
 
-        o_llv = LLV(result["open"], 21)
-        o_hhv = HHV(result["open"], 21)
+        o_llv = result["OPEN_LLV_21"] if "OPEN_LLV_21" in result.columns else LLV(result["open"], 21)
+        o_hhv = result["OPEN_HHV_21"] if "OPEN_HHV_21" in result.columns else HHV(result["open"], 21)
         result["O85"] = o_llv + self.params["TOP_RANGE_RATIO"] * (o_hhv - o_llv)
         result["TOP15O"] = result["open"] >= result["O85"]
         result["FD15"] = (
@@ -76,7 +78,7 @@ class B1V242BStrategy(BaseStrategy):
         result["CNT28"] = COUNT(result["TOP15O"] & result["FD15"], 21)
         result["GOOD28"] = result["CNT28"] <= 0
 
-        result["AVG40"] = MA(result["volume"], 40)
+        result["AVG40"] = result["AVG_VOLUME_40"] if "AVG_VOLUME_40" in result.columns else MA(result["volume"], 40)
         result["PLRY"] = (
             (result["volume"] > self.params["PLRY_VOL_RATIO"] * ref_vol_1) &
             (result["close"] > result["open"]) &
@@ -119,18 +121,20 @@ class B1V242BStrategy(BaseStrategy):
         )
         result["A1"] = branch_1 | branch_2
 
-        result["HMSHORTWL"] = SMA(SMA(result["close"], 40, 4), 100, 50)
-        result["HMLONGYL"] = 0.5 * (
-            0.2 * MA(result["close"], 12) +
-            0.3 * MA(result["close"], 24) +
-            0.3 * MA(result["close"], 52) +
-            0.2 * MA(result["close"], 108)
-        ) + 0.5 * (
-            0.4 * MA(result["close"], 20) +
-            0.25 * MA(result["close"], 40) +
-            0.25 * MA(result["close"], 80) +
-            0.1 * MA(result["close"], 160)
-        )
+        if "HMSHORTWL" not in result.columns:
+            result["HMSHORTWL"] = SMA(SMA(result["close"], 40, 4), 100, 50)
+        if "HMLONGYL" not in result.columns:
+            result["HMLONGYL"] = 0.5 * (
+                0.2 * MA(result["close"], 12) +
+                0.3 * MA(result["close"], 24) +
+                0.3 * MA(result["close"], 52) +
+                0.2 * MA(result["close"], 108)
+            ) + 0.5 * (
+                0.4 * MA(result["close"], 20) +
+                0.25 * MA(result["close"], 40) +
+                0.25 * MA(result["close"], 80) +
+                0.1 * MA(result["close"], 160)
+            )
 
         tolerance = self.params["B1_TREND_TOLERANCE"]
         result["B1_SIGNAL"] = (

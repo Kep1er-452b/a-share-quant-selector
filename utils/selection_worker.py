@@ -7,7 +7,7 @@ import contextlib
 import io
 from strategy.strategy_registry import StrategyRegistry
 from utils.csv_manager import CSVManager
-from utils.technical import prepare_selection_features
+from utils.technical import prepare_selection_features, prepare_strategy_shared_features
 
 
 _WORKER_CONTEXT = None
@@ -81,6 +81,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
 
         valid_count += 1
         prepared_df = prepare_selection_features(df)
+        prepared_df = prepare_strategy_shared_features(prepared_df, strategies.keys())
         indicator_frames = []
 
         for strategy_name, strategy in strategies.items():
