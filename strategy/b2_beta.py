@@ -65,8 +65,10 @@ class B2BetaStrategy(BaseStrategy):
         result["UPSHADOW"] = result["high"] - np.maximum(result["close"], result["open"])
         result["UP_OK"] = result["UPSHADOW"] <= (result["close"] - ref_close_1) / 2
 
-        result["VOL_YANG"] = SUM(result["volume"] * result["REAL_YANG"].astype(int), 14)
-        result["VOL_YIN"] = SUM(result["volume"] * result["REAL_YIN"].astype(int), 14)
+        real_yang_volume = result["volume"] * result["REAL_YANG"].astype(int)
+        real_yin_volume = result["volume"] * result["REAL_YIN"].astype(int)
+        result["VOL_YANG"] = result["VOL_REAL_YANG_14"] if "VOL_REAL_YANG_14" in result.columns else SUM(real_yang_volume, 14)
+        result["VOL_YIN"] = result["VOL_REAL_YIN_14"] if "VOL_REAL_YIN_14" in result.columns else SUM(real_yin_volume, 14)
         result["YANGYIN_OK"] = result["VOL_YANG"] > self.params["YANGYIN_RATIO_14"] * result["VOL_YIN"]
 
         mv_min = self.params["MV_MIN_BILLION"] * 1e8
@@ -75,9 +77,13 @@ class B2BetaStrategy(BaseStrategy):
         result["MVOK"] = market_cap >= max(mv_min, 1e8)
 
         top_window = self.params["TOP_RANGE_WINDOW"]
-        result["VAR_O85"] = LLV(result["open"], top_window) + self.params["TOP_RANGE_RATIO"] * (
-            HHV(result["open"], top_window) - LLV(result["open"], top_window)
-        )
+        if top_window == 28 and {"OPEN_LLV_28", "OPEN_HHV_28"}.issubset(result.columns):
+            open_llv = result["OPEN_LLV_28"]
+            open_hhv = result["OPEN_HHV_28"]
+        else:
+            open_llv = LLV(result["open"], top_window)
+            open_hhv = HHV(result["open"], top_window)
+        result["VAR_O85"] = open_llv + self.params["TOP_RANGE_RATIO"] * (open_hhv - open_llv)
         result["TOP150"] = result["open"] >= result["VAR_O85"]
         result["FD15"] = (
             (result["close"] < ref_close_1) &
@@ -87,7 +93,7 @@ class B2BetaStrategy(BaseStrategy):
         result["CNT28"] = COUNT(result["TOP150"] & result["FD15"], top_window)
         result["GOOD28"] = result["CNT28"] <= self.params["GOOD28_MAX_COUNT"]
 
-        result["AVG40"] = MA(result["volume"], 40)
+        result["AVG40"] = result["AVG_VOLUME_40"] if "AVG_VOLUME_40" in result.columns else MA(result["volume"], 40)
         plry_window = self.params["PLRY_WINDOW"]
         result["PLRY"] = (
             (result["volume"] > self.params["PLRY_VOL_RATIO"] * ref_vol_1) &

@@ -4,6 +4,16 @@
 import pandas as pd
 import numpy as np
 
+from utils import quant_core
+
+
+def _numeric_array(series) -> np.ndarray:
+    return pd.to_numeric(series, errors='coerce').to_numpy(dtype=np.float64, copy=True)
+
+
+def _series_from_core(values, index, *, dtype=None, name=None) -> pd.Series:
+    return pd.Series(values, index=index, dtype=dtype, name=name)
+
 
 def normalize_price_frame(df: pd.DataFrame, *, descending: bool = True) -> pd.DataFrame:
     """
@@ -38,6 +48,15 @@ def MA(series, n):
     对于倒序数据，MA(n)应该取当前及之后n-1个数据的平均值
     实现方式：反转数据 -> 计算rolling -> 反转回来
     """
+    try:
+        return _series_from_core(
+            quant_core.rolling_mean_forward(_numeric_array(series), n),
+            series.index,
+            name=getattr(series, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     # 反转数据，使数据按时间正序排列
     reversed_series = series.iloc[::-1]
     
@@ -52,6 +71,15 @@ def EMA(series, n):
     """
     指数移动平均 - 正确处理倒序排列的数据
     """
+    try:
+        return _series_from_core(
+            quant_core.ema_forward(_numeric_array(series), n),
+            series.index,
+            name=getattr(series, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_series = series.iloc[::-1]
     ema_reversed = reversed_series.ewm(span=n, adjust=False, min_periods=1).mean()
     return ema_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
@@ -61,6 +89,15 @@ def LLV(series, n):
     """
     N周期最低值 - 正确处理倒序排列的数据
     """
+    try:
+        return _series_from_core(
+            quant_core.rolling_min_forward(_numeric_array(series), n),
+            series.index,
+            name=getattr(series, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_series = series.iloc[::-1]
     llv_reversed = reversed_series.rolling(window=n, min_periods=1).min()
     return llv_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
@@ -70,6 +107,15 @@ def HHV(series, n):
     """
     N周期最高值 - 正确处理倒序排列的数据
     """
+    try:
+        return _series_from_core(
+            quant_core.rolling_max_forward(_numeric_array(series), n),
+            series.index,
+            name=getattr(series, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_series = series.iloc[::-1]
     hhv_reversed = reversed_series.rolling(window=n, min_periods=1).max()
     return hhv_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
@@ -83,6 +129,14 @@ def SMA(X, n, m):
     """
     if len(X) == 0:
         return pd.Series(index=X.index, dtype=float)
+
+    try:
+        return _series_from_core(
+            quant_core.sma_tdx_forward(_numeric_array(X), n, m),
+            X.index,
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
 
     # 转换为 numpy 数组进行计算，比 pandas .iloc 快 50x+
     arr = X.iloc[::-1].reset_index(drop=True).values.astype(float)
@@ -104,6 +158,15 @@ def REF(series, n):
     对于倒序数据（最新在前），REF(series, 1)应该获取"前一天"的数据
     实现方式：反转数据 -> shift -> 反转回来
     """
+    try:
+        return _series_from_core(
+            quant_core.ref_forward(_numeric_array(series), n),
+            series.index,
+            name=getattr(series, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_series = series.iloc[::-1]
     ref_reversed = reversed_series.shift(n)
     return ref_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
@@ -113,6 +176,19 @@ def EXIST(cond, n):
     """
     N周期内是否存在满足COND的情况 - 正确处理倒序排列的数据
     """
+    try:
+        if cond.isna().any():
+            raise quant_core.QuantCoreUnavailable("EXIST NaN semantics are delegated to pandas fallback")
+        values = cond.fillna(False).astype(bool).to_numpy(dtype=np.int8, copy=True)
+        return _series_from_core(
+            quant_core.exist_forward(values, n),
+            cond.index,
+            dtype=bool,
+            name=getattr(cond, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_cond = cond.iloc[::-1]
     exist_reversed = reversed_cond.rolling(window=n, min_periods=1).max().astype(bool)
     return exist_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
@@ -122,6 +198,18 @@ def COUNT(cond, n):
     """
     N周期内满足条件的次数 - 正确处理倒序排列的数据
     """
+    try:
+        if cond.isna().any():
+            raise quant_core.QuantCoreUnavailable("COUNT NaN semantics are delegated to pandas fallback")
+        values = cond.fillna(False).astype(bool).to_numpy(dtype=np.int8, copy=True)
+        return _series_from_core(
+            quant_core.count_forward(values, n),
+            cond.index,
+            name=getattr(cond, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_cond = cond.astype(int).iloc[::-1]
     count_reversed = reversed_cond.rolling(window=n, min_periods=1).sum()
     return count_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
@@ -132,6 +220,15 @@ def SUM(series, n):
     N周期求和 - 正确处理倒序排列的数据
     调用方应保证传入的 series 已是数值类型。
     """
+    try:
+        return _series_from_core(
+            quant_core.rolling_sum_forward(_numeric_array(series), n),
+            series.index,
+            name=getattr(series, 'name', None),
+        )
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
+
     reversed_series = series.iloc[::-1]
     sum_reversed = reversed_series.rolling(window=n, min_periods=1).sum()
     return sum_reversed.iloc[::-1].reset_index(drop=True).set_axis(series.index)
@@ -181,6 +278,20 @@ def KDJ(df, n=9, m1=3, m2=3):
     close_arr = df_calc['close'].values.astype(float)
     low_arr = df_calc['low'].values.astype(float)
     high_arr = df_calc['high'].values.astype(float)
+
+    try:
+        k, d, j = quant_core.kdj_ascending(close_arr, low_arr, high_arr, n, m1, m2)
+        result = pd.DataFrame({
+            'K': k,
+            'D': d,
+            'J': j
+        })
+        if is_descending:
+            result = result.iloc[::-1].reset_index(drop=True)
+        result.index = df.index
+        return result
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
+        pass
     
     # 计算RSV - 向量化
     low_min = pd.Series(low_arr).rolling(window=n, min_periods=1).min().values
@@ -225,6 +336,29 @@ def prepare_selection_features(df, include_standard_trend=True):
     """
     result = normalize_price_frame(df, descending=True)
 
+    core_columns = {'ref_close_1', 'ref_vol_1', 'REAL_YANG', 'REAL_YIN', 'K', 'D', 'J'}
+    if include_standard_trend:
+        core_columns |= {'short_term_trend', 'bull_bear_line'}
+
+    if result.empty:
+        return result
+
+    if not core_columns.issubset(result.columns):
+        try:
+            features = quant_core.selection_features_forward(
+                result['open'].to_numpy(),
+                result['high'].to_numpy(),
+                result['low'].to_numpy(),
+                result['close'].to_numpy(),
+                result['volume'].to_numpy(),
+                include_trend=include_standard_trend,
+            )
+            for column, values in features.items():
+                if column not in result.columns:
+                    result[column] = values
+        except (quant_core.QuantCoreUnavailable, ValueError, TypeError, KeyError):
+            pass
+
     if 'ref_close_1' not in result.columns:
         result['ref_close_1'] = REF(result['close'], 1)
     if 'ref_vol_1' not in result.columns:
@@ -264,6 +398,21 @@ def calculate_zhixing_trend(df, m1=14, m2=28, m3=57, m4=114):
         m1, m2, m3, m4: 多空线计算用的MA周期，默认14, 28, 57, 114
     """
     df = normalize_price_frame(df, descending=True)
+    try:
+        short_values, bull_values = quant_core.zhixing_trend_forward(
+            _numeric_array(df['close']),
+            m1=m1,
+            m2=m2,
+            m3=m3,
+            m4=m4,
+        )
+        return pd.DataFrame({
+            'short_term_trend': short_values,
+            'bull_bear_line': bull_values
+        }, index=df.index)
+    except (quant_core.QuantCoreUnavailable, ValueError, TypeError, KeyError):
+        pass
+
     # 知行短期趋势线 = EMA(EMA(CLOSE,10),10)
     short_term_trend = EMA(EMA(df['close'], 10), 10)
     
@@ -275,6 +424,70 @@ def calculate_zhixing_trend(df, m1=14, m2=28, m3=57, m4=114):
         'short_term_trend': short_term_trend,
         'bull_bear_line': bull_bear_line
     }, index=df.index)
+
+
+_B1_B2_SHARED_STRATEGIES = {
+    'B1V242BStrategy',
+    'B1V242PStrategy',
+    'B1MinJComplexStrategy',
+    'B2BetaStrategy',
+}
+
+
+def prepare_strategy_shared_features(df: pd.DataFrame, strategy_names=None) -> pd.DataFrame:
+    """
+    Precompute rolling columns shared by the high-volume selection strategies.
+    """
+    names = set(strategy_names or [])
+    if names and not (names & _B1_B2_SHARED_STRATEGIES):
+        return df
+
+    result = df.copy()
+    if result.empty:
+        return result
+
+    if not {'REAL_YANG', 'REAL_YIN'}.issubset(result.columns):
+        result = prepare_selection_features(result)
+
+    volume = pd.to_numeric(result['volume'], errors='coerce')
+    real_yang_volume = volume * result['REAL_YANG'].astype(int)
+    real_yin_volume = volume * result['REAL_YIN'].astype(int)
+
+    for window in (14, 28, 57):
+        yang_column = f'VOL_REAL_YANG_{window}'
+        yin_column = f'VOL_REAL_YIN_{window}'
+        if yang_column not in result.columns:
+            result[yang_column] = SUM(real_yang_volume, window)
+        if yin_column not in result.columns:
+            result[yin_column] = SUM(real_yin_volume, window)
+
+    if 'AVG_VOLUME_40' not in result.columns:
+        result['AVG_VOLUME_40'] = MA(volume, 40)
+
+    for window in (21, 28):
+        llv_column = f'OPEN_LLV_{window}'
+        hhv_column = f'OPEN_HHV_{window}'
+        if llv_column not in result.columns:
+            result[llv_column] = LLV(result['open'], window)
+        if hhv_column not in result.columns:
+            result[hhv_column] = HHV(result['open'], window)
+
+    if 'HMSHORTWL' not in result.columns:
+        result['HMSHORTWL'] = SMA(SMA(result['close'], 40, 4), 100, 50)
+    if 'HMLONGYL' not in result.columns:
+        result['HMLONGYL'] = 0.5 * (
+            0.2 * MA(result['close'], 12) +
+            0.3 * MA(result['close'], 24) +
+            0.3 * MA(result['close'], 52) +
+            0.2 * MA(result['close'], 108)
+        ) + 0.5 * (
+            0.4 * MA(result['close'], 20) +
+            0.25 * MA(result['close'], 40) +
+            0.25 * MA(result['close'], 80) +
+            0.1 * MA(result['close'], 160)
+        )
+
+    return result
 
 
 def _bars_last_count(cond: pd.Series) -> pd.Series:
