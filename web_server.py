@@ -529,9 +529,15 @@ def _bounded_text(value, field_name, *, max_length=200, allow_empty=True):
     return text
 
 
+_SHORT_JOB_ID_RE = re.compile(r"^[0-9a-fA-F]{12}$")
+
+
 def _validate_job_id(job_id):
+    text = str(job_id or "").strip()
+    if _SHORT_JOB_ID_RE.fullmatch(text):
+        return text.lower()
     try:
-        return str(uuid.UUID(str(job_id)))
+        return str(uuid.UUID(text))
     except (TypeError, ValueError):
         raise ValueError("任务 ID 格式无效")
 

@@ -29,6 +29,26 @@ def test_job_status_rejects_malformed_ids():
     assert response.status_code == 400
 
 
+def test_status_accepts_existing_short_job_ids():
+    client = web_server.app.test_client()
+    selection_job_id = web_server._create_selection_job(["main"], ["B1V242BStrategy"])
+    update_job_id = web_server._create_update_job("tencent")
+
+    try:
+        response = client.get(f"/api/select/status/{selection_job_id}")
+        assert response.status_code == 200
+        assert response.get_json()["data"]["job_id"] == selection_job_id
+
+        response = client.get(f"/api/update/status/{update_job_id}")
+        assert response.status_code == 200
+        assert response.get_json()["data"]["job_id"] == update_job_id
+    finally:
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.pop(selection_job_id, None)
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.pop(update_job_id, None)
+
+
 def test_write_endpoints_validate_payload_shape_and_lengths():
     client = web_server.app.test_client()
 
