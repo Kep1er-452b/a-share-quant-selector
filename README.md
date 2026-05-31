@@ -2,7 +2,7 @@
 
 # A-Share Quant Selector
 
-基于 Python 的 A 股量化选股系统，支持 `akshare` / `tushare` 双数据源，实现碗口反弹策略，支持 K 线图可视化、Web 管理界面和钉钉自动通知。
+基于 Python 的 开源A股量化选股系统，支持 “akshare” / “tushare” “Tencent”数据源，实现碗口反弹策略，支持 K 线图可视化、Web 管理界面和钉钉自动通知。
 
 ## 📋 TODO 清单
 
@@ -558,4 +558,4 @@ MIT License
 
 ---
 
-**GitHub**: https://github.com/Dzy-HW-XD/a-share-quant-selector
+
