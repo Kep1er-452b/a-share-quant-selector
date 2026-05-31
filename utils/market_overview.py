@@ -417,6 +417,7 @@ def build_snapshot_cache(data_dir: str = "data", progress_callback: Optional[Cal
                         current_stock={"code": csv_path.stem, "name": stock_names.get(csv_path.stem, "未知")},
                     )
 
+    records.sort(key=lambda item: str(item.get("code") or ""))
     latest_date = max((item["latest_date"] for item in records), default=None)
     payload = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

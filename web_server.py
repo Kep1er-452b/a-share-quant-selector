@@ -1575,6 +1575,7 @@ def get_stocks():
             ]
             if requested_board in {"main", "chinext", "star"}:
                 rows = [row for row in rows if row.get('board') == requested_board]
+            rows.sort(key=lambda row: str(row.get('code') or ''))
 
             start_idx = (page - 1) * per_page
             end_idx = start_idx + per_page

@@ -49,6 +49,30 @@ def test_status_accepts_existing_short_job_ids():
             web_server.update_jobs.pop(update_job_id, None)
 
 
+def test_stock_snapshot_rows_are_sorted_by_code_before_pagination(monkeypatch):
+    client = web_server.app.test_client()
+    snapshot = {
+        "stocks": [
+            {"code": "300001", "name": "Gamma", "latest_price": 3, "latest_date": "2026-05-29", "market_cap": 300},
+            {"code": "000002", "name": "Beta", "latest_price": 2, "latest_date": "2026-05-29", "market_cap": 200},
+            {"code": "000001", "name": "Alpha", "latest_price": 1, "latest_date": "2026-05-29", "market_cap": 100},
+        ]
+    }
+    monkeypatch.setattr(web_server, "load_market_caches", lambda data_dir: {"snapshot": snapshot})
+    monkeypatch.setattr(web_server, "_load_stock_names", lambda: {})
+    monkeypatch.setattr(web_server, "_load_stock_row_counts", lambda data_dir: {})
+
+    response = client.get("/api/stocks?page=1&per_page=2")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert [item["code"] for item in payload["data"]] == ["000001", "000002"]
+
+    response = client.get("/api/stocks?page=2&per_page=2")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert [item["code"] for item in payload["data"]] == ["300001"]
+
+
 def test_write_endpoints_validate_payload_shape_and_lengths():
     client = web_server.app.test_client()
 

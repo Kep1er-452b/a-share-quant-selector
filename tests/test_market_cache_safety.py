@@ -6,6 +6,7 @@ import json
 
 import pandas as pd
 
+from utils import market_overview
 from utils.market_overview import build_industry_cache
 
 
@@ -82,3 +83,31 @@ def test_provider_industry_cache_reuses_sibling_provider(monkeypatch, tmp_path):
     assert payload["unmapped_count"] == 0
     assert payload["related_reused_count"] == 2
     assert payload["items"] == {"000001": "银行", "000002": "房地产"}
+
+
+def test_snapshot_cache_stocks_are_sorted_by_code(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    csv_paths = [data_dir / "30" / "300001.csv", data_dir / "00" / "000002.csv", data_dir / "00" / "000001.csv"]
+
+    def fake_read_stock_snapshot(csv_path, stock_names):
+        code = csv_path.stem
+        return {
+            "code": code,
+            "name": code,
+            "board": "main",
+            "latest_date": "2026-05-29",
+            "latest_price": 10,
+            "market_cap": 100,
+            "data_count": 1,
+            "metrics": {},
+        }
+
+    monkeypatch.setattr(market_overview, "_stock_csv_files", lambda data_dir: csv_paths)
+    monkeypatch.setattr(market_overview, "_read_stock_snapshot", fake_read_stock_snapshot)
+
+    payload = market_overview.build_snapshot_cache(data_dir=str(data_dir))
+
+    assert [item["code"] for item in payload["stocks"]] == ["000001", "000002", "300001"]
+    saved_payload = json.loads((data_dir / "heatmap_snapshot.json").read_text(encoding="utf-8"))
+    assert [item["code"] for item in saved_payload["stocks"]] == ["000001", "000002", "300001"]
