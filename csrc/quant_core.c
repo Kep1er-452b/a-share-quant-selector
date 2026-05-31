@@ -21,18 +21,17 @@ int qc_rolling_mean_forward(const double *values, int64_t length, int window, do
     if (status != QC_OK) {
         return status;
     }
-    for (int64_t i = 0; i < length; i++) {
-        int64_t end = i + window;
-        if (end > length) {
-            end = length;
+    double sum = 0.0;
+    int64_t count = 0;
+    for (int64_t i = length; i-- > 0;) {
+        if (!isnan(values[i])) {
+            sum += values[i];
+            count++;
         }
-        double sum = 0.0;
-        int64_t count = 0;
-        for (int64_t j = i; j < end; j++) {
-            if (!isnan(values[j])) {
-                sum += values[j];
-                count++;
-            }
+        int64_t stale = i + (int64_t)window;
+        if (stale < length && !isnan(values[stale])) {
+            sum -= values[stale];
+            count--;
         }
         out[i] = count > 0 ? sum / (double)count : NAN;
     }
@@ -44,18 +43,17 @@ int qc_rolling_sum_forward(const double *values, int64_t length, int window, dou
     if (status != QC_OK) {
         return status;
     }
-    for (int64_t i = 0; i < length; i++) {
-        int64_t end = i + window;
-        if (end > length) {
-            end = length;
+    double sum = 0.0;
+    int64_t count = 0;
+    for (int64_t i = length; i-- > 0;) {
+        if (!isnan(values[i])) {
+            sum += values[i];
+            count++;
         }
-        double sum = 0.0;
-        int64_t count = 0;
-        for (int64_t j = i; j < end; j++) {
-            if (!isnan(values[j])) {
-                sum += values[j];
-                count++;
-            }
+        int64_t stale = i + (int64_t)window;
+        if (stale < length && !isnan(values[stale])) {
+            sum -= values[stale];
+            count--;
         }
         out[i] = count > 0 ? sum : NAN;
     }
@@ -67,19 +65,32 @@ int qc_rolling_min_forward(const double *values, int64_t length, int window, dou
     if (status != QC_OK) {
         return status;
     }
-    for (int64_t i = 0; i < length; i++) {
-        int64_t end = i + window;
-        if (end > length) {
-            end = length;
-        }
-        double best = NAN;
-        for (int64_t j = i; j < end; j++) {
-            if (!isnan(values[j]) && (isnan(best) || values[j] < best)) {
-                best = values[j];
-            }
-        }
-        out[i] = best;
+    if (length == 0) {
+        return QC_OK;
     }
+
+    int64_t *deque = (int64_t *)malloc((size_t)length * sizeof(int64_t));
+    if (deque == NULL) {
+        return QC_ERR_ALLOC;
+    }
+
+    int64_t head = 0;
+    int64_t tail = 0;
+    for (int64_t i = length; i-- > 0;) {
+        int64_t stale_start = i + (int64_t)window;
+        while (head < tail && deque[head] >= stale_start) {
+            head++;
+        }
+        if (!isnan(values[i])) {
+            while (head < tail && values[deque[tail - 1]] >= values[i]) {
+                tail--;
+            }
+            deque[tail++] = i;
+        }
+        out[i] = head < tail ? values[deque[head]] : NAN;
+    }
+
+    free(deque);
     return QC_OK;
 }
 
@@ -88,19 +99,32 @@ int qc_rolling_max_forward(const double *values, int64_t length, int window, dou
     if (status != QC_OK) {
         return status;
     }
-    for (int64_t i = 0; i < length; i++) {
-        int64_t end = i + window;
-        if (end > length) {
-            end = length;
-        }
-        double best = NAN;
-        for (int64_t j = i; j < end; j++) {
-            if (!isnan(values[j]) && (isnan(best) || values[j] > best)) {
-                best = values[j];
-            }
-        }
-        out[i] = best;
+    if (length == 0) {
+        return QC_OK;
     }
+
+    int64_t *deque = (int64_t *)malloc((size_t)length * sizeof(int64_t));
+    if (deque == NULL) {
+        return QC_ERR_ALLOC;
+    }
+
+    int64_t head = 0;
+    int64_t tail = 0;
+    for (int64_t i = length; i-- > 0;) {
+        int64_t stale_start = i + (int64_t)window;
+        while (head < tail && deque[head] >= stale_start) {
+            head++;
+        }
+        if (!isnan(values[i])) {
+            while (head < tail && values[deque[tail - 1]] <= values[i]) {
+                tail--;
+            }
+            deque[tail++] = i;
+        }
+        out[i] = head < tail ? values[deque[head]] : NAN;
+    }
+
+    free(deque);
     return QC_OK;
 }
 
@@ -114,16 +138,14 @@ int qc_count_forward(const int8_t *values, int64_t length, int window, double *o
     if (window <= 0) {
         return QC_ERR_WINDOW;
     }
-    for (int64_t i = 0; i < length; i++) {
-        int64_t end = i + window;
-        if (end > length) {
-            end = length;
+    int64_t count = 0;
+    for (int64_t i = length; i-- > 0;) {
+        if (values[i] != 0) {
+            count++;
         }
-        int64_t count = 0;
-        for (int64_t j = i; j < end; j++) {
-            if (values[j] != 0) {
-                count++;
-            }
+        int64_t stale = i + (int64_t)window;
+        if (stale < length && values[stale] != 0) {
+            count--;
         }
         out[i] = (double)count;
     }
@@ -140,19 +162,16 @@ int qc_exist_forward(const int8_t *values, int64_t length, int window, int8_t *o
     if (window <= 0) {
         return QC_ERR_WINDOW;
     }
-    for (int64_t i = 0; i < length; i++) {
-        int64_t end = i + window;
-        if (end > length) {
-            end = length;
+    int64_t count = 0;
+    for (int64_t i = length; i-- > 0;) {
+        if (values[i] != 0) {
+            count++;
         }
-        int8_t found = 0;
-        for (int64_t j = i; j < end; j++) {
-            if (values[j] != 0) {
-                found = 1;
-                break;
-            }
+        int64_t stale = i + (int64_t)window;
+        if (stale < length && values[stale] != 0) {
+            count--;
         }
-        out[i] = found;
+        out[i] = (int8_t)(count > 0);
     }
     return QC_OK;
 }
@@ -203,36 +222,70 @@ int qc_sma_tdx_forward(const double *values, int64_t length, int period, int wei
     return QC_OK;
 }
 
-static void rolling_min_ascending(const double *values, int64_t length, int window, double *out) {
+static int rolling_min_ascending(const double *values, int64_t length, int window, double *out) {
+    if (length == 0) {
+        return QC_OK;
+    }
+
+    int64_t *deque = (int64_t *)malloc((size_t)length * sizeof(int64_t));
+    if (deque == NULL) {
+        return QC_ERR_ALLOC;
+    }
+
+    int64_t head = 0;
+    int64_t tail = 0;
     for (int64_t i = 0; i < length; i++) {
         int64_t start = i - window + 1;
         if (start < 0) {
             start = 0;
         }
-        double best = NAN;
-        for (int64_t j = start; j <= i; j++) {
-            if (!isnan(values[j]) && (isnan(best) || values[j] < best)) {
-                best = values[j];
-            }
+        while (head < tail && deque[head] < start) {
+            head++;
         }
-        out[i] = best;
+        if (!isnan(values[i])) {
+            while (head < tail && values[deque[tail - 1]] >= values[i]) {
+                tail--;
+            }
+            deque[tail++] = i;
+        }
+        out[i] = head < tail ? values[deque[head]] : NAN;
     }
+
+    free(deque);
+    return QC_OK;
 }
 
-static void rolling_max_ascending(const double *values, int64_t length, int window, double *out) {
+static int rolling_max_ascending(const double *values, int64_t length, int window, double *out) {
+    if (length == 0) {
+        return QC_OK;
+    }
+
+    int64_t *deque = (int64_t *)malloc((size_t)length * sizeof(int64_t));
+    if (deque == NULL) {
+        return QC_ERR_ALLOC;
+    }
+
+    int64_t head = 0;
+    int64_t tail = 0;
     for (int64_t i = 0; i < length; i++) {
         int64_t start = i - window + 1;
         if (start < 0) {
             start = 0;
         }
-        double best = NAN;
-        for (int64_t j = start; j <= i; j++) {
-            if (!isnan(values[j]) && (isnan(best) || values[j] > best)) {
-                best = values[j];
-            }
+        while (head < tail && deque[head] < start) {
+            head++;
         }
-        out[i] = best;
+        if (!isnan(values[i])) {
+            while (head < tail && values[deque[tail - 1]] <= values[i]) {
+                tail--;
+            }
+            deque[tail++] = i;
+        }
+        out[i] = head < tail ? values[deque[head]] : NAN;
     }
+
+    free(deque);
+    return QC_OK;
 }
 
 int qc_kdj_ascending(
@@ -268,8 +321,18 @@ int qc_kdj_ascending(
         return QC_ERR_ALLOC;
     }
 
-    rolling_min_ascending(low, length, period, low_min);
-    rolling_max_ascending(high, length, period, high_max);
+    int status = rolling_min_ascending(low, length, period, low_min);
+    if (status != QC_OK) {
+        free(low_min);
+        free(high_max);
+        return status;
+    }
+    status = rolling_max_ascending(high, length, period, high_max);
+    if (status != QC_OK) {
+        free(low_min);
+        free(high_max);
+        return status;
+    }
 
     k_out[0] = 50.0;
     d_out[0] = 50.0;

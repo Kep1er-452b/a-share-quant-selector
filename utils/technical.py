@@ -8,7 +8,12 @@ from utils import quant_core
 
 
 def _numeric_array(series) -> np.ndarray:
-    return pd.to_numeric(series, errors='coerce').to_numpy(dtype=np.float64, copy=True)
+    numeric = pd.to_numeric(series, errors='coerce')
+    if hasattr(numeric, 'to_numpy'):
+        values = numeric.to_numpy(dtype=np.float64, copy=False)
+    else:
+        values = np.asarray(numeric, dtype=np.float64)
+    return np.ascontiguousarray(values, dtype=np.float64)
 
 
 def _series_from_core(values, index, *, dtype=None, name=None) -> pd.Series:
@@ -346,11 +351,11 @@ def prepare_selection_features(df, include_standard_trend=True):
     if not core_columns.issubset(result.columns):
         try:
             features = quant_core.selection_features_forward(
-                result['open'].to_numpy(),
-                result['high'].to_numpy(),
-                result['low'].to_numpy(),
-                result['close'].to_numpy(),
-                result['volume'].to_numpy(),
+                result['open'].to_numpy(dtype=np.float64, copy=False),
+                result['high'].to_numpy(dtype=np.float64, copy=False),
+                result['low'].to_numpy(dtype=np.float64, copy=False),
+                result['close'].to_numpy(dtype=np.float64, copy=False),
+                result['volume'].to_numpy(dtype=np.float64, copy=False),
                 include_trend=include_standard_trend,
             )
             for column, values in features.items():

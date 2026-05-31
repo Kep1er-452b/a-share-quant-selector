@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import platform
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -23,10 +24,25 @@ def library_name() -> str:
     return "libquant_core.so"
 
 
-def build(compiler: str = "clang", extra_cflags: list[str] | None = None) -> Path:
+def resolve_compiler(compiler: str | None = None) -> str:
+    if compiler:
+        if shutil.which(compiler):
+            return compiler
+        if compiler == "clang" and shutil.which("gcc"):
+            return "gcc"
+        return compiler
+
+    for candidate in ("clang", "gcc", "cc"):
+        if shutil.which(candidate):
+            return candidate
+    return "clang"
+
+
+def build(compiler: str | None = None, extra_cflags: list[str] | None = None) -> Path:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     output = BUILD_DIR / library_name()
     system = platform.system()
+    compiler = resolve_compiler(compiler)
     command = [compiler, "-O3", "-std=c11", "-Wall", "-Wextra", "-fPIC", "-I", str(ROOT / "csrc")]
     if extra_cflags:
         command.extend(extra_cflags)
@@ -43,7 +59,7 @@ def build(compiler: str = "clang", extra_cflags: list[str] | None = None) -> Pat
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the quant_core shared library.")
-    parser.add_argument("--compiler", default="clang", help="C compiler executable to use.")
+    parser.add_argument("--compiler", default=None, help="C compiler executable to use. Defaults to clang, then gcc.")
     parser.add_argument("--extra-cflag", action="append", default=[], help="Additional C compiler flag.")
     args = parser.parse_args()
     output = build(args.compiler, args.extra_cflag)

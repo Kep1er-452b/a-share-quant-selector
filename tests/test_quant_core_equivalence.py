@@ -32,6 +32,7 @@ from utils.technical import (
     calculate_zhixing_trend,
     prepare_selection_features,
 )
+from scripts import build_quant_core
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +109,26 @@ def test_core_series_indicators_match_python_fallback(monkeypatch):
     pd.testing.assert_series_equal(actual_exist, expected_exist)
 
 
+def test_large_window_rolling_indicators_match_python_fallback(monkeypatch):
+    frame = _price_frame(240).iloc[::-1].reset_index(drop=True)
+    close = frame["close"].copy()
+    volume = frame["volume"].astype(float).copy()
+    close.iloc[[3, 57, 118]] = np.nan
+    volume.iloc[[11, 86, 201]] = np.nan
+
+    comparisons = [
+        (MA, (close, 114)),
+        (MA, (close, 260)),
+        (LLV, (close, 114)),
+        (HHV, (close, 114)),
+        (SUM, (volume, 160)),
+    ]
+    for func, args in comparisons:
+        expected = _with_python_fallback(monkeypatch, func, *args)
+        actual = func(*args)
+        pd.testing.assert_series_equal(actual, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_core_dataframe_indicators_match_python_fallback(monkeypatch):
     frames = [
         _price_frame(120),
@@ -137,6 +158,22 @@ def test_prepare_selection_features_matches_python_fallback(monkeypatch):
             pd.testing.assert_series_equal(actual[column], expected[column], rtol=1e-12, atol=1e-12)
 
 
+def test_prepare_selection_features_accepts_integer_price_columns(monkeypatch):
+    frame = _price_frame(100).iloc[::-1].reset_index(drop=True)
+    for column in ["open", "high", "low", "close", "volume"]:
+        frame[column] = np.round(frame[column]).astype(np.int64)
+
+    expected = _with_python_fallback(monkeypatch, prepare_selection_features, frame.copy())
+    actual = prepare_selection_features(frame.copy())
+
+    columns = ["ref_close_1", "ref_vol_1", "REAL_YANG", "REAL_YIN", "K", "D", "J", "short_term_trend", "bull_bear_line"]
+    for column in columns:
+        if expected[column].dtype == bool:
+            pd.testing.assert_series_equal(actual[column], expected[column])
+        else:
+            pd.testing.assert_series_equal(actual[column], expected[column], rtol=1e-12, atol=1e-12)
+
+
 def test_quant_core_missing_library_falls_back(monkeypatch):
     frame = _price_frame(40)
     expected = _with_python_fallback(monkeypatch, MA, frame["close"], 5)
@@ -146,6 +183,17 @@ def test_quant_core_missing_library_falls_back(monkeypatch):
     assert not quant_core.available()
     actual = MA(frame["close"], 5)
     pd.testing.assert_series_equal(actual, expected)
+
+
+def test_build_script_uses_gcc_when_default_clang_is_missing(monkeypatch):
+    def fake_which(name):
+        if name == "gcc":
+            return "/usr/bin/gcc"
+        return None
+
+    monkeypatch.setattr(build_quant_core.shutil, "which", fake_which)
+    assert build_quant_core.resolve_compiler() == "gcc"
+    assert build_quant_core.resolve_compiler("clang") == "gcc"
 
 
 def _strategy_names():
