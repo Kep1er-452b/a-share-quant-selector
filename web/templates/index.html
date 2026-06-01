@@ -523,6 +523,26 @@
                         <div class="panel-body control-stack">
                             <div class="control-section">
                                 <div class="control-section-head">
+                                    <span class="control-section-title">FORMULA ENGINE</span>
+                                    <span class="control-section-meta" id="formula-status">IDLE</span>
+                                </div>
+                                <div class="formula-panel">
+                                    <label class="formula-enable-row">
+                                        <input id="formula-enabled" type="checkbox">
+                                        <span>启用条件公式</span>
+                                    </label>
+                                    <input id="formula-name" class="formula-name-input" type="text" value="条件公式选股">
+                                    <textarea id="formula-expression" class="formula-expression" spellcheck="false">CLOSE &gt; MA(CLOSE, 20) AND J &lt; 20 AND VOL &gt; REF(VOL, 1) * 2</textarea>
+                                    <div class="formula-actions">
+                                        <button class="btn btn-secondary" id="formula-validate-btn" type="button">检查公式</button>
+                                        <button class="btn btn-ghost formula-example-btn" data-formula="CLOSE &gt; MA(CLOSE, 20) AND J &lt; 20 AND VOL &gt; REF(VOL, 1) * 2" type="button">均线+低J+放量</button>
+                                        <button class="btn btn-ghost formula-example-btn" data-formula="CROSS(MA(CLOSE, 5), MA(CLOSE, 20)) AND VOL &gt; MA(VOL, 5)" type="button">均线金叉</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="control-section">
+                                <div class="control-section-head">
                                     <span class="control-section-title">BOARD SCOPE</span>
                                     <span class="control-section-meta" id="board-selection-meta">3 / 3 已选</span>
                                 </div>

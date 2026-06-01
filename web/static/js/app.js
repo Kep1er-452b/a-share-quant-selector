@@ -32,6 +32,10 @@ const state = {
     stocksLoadingPromise: null,
     stockSearchTimer: null,
     strategies: [],
+    openStrategyParams: new Set(),
+    dirtyStrategyParams: new Set(),
+    openConfigStrategies: new Set(),
+    dirtyConfigStrategies: new Set(),
     boardOptions: [],
     boardCounts: {},
     selectionOptionsLoaded: false,
@@ -3150,15 +3154,163 @@ function renderStrategyOptions(strategies) {
         return;
     }
 
-    container.innerHTML = strategies.map(strategy => `
-        <label class="strategy-option">
-            <input class="option-input" type="checkbox" name="strategy" value="${escapeHtml(strategy.name)}" checked>
-            <span class="strategy-option-card">
-                <span class="strategy-option-name">${escapeHtml(strategy.name)}</span>
-                <span class="strategy-option-meta">${formatNumber(strategy.param_count)} 个参数</span>
-            </span>
-        </label>
-    `).join('');
+    container.innerHTML = strategies.map(strategy => {
+        const params = strategy.params || {};
+        const entries = flattenConfigEntries(params);
+        const isOpen = state.openStrategyParams.has(strategy.name);
+        const rows = entries.map(entry => {
+            const inputType = typeof entry.value === 'number' ? 'number' : 'text';
+            const step = typeof entry.value === 'number' && !Number.isInteger(entry.value) ? 'any' : '1';
+            return `
+                <div class="selection-param-row">
+                    <span class="param-label">${escapeHtml(entry.label)}</span>
+                    <input
+                        class="param-input selection-param-input"
+                        type="${inputType}"
+                        step="${step}"
+                        value="${escapeHtml(entry.value)}"
+                        data-strategy="${escapeHtml(strategy.name)}"
+                        data-path="${escapeHtml(entry.path)}">
+                </div>
+            `;
+        }).join('');
+
+        return `
+            <div class="strategy-option strategy-accordion ${isOpen ? 'open' : ''}" data-strategy="${escapeHtml(strategy.name)}">
+                <div class="strategy-option-card strategy-accordion-head">
+                    <label class="strategy-check">
+                        <input class="option-input" type="checkbox" name="strategy" value="${escapeHtml(strategy.name)}" checked>
+                        <span class="strategy-option-name">${escapeHtml(strategy.name)}</span>
+                    </label>
+                    <span class="strategy-option-meta">${formatNumber(strategy.param_count)} 个参数</span>
+                    <button class="text-action strategy-param-toggle" type="button" data-strategy="${escapeHtml(strategy.name)}">
+                        ${isOpen ? '保存' : '参数'}
+                    </button>
+                </div>
+                <div class="strategy-param-panel" ${isOpen ? '' : 'hidden'}>
+                    ${rows || '<div class="state-empty">无可编辑参数</div>'}
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function getFormulaPayload() {
+    const enabled = Boolean(document.getElementById('formula-enabled')?.checked);
+    const expression = document.getElementById('formula-expression')?.value.trim() || '';
+    const name = document.getElementById('formula-name')?.value.trim() || '条件公式选股';
+    return {
+        enabled: enabled && Boolean(expression),
+        expression,
+        name,
+    };
+}
+
+function formulaEnabledForRun() {
+    const payload = getFormulaPayload();
+    return payload.enabled;
+}
+
+function setFormulaStatus(text, tone = '') {
+    const status = document.getElementById('formula-status');
+    if (!status) {
+        return;
+    }
+    status.textContent = text;
+    status.className = `control-section-meta${tone ? ` ${tone}` : ''}`;
+}
+
+async function validateFormula() {
+    const payload = getFormulaPayload();
+    if (!payload.expression) {
+        setFormulaStatus('EMPTY', 'down');
+        toast('请输入条件公式', 'error');
+        return false;
+    }
+
+    try {
+        const result = await apiFetch('/api/formula/validate', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                formula: payload.expression,
+                name: payload.name,
+            }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '公式检查失败');
+        }
+        setFormulaStatus('READY', 'highlight');
+        toast('公式检查通过', 'success');
+        return true;
+    } catch (error) {
+        setFormulaStatus('ERROR', 'down');
+        toast(`公式检查失败: ${error.message}`, 'error');
+        return false;
+    }
+}
+
+function collectStrategyParams(strategyName, scopeSelector) {
+    const params = {};
+    document.querySelectorAll(`${scopeSelector} .selection-param-input[data-strategy="${CSS.escape(strategyName)}"]`).forEach(input => {
+        assignNested(params, input.dataset.path, parseInputValue(input.value));
+    });
+    return params;
+}
+
+async function saveSelectionStrategyParams(strategyName) {
+    const params = collectStrategyParams(strategyName, '#strategy-filter');
+    const result = await apiFetch(`/api/config/strategy/${encodeURIComponent(strategyName)}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ params }),
+    });
+    if (!result.success) {
+        throw new Error(result.error || '参数保存失败');
+    }
+    state.dirtyStrategyParams.delete(strategyName);
+    state.selectionOptionsLoaded = false;
+    toast(`${strategyName} 参数已保存`, 'success');
+}
+
+async function toggleStrategyParams(strategyName) {
+    const block = document.querySelector(`#strategy-filter .strategy-accordion[data-strategy="${CSS.escape(strategyName)}"]`);
+    if (!block) {
+        return;
+    }
+    const panel = block.querySelector('.strategy-param-panel');
+    const button = block.querySelector('.strategy-param-toggle');
+    const isOpen = state.openStrategyParams.has(strategyName);
+
+    if (isOpen) {
+        if (state.dirtyStrategyParams.has(strategyName)) {
+            button.disabled = true;
+            button.textContent = '保存中';
+            try {
+                await saveSelectionStrategyParams(strategyName);
+            } catch (error) {
+                button.disabled = false;
+                button.textContent = '保存';
+                toast(`保存失败: ${error.message}`, 'error');
+                return;
+            }
+            button.disabled = false;
+        }
+        state.openStrategyParams.delete(strategyName);
+        block.classList.remove('open');
+        panel.hidden = true;
+        button.textContent = '参数';
+        return;
+    }
+
+    state.openStrategyParams.add(strategyName);
+    block.classList.add('open');
+    panel.hidden = false;
+    button.textContent = '保存';
 }
 
 async function loadSelectionOptions(forceReload = false) {
@@ -3208,11 +3360,13 @@ function getSelectedStrategies() {
 function updateSelectionSnapshot() {
     const selectedBoards = getSelectedBoards();
     const selectedStrategies = getSelectedStrategies();
+    const formulaActive = formulaEnabledForRun();
+    const effectiveStrategyCount = selectedStrategies.length + (formulaActive ? 1 : 0);
 
     const stockPool = selectedBoards.reduce((sum, key) => sum + (state.boardCounts[key] || 0), 0);
 
     document.getElementById('selected-boards-count').textContent = formatNumber(selectedBoards.length);
-    document.getElementById('selected-strategies-count').textContent = formatNumber(selectedStrategies.length);
+    document.getElementById('selected-strategies-count').textContent = formatNumber(effectiveStrategyCount);
     document.getElementById('selection-stock-pool').textContent = formatNumber(stockPool);
     document.getElementById('board-selection-meta').textContent = `${selectedBoards.length} / ${state.boardOptions.length || 0} 已选`;
     document.getElementById('selection-execution-note').textContent = stockPool
@@ -3223,6 +3377,7 @@ function updateSelectionSnapshot() {
         ? 'ALL BOARDS'
         : selectedBoards.map(key => BOARD_LABELS[key]).join(' / ') || 'NONE';
     document.getElementById('sidebar-universe-text').textContent = boardText;
+    setFormulaStatus(formulaActive ? 'ARMED' : 'IDLE', formulaActive ? 'highlight' : '');
 }
 
 function setRunButtonsLoading(isLoading) {
@@ -3275,6 +3430,13 @@ function buildSignalMetrics(signal) {
     }
 
     return metrics.join('');
+}
+
+function displayStrategyName(strategyName, meta = {}) {
+    if (strategyName === 'FormulaStrategy') {
+        return meta.formula?.label || meta.formula?.name || '条件公式选股';
+    }
+    return strategyName;
 }
 
 function formatElapsed(seconds) {
@@ -3414,7 +3576,7 @@ function renderSelectionResults(results, time, meta = {}) {
         html += `
             <section class="strategy-result-card">
                 <div class="strategy-result-header">
-                    <span class="strategy-result-name">${escapeHtml(strategyName)}</span>
+                    <span class="strategy-result-name">${escapeHtml(displayStrategyName(strategyName, meta))}</span>
                     <span class="strategy-result-count">${formatNumber(signals.length)} 只</span>
                 </div>
         `;
@@ -3508,13 +3670,14 @@ async function runSelection() {
 
     const boards = getSelectedBoards();
     const strategies = getSelectedStrategies();
+    const formula = getFormulaPayload();
 
     if (!boards.length) {
         toast('请至少选择一个股票类型', 'error');
         return;
     }
-    if (!strategies.length) {
-        toast('请至少选择一个策略', 'error');
+    if (!strategies.length && !formula.enabled) {
+        toast('请至少选择一个策略或启用条件公式', 'error');
         return;
     }
 
@@ -3537,6 +3700,7 @@ async function runSelection() {
             body: JSON.stringify({
                 boards: boards.join(','),
                 strategies: strategies.join(','),
+                formula,
             }),
         });
         if (!result.success) {
@@ -3656,6 +3820,7 @@ function renderStrategiesConfig(config) {
     const container = document.getElementById('strategies-config');
     const blocks = Object.entries(config || {}).map(([strategyName, params]) => {
         const entries = flattenConfigEntries(params);
+        const isOpen = state.openConfigStrategies.has(strategyName);
         const rows = entries.map(entry => {
             const inputType = typeof entry.value === 'number' ? 'number' : 'text';
             const step = typeof entry.value === 'number' && !Number.isInteger(entry.value) ? 'any' : '1';
@@ -3664,7 +3829,7 @@ function renderStrategiesConfig(config) {
                     <span class="param-label">${escapeHtml(entry.label)}</span>
                     <span class="param-path">${escapeHtml(entry.path)}</span>
                     <input
-                        class="param-input"
+                        class="param-input config-param-input"
                         type="${inputType}"
                         step="${step}"
                         value="${escapeHtml(entry.value)}"
@@ -3675,16 +3840,83 @@ function renderStrategiesConfig(config) {
         }).join('');
 
         return `
-            <section class="strategy-config-block">
+            <section class="strategy-config-block ${isOpen ? 'open' : ''}" data-strategy="${escapeHtml(strategyName)}">
                 <div class="strategy-config-header">
                     <div class="strategy-config-name">${escapeHtml(strategyName)}</div>
+                    <div class="inline-actions">
+                        <span class="strategy-option-meta">${formatNumber(entries.length)} 个参数</span>
+                        <button class="text-action config-strategy-toggle" type="button" data-strategy="${escapeHtml(strategyName)}">
+                            ${isOpen ? '保存' : '参数'}
+                        </button>
+                    </div>
                 </div>
-                <div class="config-params-grid">${rows || '<div class="state-empty">无可编辑参数</div>'}</div>
+                <div class="config-params-grid" ${isOpen ? '' : 'hidden'}>${rows || '<div class="state-empty">无可编辑参数</div>'}</div>
             </section>
         `;
     }).join('');
 
     container.innerHTML = blocks || '<div class="state-empty">未读取到策略配置</div>';
+}
+
+function collectConfigStrategyParams(strategyName) {
+    const params = {};
+    document.querySelectorAll(`#strategies-config .config-param-input[data-strategy="${CSS.escape(strategyName)}"]`).forEach(input => {
+        assignNested(params, input.dataset.path, parseInputValue(input.value));
+    });
+    return params;
+}
+
+async function saveConfigStrategyParams(strategyName) {
+    const params = collectConfigStrategyParams(strategyName);
+    const result = await apiFetch(`/api/config/strategy/${encodeURIComponent(strategyName)}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ params }),
+    });
+    if (!result.success) {
+        throw new Error(result.error || '参数保存失败');
+    }
+    state.dirtyConfigStrategies.delete(strategyName);
+    state.selectionOptionsLoaded = false;
+    toast(`${strategyName} 参数已保存`, 'success');
+}
+
+async function toggleConfigStrategy(strategyName) {
+    const block = document.querySelector(`#strategies-config .strategy-config-block[data-strategy="${CSS.escape(strategyName)}"]`);
+    if (!block) {
+        return;
+    }
+    const panel = block.querySelector('.config-params-grid');
+    const button = block.querySelector('.config-strategy-toggle');
+    const isOpen = state.openConfigStrategies.has(strategyName);
+
+    if (isOpen) {
+        if (state.dirtyConfigStrategies.has(strategyName)) {
+            button.disabled = true;
+            button.textContent = '保存中';
+            try {
+                await saveConfigStrategyParams(strategyName);
+            } catch (error) {
+                button.disabled = false;
+                button.textContent = '保存';
+                toast(`保存失败: ${error.message}`, 'error');
+                return;
+            }
+            button.disabled = false;
+        }
+        state.openConfigStrategies.delete(strategyName);
+        block.classList.remove('open');
+        panel.hidden = true;
+        button.textContent = '参数';
+        return;
+    }
+
+    state.openConfigStrategies.add(strategyName);
+    block.classList.add('open');
+    panel.hidden = false;
+    button.textContent = '保存';
 }
 
 async function loadStrategies() {
@@ -4066,6 +4298,36 @@ function bindEvents() {
 
     document.getElementById('board-filter').addEventListener('change', updateSelectionSnapshot);
     document.getElementById('strategy-filter').addEventListener('change', updateSelectionSnapshot);
+    document.getElementById('strategy-filter').addEventListener('click', event => {
+        const button = event.target.closest('.strategy-param-toggle');
+        if (!button) {
+            return;
+        }
+        event.preventDefault();
+        toggleStrategyParams(button.dataset.strategy);
+    });
+    document.getElementById('strategy-filter').addEventListener('input', event => {
+        const input = event.target.closest('.selection-param-input');
+        if (!input) {
+            return;
+        }
+        state.dirtyStrategyParams.add(input.dataset.strategy);
+    });
+    document.getElementById('formula-enabled').addEventListener('change', updateSelectionSnapshot);
+    document.getElementById('formula-expression').addEventListener('input', () => {
+        setFormulaStatus(formulaEnabledForRun() ? 'EDITING' : 'IDLE', formulaEnabledForRun() ? 'highlight' : '');
+        updateSelectionSnapshot();
+    });
+    document.getElementById('formula-name').addEventListener('input', updateSelectionSnapshot);
+    document.getElementById('formula-validate-btn').addEventListener('click', validateFormula);
+    document.querySelectorAll('.formula-example-btn').forEach(button => {
+        button.addEventListener('click', () => {
+            document.getElementById('formula-expression').value = button.dataset.formula || '';
+            document.getElementById('formula-enabled').checked = true;
+            updateSelectionSnapshot();
+            setFormulaStatus('EDITING', 'highlight');
+        });
+    });
 
     document.getElementById('strategy-select-all-btn').addEventListener('click', () => {
         document.querySelectorAll('#strategy-filter input[name="strategy"]').forEach(input => {
@@ -4139,6 +4401,21 @@ function bindEvents() {
             event.preventDefault();
             runWyckoffAnalysis();
         }
+    });
+    document.getElementById('strategies-config').addEventListener('click', event => {
+        const button = event.target.closest('.config-strategy-toggle');
+        if (!button) {
+            return;
+        }
+        event.preventDefault();
+        toggleConfigStrategy(button.dataset.strategy);
+    });
+    document.getElementById('strategies-config').addEventListener('input', event => {
+        const input = event.target.closest('.config-param-input');
+        if (!input) {
+            return;
+        }
+        state.dirtyConfigStrategies.add(input.dataset.strategy);
     });
     document.getElementById('save-config-btn').addEventListener('click', saveConfig);
     document.getElementById('refresh-heatmap-btn').addEventListener('click', async () => {

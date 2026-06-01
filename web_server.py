@@ -67,6 +67,8 @@ from wyckoff_ai.naming import stock_output_folder_name
 from wyckoff_ai.pipeline import WyckoffPipelineError
 import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
+from strategy.formula_strategy import FORMULA_DISPLAY_NAME, FORMULA_STRATEGY_NAME, build_formula_params
+from utils.formula_engine import FormulaError
 
 app = Flask(__name__, 
             template_folder='web/templates',
@@ -553,9 +555,13 @@ def _parse_requested_boards(raw_value):
     return selected
 
 
-def _parse_requested_strategies(raw_value):
-    available = registry.list_strategies()
-    if not raw_value:
+def _parse_requested_strategies(raw_value, allow_empty=False):
+    available = [name for name in registry.list_strategies() if name != FORMULA_STRATEGY_NAME]
+    if raw_value is None:
+        return available
+    if str(raw_value).strip() == "":
+        if allow_empty:
+            return []
         return available
 
     requested = []
@@ -575,6 +581,30 @@ def _parse_requested_strategies(raw_value):
     if not requested:
         raise ValueError("未选择有效策略")
     return requested
+
+
+def _parse_formula_spec(raw_value):
+    if not isinstance(raw_value, dict) or not raw_value.get('enabled'):
+        return None
+    formula = _bounded_text(raw_value.get('expression') or raw_value.get('formula'), '条件公式', max_length=2000)
+    label = _bounded_text(raw_value.get('name') or raw_value.get('label'), '公式名称', max_length=40) or FORMULA_DISPLAY_NAME
+    try:
+        return build_formula_params(formula, label)
+    except FormulaError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _selection_runtime_params(formula_spec):
+    if not formula_spec:
+        return {}
+    return {FORMULA_STRATEGY_NAME: formula_spec}
+
+
+def _append_formula_strategy(requested_strategies, formula_spec):
+    strategies = list(requested_strategies)
+    if formula_spec and FORMULA_STRATEGY_NAME not in strategies:
+        strategies.append(FORMULA_STRATEGY_NAME)
+    return strategies
 
 
 def _load_stock_names():
@@ -998,7 +1028,7 @@ def _create_update_job(provider):
     return job_id
 
 
-def _create_selection_job(requested_boards, requested_strategies):
+def _create_selection_job(requested_boards, requested_strategies, formula_spec=None):
     job_id = uuid.uuid4().hex[:12]
     now = _job_timestamp()
     job = {
@@ -1010,6 +1040,7 @@ def _create_selection_job(requested_boards, requested_strategies):
         'elapsed_seconds': 0,
         'boards': requested_boards,
         'strategies': requested_strategies,
+        'formula': formula_spec,
         'backend': 'thread',
         'progress_pct': 0,
         'total_candidates': 0,
@@ -1056,7 +1087,7 @@ def block_requests_after_halt():
     return None
 
 
-def _run_selection_job(job_id, requested_boards, requested_strategies):
+def _run_selection_job(job_id, requested_boards, requested_strategies, formula_spec=None):
     try:
         _update_job(
             job_id,
@@ -1088,6 +1119,7 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
         backend = _resolve_selection_backend(len(candidates), settings)
         candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
         effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
+        runtime_strategy_params = _selection_runtime_params(formula_spec)
 
         _update_job(
             job_id,
@@ -1144,7 +1176,12 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
                 )
 
         if backend == 'thread':
-            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            worker_context = build_worker_context(
+                data_dir,
+                requested_strategies,
+                str(registry.params_file),
+                runtime_strategy_params,
+            )
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [
                     executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
@@ -1158,7 +1195,12 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
                         return
                     consume_chunk(future.result())
         else:
-            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            worker_context = build_worker_context(
+                data_dir,
+                requested_strategies,
+                str(registry.params_file),
+                runtime_strategy_params,
+            )
             for chunk in candidate_chunks:
                 if _is_halted():
                     _update_job(job_id, status='halted', error='系统已急停')
@@ -1178,6 +1220,7 @@ def _run_selection_job(job_id, requested_boards, requested_strategies):
             'valid_stock_count': valid_total_count,
             'skipped_stock_count': skipped_count,
             'backend': backend,
+            'formula': formula_spec,
         }
         report_path = _save_selection_markdown(results, result_time, report_meta)
 
@@ -2273,8 +2316,10 @@ def run_selection():
             payload = {}
         if not isinstance(payload, dict):
             return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+        formula_spec = _parse_formula_spec(payload.get('formula'))
         requested_boards = _parse_requested_boards(payload.get('boards'))
-        requested_strategies = _parse_requested_strategies(payload.get('strategies'))
+        requested_strategies = _parse_requested_strategies(payload.get('strategies'), allow_empty=bool(formula_spec))
+        requested_strategies = _append_formula_strategy(requested_strategies, formula_spec)
 
         manager = _active_csv_manager()
         stock_codes = [
@@ -2297,6 +2342,8 @@ def run_selection():
         backend = _resolve_selection_backend(len(candidates), settings)
         candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
         effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
+
+        runtime_strategy_params = _selection_runtime_params(formula_spec)
 
         print(
             f"[web] 开始执行选股: boards={requested_boards}, "
@@ -2325,7 +2372,7 @@ def run_selection():
             with ProcessPoolExecutor(
                 max_workers=effective_workers,
                 initializer=initialize_selection_worker,
-                initargs=(data_dir, requested_strategies, str(registry.params_file)),
+                initargs=(data_dir, requested_strategies, str(registry.params_file), runtime_strategy_params),
             ) as executor:
                 futures = [
                     executor.submit(process_selection_chunk, chunk, "all", False)
@@ -2337,7 +2384,12 @@ def run_selection():
                         return _halted_response()
                     consume_chunk(future.result())
         elif backend == 'thread':
-            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            worker_context = build_worker_context(
+                data_dir,
+                requested_strategies,
+                str(registry.params_file),
+                runtime_strategy_params,
+            )
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [
                     executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
@@ -2349,7 +2401,12 @@ def run_selection():
                         return _halted_response()
                     consume_chunk(future.result())
         else:
-            worker_context = build_worker_context(data_dir, requested_strategies, str(registry.params_file))
+            worker_context = build_worker_context(
+                data_dir,
+                requested_strategies,
+                str(registry.params_file),
+                runtime_strategy_params,
+            )
             for chunk in candidate_chunks:
                 if _is_halted():
                     return _halted_response()
@@ -2367,6 +2424,7 @@ def run_selection():
             'valid_stock_count': valid_total_count,
             'skipped_stock_count': skipped_count,
             'backend': backend,
+            'formula': formula_spec,
         }
         report_path = _save_selection_markdown(results, result_time, meta)
 
@@ -2408,13 +2466,15 @@ def start_selection_job():
             payload = {}
         if not isinstance(payload, dict):
             return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+        formula_spec = _parse_formula_spec(payload.get('formula'))
         requested_boards = _parse_requested_boards(payload.get('boards'))
-        requested_strategies = _parse_requested_strategies(payload.get('strategies'))
+        requested_strategies = _parse_requested_strategies(payload.get('strategies'), allow_empty=bool(formula_spec))
+        requested_strategies = _append_formula_strategy(requested_strategies, formula_spec)
 
-        job_id = _create_selection_job(requested_boards, requested_strategies)
+        job_id = _create_selection_job(requested_boards, requested_strategies, formula_spec)
         thread = Thread(
             target=_run_selection_job,
-            args=(job_id, requested_boards, requested_strategies),
+            args=(job_id, requested_boards, requested_strategies, formula_spec),
             daemon=True,
         )
         thread.start()
@@ -2465,9 +2525,12 @@ def get_selection_options():
 
         strategies = []
         for strategy_name, strategy in registry.strategies.items():
+            if strategy_name == FORMULA_STRATEGY_NAME:
+                continue
             strategies.append({
                 'name': strategy_name,
                 'param_count': len(strategy.params or {}),
+                'params': strategy.params or {},
             })
 
         return jsonify({
@@ -2487,6 +2550,8 @@ def get_strategies():
     try:
         strategies = []
         for name, strategy in registry.strategies.items():
+            if name == FORMULA_STRATEGY_NAME:
+                continue
             strategies.append({
                 'name': name,
                 'params': strategy.params
@@ -2986,6 +3051,62 @@ def update_config():
         return jsonify({'success': True, 'backup': str(backup_path) if backup_path else None})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/config/strategy/<strategy_name>', methods=['POST'])
+def update_single_strategy_config(strategy_name):
+    """Update one strategy parameter block without discarding unrelated config."""
+    try:
+        if strategy_name not in registry.strategies or strategy_name == FORMULA_STRATEGY_NAME:
+            return jsonify({'success': False, 'error': '策略不存在'}), 404
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get('params'), dict):
+            return jsonify({'success': False, 'error': 'params 必须是对象'}), 400
+
+        config_file = Path("config/strategy_params.yaml")
+        config = {}
+        if config_file.exists():
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
+        config[strategy_name] = payload['params']
+
+        validation_errors = validate_strategy_params(config)
+        if validation_errors:
+            return jsonify({
+                'success': False,
+                'error': '配置校验失败',
+                'details': validation_errors,
+            }), 400
+
+        backup_path = atomic_write_yaml(config_file, config)
+        _reload_registry()
+
+        return jsonify({'success': True, 'backup': str(backup_path) if backup_path else None})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/formula/validate', methods=['POST'])
+def validate_formula_api():
+    """Validate a custom selection formula."""
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+        formula = _bounded_text(payload.get('formula') or payload.get('expression'), '条件公式', max_length=2000)
+        params = build_formula_params(formula, payload.get('name') or payload.get('label'))
+        return jsonify({
+            'success': True,
+            'data': {
+                'formula': params['formula'],
+                'label': params['label'],
+            },
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/system_status')

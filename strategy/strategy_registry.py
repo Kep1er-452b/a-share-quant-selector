@@ -86,6 +86,8 @@ class StrategyRegistry:
                     if (isinstance(attr, type) and 
                         issubclass(attr, BaseStrategy) and 
                         attr is not BaseStrategy):
+                        if getattr(attr, "runtime_only", False):
+                            continue
                         
                         # 注册策略（排除基类）
                         self.register(attr, name=attr_name)
