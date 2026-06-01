@@ -1424,6 +1424,37 @@ select {
     border-bottom: 1px solid var(--accent);
 }
 
+.strategy-result-toggle {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.strategy-result-toggle:hover,
+.strategy-result-toggle:focus-visible {
+    background: #151515;
+}
+
+.strategy-result-toggle:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.strategy-result-caret {
+    color: var(--accent);
+    font-size: 10px;
+    text-align: center;
+}
+
+.strategy-result-body[hidden] {
+    display: none;
+}
+
 .strategy-result-name {
     color: var(--accent);
 }

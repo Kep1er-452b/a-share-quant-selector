@@ -34,6 +34,7 @@ const state = {
     strategies: [],
     openStrategyParams: new Set(),
     dirtyStrategyParams: new Set(),
+    expandedSelectionResults: new Set(),
     openConfigStrategies: new Set(),
     dirtyConfigStrategies: new Set(),
     boardOptions: [],
@@ -3572,13 +3573,18 @@ function renderSelectionResults(results, time, meta = {}) {
 
     strategies.forEach(strategyName => {
         const signals = results[strategyName] || [];
+        const expanded = state.expandedSelectionResults.has(strategyName);
 
         html += `
-            <section class="strategy-result-card">
-                <div class="strategy-result-header">
+            <section class="strategy-result-card ${expanded ? 'open' : 'collapsed'}" data-strategy="${escapeHtml(strategyName)}">
+                <button class="strategy-result-header strategy-result-toggle" type="button"
+                    data-strategy="${escapeHtml(strategyName)}"
+                    aria-expanded="${expanded ? 'true' : 'false'}">
+                    <span class="strategy-result-caret" aria-hidden="true">${expanded ? 'v' : '>'}</span>
                     <span class="strategy-result-name">${escapeHtml(displayStrategyName(strategyName, meta))}</span>
                     <span class="strategy-result-count">${formatNumber(signals.length)} 只</span>
-                </div>
+                </button>
+                <div class="strategy-result-body" ${expanded ? '' : 'hidden'}>
         `;
 
         if (!signals.length) {
@@ -3646,11 +3652,45 @@ function renderSelectionResults(results, time, meta = {}) {
             `;
         }
 
-        html += '</section>';
+        html += '</div></section>';
     });
 
     document.getElementById('selection-results').innerHTML = html;
     scrollResultsToTop();
+}
+
+function toggleSelectionResultCard(strategyName) {
+    const card = document.querySelector(`#selection-results .strategy-result-card[data-strategy="${CSS.escape(strategyName)}"]`);
+    if (!card) {
+        return;
+    }
+    const body = card.querySelector('.strategy-result-body');
+    const button = card.querySelector('.strategy-result-toggle');
+    const caret = card.querySelector('.strategy-result-caret');
+    const expanded = !state.expandedSelectionResults.has(strategyName);
+
+    if (expanded) {
+        state.expandedSelectionResults.add(strategyName);
+        card.classList.add('open');
+        card.classList.remove('collapsed');
+        if (body) {
+            body.hidden = false;
+        }
+    } else {
+        state.expandedSelectionResults.delete(strategyName);
+        card.classList.remove('open');
+        card.classList.add('collapsed');
+        if (body) {
+            body.hidden = true;
+        }
+    }
+
+    if (button) {
+        button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    }
+    if (caret) {
+        caret.textContent = expanded ? 'v' : '>';
+    }
 }
 
 async function runSelection() {
@@ -3665,6 +3705,7 @@ async function runSelection() {
     if (state.currentPage !== 'selection') {
         switchPage('selection');
     }
+    state.expandedSelectionResults.clear();
 
     await loadSelectionOptions();
 
@@ -4255,6 +4296,12 @@ function bindEvents() {
     });
 
     document.getElementById('selection-results').addEventListener('click', event => {
+        const toggle = event.target.closest('.strategy-result-toggle');
+        if (toggle) {
+            toggleSelectionResultCard(toggle.dataset.strategy);
+            return;
+        }
+
         const button = event.target.closest('.view-detail-btn');
         if (!button) {
             return;
