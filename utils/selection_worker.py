@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 from strategy.strategy_registry import StrategyRegistry
+from strategy.formula_strategy import FORMULA_STRATEGY_NAME
 from utils.csv_manager import CSVManager
 from utils.technical import prepare_selection_features, prepare_strategy_shared_features
 
@@ -25,17 +26,26 @@ def merge_indicator_frames(base_df, frames):
     return merged
 
 
-def build_worker_context(data_dir, strategy_names, params_file):
+def build_worker_context(data_dir, strategy_names, params_file, runtime_strategy_params=None):
     """构建批处理上下文。"""
+    runtime_strategy_params = runtime_strategy_params or {}
     registry = StrategyRegistry(params_file)
     with contextlib.redirect_stdout(io.StringIO()):
         registry.auto_register_from_directory("strategy")
 
     strategies = {}
     for strategy_name in strategy_names:
-        strategy = registry.get_strategy(strategy_name)
-        if strategy is None:
-            raise ValueError(f"未找到策略类: {strategy_name}")
+        if strategy_name == FORMULA_STRATEGY_NAME:
+            from strategy.formula_strategy import FormulaStrategy
+
+            formula_params = runtime_strategy_params.get(FORMULA_STRATEGY_NAME)
+            if not formula_params:
+                raise ValueError("条件公式策略缺少运行参数")
+            strategy = FormulaStrategy(params=formula_params)
+        else:
+            strategy = registry.get_strategy(strategy_name)
+            if strategy is None:
+                raise ValueError(f"未找到策略类: {strategy_name}")
         strategies[strategy_name] = strategy
 
     return {
@@ -44,11 +54,11 @@ def build_worker_context(data_dir, strategy_names, params_file):
     }
 
 
-def initialize_selection_worker(data_dir, strategy_names, params_file):
+def initialize_selection_worker(data_dir, strategy_names, params_file, runtime_strategy_params=None):
     """进程池初始化。"""
     global _WORKER_CONTEXT
     with contextlib.redirect_stdout(io.StringIO()):
-        _WORKER_CONTEXT = build_worker_context(data_dir, strategy_names, params_file)
+        _WORKER_CONTEXT = build_worker_context(data_dir, strategy_names, params_file, runtime_strategy_params)
 
 
 def process_selection_chunk(candidates, category="all", return_data=False, context=None):

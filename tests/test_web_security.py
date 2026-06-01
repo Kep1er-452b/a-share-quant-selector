@@ -73,6 +73,19 @@ def test_stock_snapshot_rows_are_sorted_by_code_before_pagination(monkeypatch):
     assert [item["code"] for item in payload["data"]] == ["300001"]
 
 
+def test_formula_validate_endpoint_accepts_safe_formula():
+    client = web_server.app.test_client()
+    response = client.post(
+        "/api/formula/validate",
+        json={"formula": "CLOSE > MA(CLOSE, 20) AND J < 20"},
+        headers=_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["success"] is True
+
+
 def test_write_endpoints_validate_payload_shape_and_lengths():
     client = web_server.app.test_client()
 
