@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -8,6 +9,32 @@ import web_server
 
 def _headers():
     return {"X-Quant-Session": web_server.WEB_SESSION_TOKEN}
+
+
+def _write_provider_fixture(root, provider, *, code="000001", latest="2026-06-01", state=None):
+    provider_root = root / "providers" / provider
+    csv_dir = provider_root / code[:2]
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    (csv_dir / f"{code}.csv").write_text(
+        f"date,open,high,low,close,volume\n{latest},1,1,1,1,100\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "provider": provider,
+        "status": "ready",
+        "latest_trade_date": latest,
+        "target_count": 1,
+        "success_count": 1,
+        "failed_count": 0,
+        "warning_count": 0,
+        "coverage_ratio": 1.0,
+        "is_complete": True,
+    }
+    payload.update(state or {})
+    (provider_root / "provider_state.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def test_side_effect_select_requires_post_and_session_token():
@@ -84,6 +111,65 @@ def test_formula_validate_endpoint_accepts_safe_formula():
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["success"] is True
+
+
+def test_provider_activate_requires_session_token_and_valid_payload(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_server, "_data_root_dir", lambda: tmp_path)
+    monkeypatch.setattr(web_server, "_find_running_update_job", lambda: None)
+    monkeypatch.setattr(web_server, "_find_running_job", lambda: None)
+    client = web_server.app.test_client()
+
+    response = client.post("/api/provider/activate", json={"provider": "akshare"})
+    assert response.status_code == 403
+
+    response = client.post("/api/provider/activate", json=[], headers=_headers())
+    assert response.status_code == 400
+
+    response = client.post("/api/provider/activate", json={"provider": "bad"}, headers=_headers())
+    assert response.status_code == 400
+
+
+def test_provider_activate_rejects_empty_provider(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_server, "_data_root_dir", lambda: tmp_path)
+    monkeypatch.setattr(web_server, "_find_running_update_job", lambda: None)
+    monkeypatch.setattr(web_server, "_find_running_job", lambda: None)
+    client = web_server.app.test_client()
+
+    response = client.post("/api/provider/activate", json={"provider": "akshare"}, headers=_headers())
+
+    assert response.status_code == 400
+    assert "本地数据仓为空" in response.get_json()["error"]
+
+
+def test_provider_activate_switches_and_reports_stale_warnings(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_server, "_data_root_dir", lambda: tmp_path)
+    monkeypatch.setattr(web_server, "_find_running_update_job", lambda: None)
+    monkeypatch.setattr(web_server, "_find_running_job", lambda: None)
+    _write_provider_fixture(tmp_path, "akshare", latest="2026-06-01")
+    _write_provider_fixture(
+        tmp_path,
+        "tencent",
+        latest="2026-05-30",
+        state={
+            "status": "partial",
+            "target_count": 2,
+            "success_count": 1,
+            "failed_count": 1,
+            "warning_count": 1,
+            "coverage_ratio": 0.5,
+            "is_complete": False,
+        },
+    )
+    client = web_server.app.test_client()
+
+    response = client.post("/api/provider/activate", json={"provider": "tencent"}, headers=_headers())
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["success"] is True
+    assert payload["data"]["active_provider"]["active_provider"] == "tencent"
+    assert any("落后于本地最新" in warning for warning in payload["data"]["warnings"])
+    assert any("覆盖率" in warning for warning in payload["data"]["warnings"])
 
 
 def test_write_endpoints_validate_payload_shape_and_lengths():

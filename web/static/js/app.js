@@ -69,6 +69,9 @@ const state = {
     updateActiveProvider: null,
     updateProviderStatuses: [],
     updateLegacyProvider: null,
+    activeProviderState: null,
+    providerStatuses: [],
+    providerSwitching: false,
     globalTickerText: '',
     currentStockDetail: null,
     currentStockPeriod: 'daily',
@@ -830,17 +833,132 @@ function providerSubText(status) {
     return `${base} · ${latest} · 失败 ${formatNumber(failed)} / 警告 ${formatNumber(warnings)}`;
 }
 
+function getProviderStatus(provider) {
+    return (state.providerStatuses || []).find(item => item.provider === provider) || { provider, status: 'empty' };
+}
+
+function freshestProviderDate(statuses) {
+    return (statuses || [])
+        .filter(item => Number(item?.stock_count || 0) > 0 && item?.latest_trade_date)
+        .map(item => String(item.latest_trade_date))
+        .sort()
+        .pop() || null;
+}
+
+function providerSwitchWarnings(provider, status) {
+    const warnings = [];
+    const freshestDate = freshestProviderDate(state.providerStatuses || []);
+    const latest = status?.latest_trade_date ? String(status.latest_trade_date) : '';
+    const stockCount = Number(status?.stock_count || 0);
+    const targetCount = Number(status?.target_count || 0);
+    const failed = Number(status?.failed_count || 0);
+    const warningCount = Number(status?.warning_count || 0);
+    const coverage = Number(status?.coverage_ratio);
+    const providerState = String(status?.status || '').toLowerCase();
+
+    if (!latest) {
+        warnings.push('目标数据源缺少最新交易日信息。');
+    } else if (freshestDate && latest < freshestDate) {
+        warnings.push(`目标数据源最新交易日 ${latest} 落后于本地最新 ${freshestDate}。`);
+    }
+    if (providerState === 'partial') {
+        warnings.push('目标数据源最近一次更新状态为 PARTIAL。');
+    } else if (['failed', 'error'].includes(providerState)) {
+        warnings.push(`目标数据源状态为 ${providerState.toUpperCase()}。`);
+    }
+    if (targetCount > 0 && Number.isFinite(coverage) && coverage < 0.98) {
+        warnings.push(`目标数据源覆盖率为 ${formatCoverageRatio(coverage)}。`);
+    }
+    if (targetCount > 0 && stockCount < targetCount) {
+        warnings.push(`目标数据源本地股票数 ${formatNumber(stockCount)} 少于目标股票池 ${formatNumber(targetCount)}。`);
+    }
+    if (failed > 0) {
+        warnings.push(`目标数据源有 ${formatNumber(failed)} 条更新失败记录。`);
+    }
+    if (warningCount > 0) {
+        warnings.push(`目标数据源有 ${formatNumber(warningCount)} 条更新警告记录。`);
+    }
+
+    return warnings;
+}
+
+function buildProviderSwitchConfirmMessage(provider, status, warnings) {
+    const activeProvider = state.activeProviderState?.active_provider || 'legacy';
+    const activeStatus = getProviderStatus(activeProvider);
+    const activeText = `${providerDisplayName(activeProvider)} · ${activeStatus.latest_trade_date || state.activeProviderState?.latest_trade_date || '--'}`;
+    const targetText = `${providerDisplayName(provider)} · ${status.latest_trade_date || '--'} · ${providerSubText(status)}`;
+    const warningText = warnings.length
+        ? `\n\n提醒:\n${warnings.map(item => `- ${item}`).join('\n')}`
+        : '';
+
+    return `确认将当前数据源切换为 ${providerDisplayName(provider)} 吗？\n\n当前: ${activeText}\n目标: ${targetText}${warningText}\n\n切换只会改变系统读取的本地数据仓，不会自动下载新数据。`;
+}
+
+async function switchActiveProvider(provider) {
+    if (state.providerSwitching) {
+        return;
+    }
+    const status = getProviderStatus(provider);
+    const activeProvider = state.activeProviderState?.active_provider || 'legacy';
+
+    if (provider === activeProvider) {
+        toast(`${providerDisplayName(provider)} 已经是当前数据源`, 'info');
+        return;
+    }
+    if (Number(status?.stock_count || 0) <= 0) {
+        toast(`${providerDisplayName(provider)} 本地数据仓为空，不能切换`, 'error');
+        return;
+    }
+
+    const warnings = providerSwitchWarnings(provider, status);
+    if (!window.confirm(buildProviderSwitchConfirmMessage(provider, status, warnings))) {
+        return;
+    }
+
+    state.providerSwitching = true;
+    try {
+        const result = await apiFetch('/api/provider/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider, confirmed: true }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '数据源切换失败');
+        }
+
+        const data = result.data || {};
+        state.activeProviderState = data.active_provider || null;
+        state.providerStatuses = Array.isArray(data.provider_statuses) ? data.provider_statuses : state.providerStatuses;
+        state.updateActiveProvider = data.active_provider?.active_provider || state.updateActiveProvider;
+        state.updateProviderStatuses = state.providerStatuses;
+        state.stocksLoaded = false;
+        state.allStocksCache = [];
+        state.heatmapMetaLoaded = false;
+        clearHeatmapPayloadCache();
+        toast(`数据源已切换为 ${providerDisplayName(provider)}`, 'success', 3600);
+        updateGlobalTicker(`ACTIVE PROVIDER ${providerDisplayName(provider)}   LOCAL DATA SWITCHED`);
+        await loadStats();
+    } catch (error) {
+        toast(`数据源切换失败: ${error.message}`, 'error', 5200);
+    } finally {
+        state.providerSwitching = false;
+    }
+}
+
 function renderProviderHealthCard(status, activeProvider) {
     const provider = status?.provider || '--';
     const isActive = provider === activeProvider;
     const label = isActive ? `${providerDisplayName(provider)} ACTIVE` : providerDisplayName(provider);
     const state = isActive ? 'ACTIVE' : String(status?.status || 'EMPTY').toUpperCase();
+    const disabled = Number(status?.stock_count || 0) <= 0 || provider === '--';
     return `
-        <div class="health-card provider-health-card ${isActive ? 'active' : ''}">
+        <button class="health-card provider-health-card provider-switch-card ${isActive ? 'active' : ''}" type="button"
+            data-provider-switch="${escapeHtml(provider)}" ${disabled ? 'disabled' : ''}
+            title="${escapeHtml(disabled ? '本地数据仓为空' : `切换到 ${providerDisplayName(provider)}`)}">
             <div class="pulse-label">${escapeHtml(label)}</div>
             <div class="pulse-value ${providerStatusClass(status?.status)}">${escapeHtml(state)}</div>
             <div class="pulse-sub">${escapeHtml(providerSubText(status || {}))}</div>
-        </div>
+        </button>
     `;
 }
 
@@ -854,6 +972,8 @@ function renderDashboardHealth(payload) {
     const providers = Array.isArray(payload?.provider_statuses) ? payload.provider_statuses : [];
     const activeProviderState = payload?.active_provider || {};
     const activeProvider = activeProviderState.active_provider || 'legacy';
+    state.providerStatuses = providers;
+    state.activeProviderState = activeProviderState;
     const activeStatus = providers.find(item => item.provider === activeProvider) || activeProviderState.provider_state || {};
     const refreshPending = Boolean(health.refresh_pending);
     const anomalyCount = Number(health.market_cap_anomaly_count || 0);
@@ -4473,6 +4593,13 @@ function bindEvents() {
     document.getElementById('heatmap-fullscreen-btn').addEventListener('click', toggleHeatmapFullscreen);
     document.getElementById('update-data-btn').addEventListener('click', openUpdateModal);
     document.getElementById('shutdown-btn').addEventListener('click', openShutdownConfirm);
+    document.getElementById('dashboard-market-health').addEventListener('click', event => {
+        const button = event.target.closest('[data-provider-switch]');
+        if (!button || button.disabled) {
+            return;
+        }
+        switchActiveProvider(button.dataset.providerSwitch);
+    });
 
     document.getElementById('halt-btn').addEventListener('click', openHaltConfirm);
     document.getElementById('cancel-halt-btn').addEventListener('click', closeHaltConfirm);
