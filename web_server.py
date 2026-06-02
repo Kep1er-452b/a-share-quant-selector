@@ -41,6 +41,7 @@ from utils.market_overview import (
     is_hidden_market_stock,
 )
 from utils.provider_router import (
+    VALID_PROVIDERS,
     activate_provider,
     active_data_dir as routed_active_data_dir,
     get_active_provider_name,
@@ -1352,6 +1353,52 @@ def _coverage_guard_active(summary):
     return _provider_update_target_count(summary) >= UPDATE_COVERAGE_GUARD_MIN_TARGETS
 
 
+def _provider_switch_warnings(data_root, provider, provider_state=None):
+    provider_state = provider_state or warehouse_summary(data_root, provider)
+    statuses = list_provider_statuses(data_root)
+    latest_dates = [
+        str(status.get('latest_trade_date'))
+        for status in statuses
+        if status.get('stock_count') and status.get('latest_trade_date')
+    ]
+    freshest_date = max(latest_dates) if latest_dates else None
+    target_date = provider_state.get('latest_trade_date')
+    target_count = _provider_update_target_count(provider_state)
+    stock_count = _provider_update_stock_count(provider_state)
+    try:
+        failed_count = int(provider_state.get('failed_count') or 0)
+    except (TypeError, ValueError):
+        failed_count = 0
+    try:
+        warning_count = int(provider_state.get('warning_count') or 0)
+    except (TypeError, ValueError):
+        warning_count = 0
+    coverage_ratio = provider_state.get('coverage_ratio')
+    status = str(provider_state.get('status') or '').lower()
+    warnings = []
+
+    if not target_date:
+        warnings.append('目标数据源缺少最新交易日信息')
+    elif freshest_date and str(target_date) < freshest_date:
+        warnings.append(f'目标数据源最新交易日 {target_date} 落后于本地最新 {freshest_date}')
+
+    if status in {'failed', 'error'}:
+        warnings.append(f'目标数据源状态为 {status.upper()}')
+    elif status == 'partial':
+        warnings.append('目标数据源最近一次更新状态为 PARTIAL')
+
+    if target_count > 0 and coverage_ratio is not None and _provider_update_coverage(provider_state) < 0.98:
+        warnings.append(f'目标数据源覆盖率为 {round(_provider_update_coverage(provider_state) * 100, 2)}%')
+    if target_count > 0 and stock_count < target_count:
+        warnings.append(f'目标数据源本地股票数 {stock_count} 少于目标股票池 {target_count}')
+    if failed_count > 0:
+        warnings.append(f'目标数据源有 {failed_count} 条更新失败记录')
+    if warning_count > 0:
+        warnings.append(f'目标数据源有 {warning_count} 条更新警告记录')
+
+    return warnings
+
+
 def _run_update_job(job_id, provider_name, provider_token):
     config = _load_config()
     data_dir = str(_config_value(config, 'data_dir', default='data'))
@@ -2305,6 +2352,79 @@ def get_dashboard_pulse():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/provider/activate', methods=['POST'])
+def activate_data_provider():
+    """手动切换当前 active provider，不触发数据下载。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+
+        running_update = _find_running_update_job()
+        if running_update:
+            return jsonify({
+                'success': False,
+                'error': '当前有数据更新任务正在执行，请等待完成后再切换数据源',
+                'job': running_update,
+            }), 409
+
+        running_selection = _find_running_job()
+        if running_selection:
+            return jsonify({
+                'success': False,
+                'error': '当前有选股任务正在执行，请等待完成后再切换数据源',
+                'job': running_selection,
+            }), 409
+
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+
+        provider = _normalize_csv_value(payload.get('provider'))
+        if provider not in VALID_PROVIDERS:
+            return jsonify({'success': False, 'error': '不支持的数据源'}), 400
+
+        data_root = str(_data_root_dir())
+        provider_state = warehouse_summary(data_root, provider)
+        if _provider_update_stock_count(provider_state) <= 0:
+            return jsonify({
+                'success': False,
+                'error': f'{provider.upper()} 本地数据仓为空，不能切换为当前数据源',
+                'data': {
+                    'provider_state': provider_state,
+                    'active_provider': load_active_provider(data_root),
+                    'provider_statuses': list_provider_statuses(data_root),
+                },
+            }), 400
+
+        warnings = _provider_switch_warnings(data_root, provider, provider_state)
+        activate_provider(data_root, provider, provider_state)
+        active_state = load_active_provider(data_root)
+        _append_system_log(
+            'manual_provider_switch',
+            f'active provider 已手动切换为 {provider}。',
+            {
+                'provider': provider,
+                'warnings': warnings,
+                'provider_state': provider_state,
+            },
+        )
+        return jsonify({
+            'success': True,
+            'data': {
+                'active_provider': active_state,
+                'provider_statuses': list_provider_statuses(data_root),
+                'provider_state': provider_state,
+                'warnings': warnings,
+            },
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/select', methods=['POST'])
