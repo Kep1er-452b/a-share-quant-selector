@@ -1,0 +1,90 @@
+{
+  "incident_id": "20260604-173252",
+  "type": "emergency_stop",
+  "reason": "用户手动触发事故急停",
+  "created_at": "2026-06-04T17:32:52",
+  "pid": 12518,
+  "shutdown_delay_seconds": 1.2,
+  "request": {
+    "remote_addr": "127.0.0.1",
+    "path": "/api/emergency_stop",
+    "method": "POST",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+  },
+  "tasks": {
+    "update_jobs": [
+      {
+        "job_id": "e01a953a788e",
+        "status": "halted",
+        "created_at": "2026-06-04 17:12:52",
+        "updated_at": "2026-06-04 17:32:52",
+        "started_at": "2026-06-04 17:12:52",
+        "finished_at": "2026-06-04 17:32:52",
+        "elapsed_seconds": 1200,
+        "error": "用户手动触发事故急停",
+        "progress_pct": 30,
+        "current_step": "增量补齐",
+        "current_stock": {
+          "code": "301616",
+          "name": "浙江华业"
+        },
+        "provider": "tushare",
+        "processed_count": 2847,
+        "total_count": 7564,
+        "cache_refresh": null,
+        "logs": [
+          {
+            "time": "2026-06-04 17:25:46",
+            "message": "增量补齐: 海洋王(002724) 1200/6407"
+          },
+          {
+            "time": "2026-06-04 17:26:07",
+            "message": "增量补齐: 中宠股份(002891) 1350/6557"
+          },
+          {
+            "time": "2026-06-04 17:26:54",
+            "message": "增量补齐: 华测检测(300012) 1500/6707"
+          },
+          {
+            "time": "2026-06-04 17:27:45",
+            "message": "增量补齐: 佐力药业(300181) 1650/6857"
+          },
+          {
+            "time": "2026-06-04 17:28:05",
+            "message": "增量补齐: 润和软件(300339) 1800/7007"
+          },
+          {
+            "time": "2026-06-04 17:28:53",
+            "message": "增量补齐: 天邑股份(300504) 1950/7157"
+          },
+          {
+            "time": "2026-06-04 17:29:46",
+            "message": "增量补齐: 民德电子(300656) 2100/7307"
+          },
+          {
+            "time": "2026-06-04 17:30:02",
+            "message": "增量补齐: 建科智能(300823) 2250/7457"
+          },
+          {
+            "time": "2026-06-04 17:30:53",
+            "message": "增量补齐: 华绿生物(300970) 2400/7508"
+          },
+          {
+            "time": "2026-06-04 17:31:43",
+            "message": "增量补齐: 瑞德智能(301135) 2550/7539"
+          },
+          {
+            "time": "2026-06-04 17:32:13",
+            "message": "增量补齐: 豪江智能(301320) 2700/7544"
+          },
+          {
+            "time": "2026-06-04 17:32:52",
+            "message": "事故急停触发，系统即将退出。"
+          }
+        ]
+      }
+    ],
+    "selection_jobs": [],
+    "wyckoff_jobs": []
+  }
+}

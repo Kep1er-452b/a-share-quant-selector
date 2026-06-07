@@ -1,0 +1,59 @@
+{
+  "incident_id": "20260604-171238",
+  "type": "emergency_stop",
+  "reason": "用户手动触发事故急停",
+  "created_at": "2026-06-04T17:12:38",
+  "pid": 12441,
+  "shutdown_delay_seconds": 1.2,
+  "request": {
+    "remote_addr": "127.0.0.1",
+    "path": "/api/emergency_stop",
+    "method": "POST",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+  },
+  "tasks": {
+    "update_jobs": [
+      {
+        "job_id": "260531b06c08",
+        "status": "halted",
+        "created_at": "2026-06-04 17:05:44",
+        "updated_at": "2026-06-04 17:12:38",
+        "started_at": "2026-06-04 17:05:44",
+        "finished_at": "2026-06-04 17:12:38",
+        "elapsed_seconds": 413,
+        "error": "用户手动触发事故急停",
+        "progress_pct": 3,
+        "current_step": "分析目标股票池",
+        "current_stock": null,
+        "provider": "tushare",
+        "processed_count": 0,
+        "total_count": 5207,
+        "cache_refresh": null,
+        "logs": [
+          {
+            "time": "2026-06-04 17:05:44",
+            "message": "更新任务已创建，等待执行。"
+          },
+          {
+            "time": "2026-06-04 17:05:44",
+            "message": "开始执行数据更新，数据源: tushare。"
+          },
+          {
+            "time": "2026-06-04 17:05:44",
+            "message": "正在获取 tushare 目标股票池。"
+          },
+          {
+            "time": "2026-06-04 17:05:44",
+            "message": "目标股票池 5207 只，准备开始同步。"
+          },
+          {
+            "time": "2026-06-04 17:12:38",
+            "message": "事故急停触发，系统即将退出。"
+          }
+        ]
+      }
+    ],
+    "selection_jobs": [],
+    "wyckoff_jobs": []
+  }
+}

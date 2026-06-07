@@ -1,0 +1,90 @@
+{
+  "incident_id": "20260604-174858",
+  "type": "emergency_stop",
+  "reason": "用户手动触发事故急停",
+  "created_at": "2026-06-04T17:48:58",
+  "pid": 26199,
+  "shutdown_delay_seconds": 1.2,
+  "request": {
+    "remote_addr": "127.0.0.1",
+    "path": "/api/emergency_stop",
+    "method": "POST",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+  },
+  "tasks": {
+    "update_jobs": [
+      {
+        "job_id": "b91ec9a9db02",
+        "status": "halted",
+        "created_at": "2026-06-04 17:33:29",
+        "updated_at": "2026-06-04 17:48:58",
+        "started_at": "2026-06-04 17:33:29",
+        "finished_at": "2026-06-04 17:48:58",
+        "elapsed_seconds": 928,
+        "error": "用户手动触发事故急停",
+        "progress_pct": 41,
+        "current_step": "增量补齐",
+        "current_stock": {
+          "code": "600038",
+          "name": "中直股份"
+        },
+        "provider": "tushare",
+        "processed_count": 2417,
+        "total_count": 4721,
+        "cache_refresh": null,
+        "logs": [
+          {
+            "time": "2026-06-04 17:39:03",
+            "message": "增量补齐: 中远海科(002401) 900/4717"
+          },
+          {
+            "time": "2026-06-04 17:40:03",
+            "message": "增量补齐: 洽洽食品(002557) 1050/4717"
+          },
+          {
+            "time": "2026-06-04 17:41:03",
+            "message": "增量补齐: 海洋王(002724) 1200/4717"
+          },
+          {
+            "time": "2026-06-04 17:42:03",
+            "message": "增量补齐: 川恒股份(002895) 1350/4719"
+          },
+          {
+            "time": "2026-06-04 17:43:04",
+            "message": "增量补齐: 华测检测(300012) 1500/4719"
+          },
+          {
+            "time": "2026-06-04 17:44:03",
+            "message": "增量补齐: ST朗源(300175) 1650/4719"
+          },
+          {
+            "time": "2026-06-04 17:44:59",
+            "message": "增量补齐: 迪森股份(300335) 1800/4719"
+          },
+          {
+            "time": "2026-06-04 17:45:58",
+            "message": "增量补齐: 天邑股份(300504) 1950/4719"
+          },
+          {
+            "time": "2026-06-04 17:46:57",
+            "message": "增量补齐: 中孚信息(300659) 2100/4719"
+          },
+          {
+            "time": "2026-06-04 17:47:56",
+            "message": "增量补齐: 建科智能(300823) 2250/4720"
+          },
+          {
+            "time": "2026-06-04 17:48:25",
+            "message": "增量补齐: 上港集团(600018) 2400/4721"
+          },
+          {
+            "time": "2026-06-04 17:48:58",
+            "message": "事故急停触发，系统即将退出。"
+          }
+        ]
+      }
+    ],
+    "selection_jobs": [],
+    "wyckoff_jobs": []
+  }
+}

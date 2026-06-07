@@ -48,6 +48,18 @@ NUMERIC_RANGES = {
         "FD15_VOL_RATIO": (0, 100),
         "B1_TREND_TOLERANCE": (0, 2),
     },
+    "B1V24261Strategy": {
+        "J_MAX": (-200, 200),
+        "MV_MIN_BILLION": (0, 100000),
+        "YANGYIN_RATIO_28": (0, 100),
+        "YANGYIN_RATIO_14": (0, 100),
+        "YANGYIN_RATIO_57": (0, 100),
+        "PLRY_VOL_RATIO": (0, 100),
+        "HALF_DOWN_VOL_RATIO": (0, 10),
+        "TOP_RANGE_RATIO": (0, 2),
+        "FD15_VOL_RATIO": (0, 100),
+        "B1_TREND_TOLERANCE": (0, 2),
+    },
     "B2BetaStrategy": {
         "J_MAX": (-200, 200),
         "J13_THRESHOLD": (-200, 200),

@@ -99,6 +99,7 @@ python3 main.py init --board main --max-stocks 500
 python3 main.py select
 python3 main.py select --strategy BowlReboundStrategy
 python3 main.py select --strategy B1V242BStrategy
+python3 main.py select --strategy B1V24261Strategy
 python3 main.py select --strategy B2BetaStrategy
 python3 main.py select --category bowl_center
 python3 main.py select --board main --max-stocks 300
@@ -198,7 +199,7 @@ web:
   - F1 系统概览
   - F2 市场云图
   - F3 股票列表：搜索框支持代码、名称、拼音首字母，回车可打开 K 线详情
-  - F4 执行选股
+  - F4 执行选股：策略按 B1、B2、Bowl 主栏折叠，展开后可勾选具体子策略
   - F5 策略配置
   - F6 自选股票：支持添加、删除、查看 K 线和导出 CSV
 - K 线详情弹窗内的 `EXPORT CSV` 按钮会先校验单股 CSV 是否最新；如果不是最新，会弹窗让你选择“先更新后导出”或“直接导出”。

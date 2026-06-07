@@ -32,6 +32,8 @@ const state = {
     stocksLoadingPromise: null,
     stockSearchTimer: null,
     strategies: [],
+    strategyGroups: [],
+    openStrategyGroups: new Set(),
     openStrategyParams: new Set(),
     dirtyStrategyParams: new Set(),
     expandedSelectionResults: new Set(),
@@ -3173,7 +3175,7 @@ function renderUpdateJob(job) {
     document.getElementById('update-progress-bar-fill').style.width = `${Math.min(100, Math.max(0, percent))}%`;
     document.getElementById('update-progress-pct').textContent = `${percent}%`;
     document.getElementById('update-current-step').textContent = job.current_step || '等待执行';
-    document.getElementById('update-processed-count').textContent = `${formatNumber(job.processed_count || 0)} / ${formatNumber(job.total_count || 0)}`;
+    document.getElementById('update-processed-count').textContent = formatUpdateWorkload(job);
     document.getElementById('update-provider-value').textContent = String(job.provider || '--').toUpperCase();
     document.getElementById('update-elapsed-value').textContent = formatElapsed(job.elapsed_seconds || 0);
     document.getElementById('update-progress-status').textContent = String(job.status || 'queued').toUpperCase();
@@ -3190,6 +3192,17 @@ function renderUpdateJob(job) {
             <span class="progress-log-message">${escapeHtml(item.message)}</span>
         </div>
     `).join('') || '<div class="progress-log-row"><span class="progress-log-message">等待任务启动...</span></div>';
+}
+
+function formatUpdateWorkload(job) {
+    const processed = Number(job.processed_count || 0);
+    const total = Number(job.total_count || 0);
+    const planned = Number(job.planned_total_count || total);
+    const retry = Number(job.retry_count || Math.max(total - planned, 0));
+    if (retry > 0 && planned > 0) {
+        return `${formatNumber(processed)} / ${formatNumber(planned)}(原) + ${formatNumber(retry)}(重试) = ${formatNumber(total)}`;
+    }
+    return `${formatNumber(processed)} / ${formatNumber(total)}`;
 }
 
 async function pollUpdateJobStatus() {
@@ -3267,7 +3280,7 @@ function renderBoardOptions(boards) {
     `).join('');
 }
 
-function renderStrategyOptions(strategies) {
+function renderStrategyOptions(strategies, groups = []) {
     const container = document.getElementById('strategy-filter');
 
     if (!strategies.length) {
@@ -3275,7 +3288,19 @@ function renderStrategyOptions(strategies) {
         return;
     }
 
-    container.innerHTML = strategies.map(strategy => {
+    const groupDefinitions = groups.length
+        ? groups
+        : [{ key: 'other', label: 'Other', description: '其他独立策略', order: 999 }];
+    const strategiesByGroup = new Map();
+    strategies.forEach(strategy => {
+        const groupKey = strategy.group || 'other';
+        if (!strategiesByGroup.has(groupKey)) {
+            strategiesByGroup.set(groupKey, []);
+        }
+        strategiesByGroup.get(groupKey).push(strategy);
+    });
+
+    const renderStrategy = strategy => {
         const params = strategy.params || {};
         const entries = flattenConfigEntries(params);
         const isOpen = state.openStrategyParams.has(strategy.name);
@@ -3301,7 +3326,12 @@ function renderStrategyOptions(strategies) {
                 <div class="strategy-option-card strategy-accordion-head">
                     <label class="strategy-check">
                         <input class="option-input" type="checkbox" name="strategy" value="${escapeHtml(strategy.name)}" checked>
-                        <span class="strategy-option-name">${escapeHtml(strategy.name)}</span>
+                        <span class="strategy-option-copy">
+                            <span class="strategy-option-name">${escapeHtml(strategy.display_name || strategy.name)}</span>
+                            <span class="strategy-option-description">
+                                ${escapeHtml(strategy.description || strategy.name)} · ${escapeHtml(strategy.name)}
+                            </span>
+                        </span>
                     </label>
                     <span class="strategy-option-meta">${formatNumber(strategy.param_count)} 个参数</span>
                     <button class="text-action strategy-param-toggle" type="button" data-strategy="${escapeHtml(strategy.name)}">
@@ -3313,7 +3343,52 @@ function renderStrategyOptions(strategies) {
                 </div>
             </div>
         `;
-    }).join('');
+    };
+
+    const knownGroupKeys = new Set(groupDefinitions.map(group => group.key));
+    const renderedGroups = [...groupDefinitions];
+    strategiesByGroup.forEach((items, key) => {
+        if (!knownGroupKeys.has(key)) {
+            renderedGroups.push({
+                key,
+                label: key,
+                description: '其他独立策略',
+                order: 999,
+            });
+        }
+    });
+
+    container.innerHTML = renderedGroups
+        .sort((left, right) => Number(left.order || 999) - Number(right.order || 999))
+        .map(group => {
+            const items = strategiesByGroup.get(group.key) || [];
+            if (!items.length) {
+                return '';
+            }
+            const isOpen = state.openStrategyGroups.has(group.key);
+            return `
+                <section class="strategy-group ${isOpen ? 'open' : 'collapsed'}" data-strategy-group="${escapeHtml(group.key)}">
+                    <button
+                        class="strategy-group-head"
+                        type="button"
+                        data-strategy-group-toggle="${escapeHtml(group.key)}"
+                        aria-expanded="${isOpen ? 'true' : 'false'}">
+                        <span class="strategy-group-caret" aria-hidden="true">${isOpen ? 'v' : '>'}</span>
+                        <span class="strategy-group-copy">
+                            <span class="strategy-group-name">${escapeHtml(group.label || group.key)}</span>
+                            <span class="strategy-group-description">${escapeHtml(group.description || '')}</span>
+                        </span>
+                        <span class="strategy-group-meta" data-strategy-group-meta="${escapeHtml(group.key)}">
+                            ${formatNumber(items.length)} / ${formatNumber(items.length)} 已选
+                        </span>
+                    </button>
+                    <div class="strategy-group-body" ${isOpen ? '' : 'hidden'}>
+                        ${items.map(renderStrategy).join('')}
+                    </div>
+                </section>
+            `;
+        })
+        .join('');
 }
 
 function getFormulaPayload() {
@@ -3434,6 +3509,48 @@ async function toggleStrategyParams(strategyName) {
     button.textContent = '保存';
 }
 
+function toggleStrategyGroup(groupKey) {
+    const group = document.querySelector(`#strategy-filter .strategy-group[data-strategy-group="${CSS.escape(groupKey)}"]`);
+    if (!group) {
+        return;
+    }
+    const body = group.querySelector('.strategy-group-body');
+    const button = group.querySelector('.strategy-group-head');
+    const caret = group.querySelector('.strategy-group-caret');
+    const expanded = !state.openStrategyGroups.has(groupKey);
+
+    if (expanded) {
+        state.openStrategyGroups.add(groupKey);
+        group.classList.add('open');
+        group.classList.remove('collapsed');
+        body.hidden = false;
+    } else {
+        state.openStrategyGroups.delete(groupKey);
+        group.classList.remove('open');
+        group.classList.add('collapsed');
+        body.hidden = true;
+    }
+
+    button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    caret.textContent = expanded ? 'v' : '>';
+}
+
+function updateStrategyGroupMeta() {
+    document.querySelectorAll('#strategy-filter .strategy-group').forEach(group => {
+        const inputs = Array.from(group.querySelectorAll('input[name="strategy"]'));
+        const selectedCount = inputs.filter(input => input.checked).length;
+        const meta = group.querySelector('.strategy-group-meta');
+        if (meta) {
+            meta.textContent = `${formatNumber(selectedCount)} / ${formatNumber(inputs.length)} 已选`;
+        }
+        group.classList.toggle('has-selection', selectedCount > 0);
+        group.classList.toggle('all-selected', selectedCount === inputs.length && inputs.length > 0);
+        inputs.forEach(input => {
+            input.closest('.strategy-option')?.classList.toggle('selected', input.checked);
+        });
+    });
+}
+
 async function loadSelectionOptions(forceReload = false) {
     if (state.systemHalted) {
         return;
@@ -3452,11 +3569,12 @@ async function loadSelectionOptions(forceReload = false) {
 
         state.boardOptions = result.data.boards || [];
         state.boardCounts = Object.fromEntries(state.boardOptions.map(item => [item.key, item.count]));
+        state.strategyGroups = result.data.strategy_groups || [];
         state.strategies = result.data.strategies || [];
         state.selectionOptionsLoaded = true;
 
         renderBoardOptions(state.boardOptions);
-        renderStrategyOptions(state.strategies);
+        renderStrategyOptions(state.strategies, state.strategyGroups);
         updateSelectionSnapshot();
     } catch (error) {
         if (error.name === 'AbortError' && state.systemHalted) {
@@ -3499,6 +3617,7 @@ function updateSelectionSnapshot() {
         : selectedBoards.map(key => BOARD_LABELS[key]).join(' / ') || 'NONE';
     document.getElementById('sidebar-universe-text').textContent = boardText;
     setFormulaStatus(formulaActive ? 'ARMED' : 'IDLE', formulaActive ? 'highlight' : '');
+    updateStrategyGroupMeta();
 }
 
 function setRunButtonsLoading(isLoading) {
@@ -4466,6 +4585,12 @@ function bindEvents() {
     document.getElementById('board-filter').addEventListener('change', updateSelectionSnapshot);
     document.getElementById('strategy-filter').addEventListener('change', updateSelectionSnapshot);
     document.getElementById('strategy-filter').addEventListener('click', event => {
+        const groupButton = event.target.closest('[data-strategy-group-toggle]');
+        if (groupButton) {
+            event.preventDefault();
+            toggleStrategyGroup(groupButton.dataset.strategyGroupToggle);
+            return;
+        }
         const button = event.target.closest('.strategy-param-toggle');
         if (!button) {
             return;

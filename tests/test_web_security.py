@@ -113,6 +113,26 @@ def test_formula_validate_endpoint_accepts_safe_formula():
     assert payload["success"] is True
 
 
+def test_selection_options_groups_b1_strategies(monkeypatch):
+    class EmptyManager:
+        @staticmethod
+        def list_all_stocks():
+            return []
+
+    monkeypatch.setattr(web_server, "_active_csv_manager", lambda: EmptyManager())
+    monkeypatch.setattr(web_server, "_load_stock_names", lambda: {})
+    client = web_server.app.test_client()
+
+    response = client.get("/api/selection/options")
+
+    assert response.status_code == 200
+    data = response.get_json()["data"]
+    assert [group["key"] for group in data["strategy_groups"][:3]] == ["b1", "b2", "bowl"]
+    strategy = next(item for item in data["strategies"] if item["name"] == "B1V24261Strategy")
+    assert strategy["group"] == "b1"
+    assert strategy["display_name"] == "V2.42.61"
+
+
 def test_provider_activate_requires_session_token_and_valid_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(web_server, "_data_root_dir", lambda: tmp_path)
     monkeypatch.setattr(web_server, "_find_running_update_job", lambda: None)
