@@ -47,9 +47,12 @@ class TushareFetcher(BaseDataProvider):
         self.daily_basic_rate_limit_wait = 62
         self.daily_basic_lock = Lock()
         self.pro_bar_calls = deque()
-        self.pro_bar_limit_per_minute = 360
+        # ts.pro_bar internally touches adj_factor, whose Tushare quota is
+        # lower than daily. Keep a buffer below 200/min to avoid mass fallback.
+        self.pro_bar_limit_per_minute = 160
         self.pro_bar_rate_limit_wait = 62
         self.pro_bar_lock = Lock()
+        self._sync_max_workers = min(self._sync_max_workers, 8)
         self.proxy_fallback_lock = Lock()
         self._prefer_direct_network = False
         self.daily_basic_by_date_cache = {}

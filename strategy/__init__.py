@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.bowl_rebound import BowlReboundStrategy
 from strategy.b1_v242b import B1V242BStrategy
 from strategy.b1_v242p import B1V242PStrategy
+from strategy.b1_v24261 import B1V24261Strategy
 from strategy.b2_beta import B2BetaStrategy
 from strategy.b1_min_j_simple import B1MinJSimpleStrategy
 from strategy.b1_min_j_complex import B1MinJComplexStrategy
@@ -22,6 +23,7 @@ STRATEGIES = {
     'BowlReboundStrategy': BowlReboundStrategy,
     'B1V242BStrategy': B1V242BStrategy,
     'B1V242PStrategy': B1V242PStrategy,
+    'B1V24261Strategy': B1V24261Strategy,
     'B2BetaStrategy': B2BetaStrategy,
     'B1MinJSimpleStrategy': B1MinJSimpleStrategy,
     'B1MinJComplexStrategy': B1MinJComplexStrategy,
@@ -31,6 +33,7 @@ __all__ = [
     'BowlReboundStrategy',
     'B1V242BStrategy',
     'B1V242PStrategy',
+    'B1V24261Strategy',
     'B2BetaStrategy',
     'B1MinJSimpleStrategy',
     'B1MinJComplexStrategy',

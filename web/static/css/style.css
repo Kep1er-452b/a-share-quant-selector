@@ -1189,6 +1189,8 @@ select {
 
 .strategy-option-grid {
     grid-template-columns: 1fr;
+    gap: 8px;
+    background: transparent;
 }
 
 .update-provider-grid {
@@ -1208,6 +1210,89 @@ select {
 .board-option,
 .strategy-option {
     position: relative;
+}
+
+.strategy-group {
+    display: grid;
+    border: 1px solid var(--grid-line);
+    background: var(--bg-panel);
+}
+
+.strategy-group-head {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    min-height: 54px;
+    padding: 8px;
+    color: var(--white);
+    text-align: left;
+    background: var(--bg-raised);
+    border: 0;
+    cursor: pointer;
+}
+
+.strategy-group-head:hover,
+.strategy-group-head:focus-visible,
+.strategy-group.open .strategy-group-head {
+    background: #151515;
+    color: var(--accent);
+}
+
+.strategy-group-head:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.strategy-group-caret {
+    color: var(--accent);
+    font-size: 11px;
+    text-align: center;
+}
+
+.strategy-group-copy,
+.strategy-option-copy {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+
+.strategy-group-name {
+    color: inherit;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.strategy-group-description,
+.strategy-option-description {
+    color: var(--dim);
+    font-size: 9px;
+    line-height: 1.35;
+    text-transform: none;
+}
+
+.strategy-group-meta {
+    color: var(--neutral);
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.strategy-group.has-selection .strategy-group-meta {
+    color: var(--accent);
+}
+
+.strategy-group-body {
+    display: grid;
+    gap: 1px;
+    padding: 1px;
+    background: var(--grid-line);
+}
+
+.strategy-group-body[hidden] {
+    display: none;
 }
 
 .option-input {
@@ -1258,6 +1343,10 @@ select {
 
 .strategy-param-panel[hidden] {
     display: none;
+}
+
+.strategy-option.selected > .strategy-option-card {
+    border-left-color: var(--accent);
 }
 
 .selection-param-row {

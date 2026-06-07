@@ -56,7 +56,12 @@ from utils.selection_worker import (
     initialize_selection_worker,
     process_selection_chunk,
 )
-from utils.strategy_labels import fallback_stock_name, is_invalid_stock_name
+from utils.strategy_labels import (
+    STRATEGY_GROUPS,
+    fallback_stock_name,
+    is_invalid_stock_name,
+    strategy_ui_metadata,
+)
 from utils.stock_exporter import (
     StockExportService,
     load_stock_names as load_stock_names_from_dir,
@@ -1015,6 +1020,8 @@ def _create_update_job(provider):
         'progress_pct': 0,
         'processed_count': 0,
         'total_count': 0,
+        'planned_total_count': 0,
+        'retry_count': 0,
         'current_step': '等待执行',
         'current_stock': None,
         'started_at': None,
@@ -1260,6 +1267,8 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
 def _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=100):
     total_count = int(payload.get('total_count') or 0)
     processed_count = int(payload.get('processed_count') or 0)
+    planned_total_count = int(payload.get('planned_total_count') or total_count)
+    retry_count = int(payload.get('retry_count') or max(total_count - planned_total_count, 0))
     raw_progress = int(payload.get('progress_pct') or 0)
     overall_progress = min(100, max(0, phase_offset + int(raw_progress * phase_weight / 100)))
     current_stock = payload.get('current_stock')
@@ -1270,6 +1279,8 @@ def _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=100):
         progress_pct=overall_progress,
         processed_count=processed_count,
         total_count=total_count,
+        planned_total_count=planned_total_count,
+        retry_count=retry_count,
         current_step=current_step,
         current_stock=current_stock,
     )
@@ -2647,16 +2658,28 @@ def get_selection_options():
         for strategy_name, strategy in registry.strategies.items():
             if strategy_name == FORMULA_STRATEGY_NAME:
                 continue
+            ui = strategy_ui_metadata(strategy_name)
             strategies.append({
                 'name': strategy_name,
+                'display_name': ui['label'],
+                'description': ui['description'],
+                'group': ui['group'],
+                'order': ui['order'],
                 'param_count': len(strategy.params or {}),
                 'params': strategy.params or {},
             })
+        group_order = {item['key']: item['order'] for item in STRATEGY_GROUPS}
+        strategies.sort(key=lambda item: (
+            group_order.get(item['group'], 999),
+            item['order'],
+            item['name'],
+        ))
 
         return jsonify({
             'success': True,
             'data': {
                 'boards': boards,
+                'strategy_groups': STRATEGY_GROUPS,
                 'strategies': strategies,
             }
         })

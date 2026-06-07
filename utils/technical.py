@@ -434,6 +434,7 @@ def calculate_zhixing_trend(df, m1=14, m2=28, m3=57, m4=114):
 _B1_B2_SHARED_STRATEGIES = {
     'B1V242BStrategy',
     'B1V242PStrategy',
+    'B1V24261Strategy',
     'B1MinJComplexStrategy',
     'B2BetaStrategy',
 }

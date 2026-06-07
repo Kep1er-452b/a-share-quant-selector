@@ -8,6 +8,7 @@ CATEGORY_LABELS = {
     "near_short_trend": "📈 靠近短期趋势线",
     "b1_v242b": "🎯 B1(V2.42B)",
     "b1_v242p": "🎯 B1(V2.42P)",
+    "b1_v24261": "🎯 B1(V2.42.61)",
     "b2_beta": "🚀 B2选股Beta版",
     "b1_min_j_simple": "🔻 B1MinJSimple",
     "b1_min_j_complex": "🧩 B1MinJComplex",
@@ -19,12 +20,97 @@ CATEGORY_DISPLAY_ORDER = [
     "near_short_trend",
     "b1_v242b",
     "b1_v242p",
+    "b1_v24261",
     "b2_beta",
     "b1_min_j_simple",
     "b1_min_j_complex",
 ]
 
 INVALID_STOCK_NAME_KEYWORDS = ("退", "未知", "退市", "已退")
+
+
+STRATEGY_GROUPS = [
+    {
+        "key": "b1",
+        "label": "B1",
+        "description": "B1 系列底部与量价策略",
+        "order": 10,
+    },
+    {
+        "key": "b2",
+        "label": "B2",
+        "description": "B2 系列确认与启动策略",
+        "order": 20,
+    },
+    {
+        "key": "bowl",
+        "label": "Bowl",
+        "description": "碗口反弹与趋势回踩策略",
+        "order": 30,
+    },
+    {
+        "key": "other",
+        "label": "Other",
+        "description": "其他独立策略",
+        "order": 90,
+    },
+]
+
+
+STRATEGY_UI_METADATA = {
+    "B1V242BStrategy": {
+        "group": "b1",
+        "label": "242B",
+        "description": "B1 V2.42B",
+        "order": 10,
+    },
+    "B1V242PStrategy": {
+        "group": "b1",
+        "label": "242P",
+        "description": "B1 V2.42P",
+        "order": 20,
+    },
+    "B1V24261Strategy": {
+        "group": "b1",
+        "label": "V2.42.61",
+        "description": "2026 年 6 月第 1 周公式",
+        "order": 30,
+    },
+    "B1MinJSimpleStrategy": {
+        "group": "b1",
+        "label": "Min J Simple",
+        "description": "动态 Min J 简化版",
+        "order": 40,
+    },
+    "B1MinJComplexStrategy": {
+        "group": "b1",
+        "label": "Min J Complex",
+        "description": "动态 Min J 完整版",
+        "order": 50,
+    },
+    "B2BetaStrategy": {
+        "group": "b2",
+        "label": "Beta",
+        "description": "B2 选股 Beta 版",
+        "order": 10,
+    },
+    "BowlReboundStrategy": {
+        "group": "bowl",
+        "label": "Rebound",
+        "description": "碗口反弹策略",
+        "order": 10,
+    },
+}
+
+
+def strategy_ui_metadata(strategy_name):
+    """Return stable grouping and display metadata for the Selection page."""
+    metadata = dict(STRATEGY_UI_METADATA.get(strategy_name, {}))
+    metadata.setdefault("group", "other")
+    metadata.setdefault("label", strategy_name)
+    metadata.setdefault("description", strategy_name)
+    metadata.setdefault("order", 999)
+    return metadata
 
 
 def category_label(category):

@@ -457,6 +457,7 @@ class BaseDataProvider:
 
         if result.get("fallback_full"):
             progress_state["total"] = progress_state.get("total", 0) + 1
+            progress_state["retry"] = progress_state.get("retry", 0) + 1
 
         progress_state["processed"] = progress_state.get("processed", 0) + 1
         if result.get("ok"):
@@ -471,6 +472,8 @@ class BaseDataProvider:
             "current_step": current_step,
             "processed_count": processed,
             "total_count": progress_state.get("total", 0),
+            "planned_total_count": progress_state.get("planned_total", progress_state.get("total", 0)),
+            "retry_count": progress_state.get("retry", 0),
             "progress_pct": int((processed / total) * 100),
             "current_stock": {
                 "code": item.get("code", result.get("code", "--")),
@@ -892,6 +895,8 @@ class BaseDataProvider:
             full_refresh_count=len(full_refresh),
             processed_count=0,
             total_count=len(incremental) + len(full_refresh),
+            planned_total_count=len(incremental) + len(full_refresh),
+            retry_count=0,
             progress_pct=0,
             current_stock=None,
         )
@@ -918,6 +923,8 @@ class BaseDataProvider:
                 current_step="本地数据已是最新",
                 processed_count=0,
                 total_count=0,
+                planned_total_count=0,
+                retry_count=0,
                 progress_pct=100,
                 current_stock=None,
             )
@@ -938,6 +945,8 @@ class BaseDataProvider:
         progress_state = {
             "processed": 0,
             "total": total_work,
+            "planned_total": total_work,
+            "retry": 0,
             "success": 0,
             "failed": 0,
         }
@@ -951,6 +960,8 @@ class BaseDataProvider:
             current_step="开始同步目标股票池数据",
             processed_count=0,
             total_count=total_work,
+            planned_total_count=total_work,
+            retry_count=0,
             progress_pct=0,
             current_stock=None,
             success_count=0,
@@ -987,6 +998,8 @@ class BaseDataProvider:
                             current_step="检测到复权断层，转为全量重抓",
                             processed_count=progress_state.get("processed", 0),
                             total_count=progress_state.get("total", 0),
+                            planned_total_count=progress_state.get("planned_total", progress_state.get("total", 0)),
+                            retry_count=progress_state.get("retry", 0),
                             progress_pct=int((progress_state.get("processed", 0) / max(progress_state.get("total", 1), 1)) * 100),
                             current_stock={"code": item.get("code"), "name": item.get("name", "")},
                             adjustment_gaps=gap_result.get("gaps", []),
@@ -1027,6 +1040,8 @@ class BaseDataProvider:
                         current_step="全量重抓后仍检测到复权断层",
                         processed_count=progress_state.get("processed", 0),
                         total_count=progress_state.get("total", 0),
+                        planned_total_count=progress_state.get("planned_total", progress_state.get("total", 0)),
+                        retry_count=progress_state.get("retry", 0),
                         progress_pct=int((progress_state.get("processed", 0) / max(progress_state.get("total", 1), 1)) * 100),
                         current_stock={"code": r.get("code"), "name": r.get("name", "")},
                         adjustment_gaps=r.get("gaps", []),
@@ -1061,6 +1076,8 @@ class BaseDataProvider:
             current_step="目标股票池同步完成",
             processed_count=processed,
             total_count=total_work,
+            planned_total_count=progress_state.get("planned_total", total_work),
+            retry_count=max(total_work - progress_state.get("planned_total", total_work), 0),
             progress_pct=100,
             current_stock=None,
             success_count=success_count,

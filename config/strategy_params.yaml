@@ -83,6 +83,22 @@ B1V242PStrategy:
   B1_TREND_TOLERANCE: 0.985
 
 # ============================================
+# B1 (V2.42.61) 策略
+# 通达信版本: 2026 年 6 月第 1 周
+# ============================================
+B1V24261Strategy:
+  J_MAX: 13
+  MV_MIN_BILLION: 50
+  YANGYIN_RATIO_28: 1.6
+  YANGYIN_RATIO_14: 2.2
+  YANGYIN_RATIO_57: 1.2
+  PLRY_VOL_RATIO: 1.95
+  HALF_DOWN_VOL_RATIO: 0.5
+  TOP_RANGE_RATIO: 0.95
+  FD15_VOL_RATIO: 1.2
+  B1_TREND_TOLERANCE: 0.995
+
+# ============================================
 # B2 选股 Beta 版策略
 # ============================================
 B2BetaStrategy:
