@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 允许本地HTTP连接（Flask服务） -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+        <domain includeSubdomains="true">10.0.3.2</domain>
+    </domain-config>
+    
+    <!-- 允许股票数据API的HTTP连接 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">qt.gtimg.cn</domain>
+        <domain includeSubdomains="true">web.ifzq.gtimg.cn</domain>
+        <domain includeSubdomains="true">push2his.eastmoney.com</domain>
+        <domain includeSubdomains="true">api.tushare.pro</domain>
+    </domain-config>
+    
+    <!-- 基础网络安全配置 -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    
+    <!-- 自定义颜色 -->
+    <color name="primary">#FF1976D2</color>
+    <color name="primary_dark">#FF1565C0</color>
+    <color name="accent">#FFFF6F00</color>
+    <color name="background">#FFF5F5F5</color>
+    <color name="surface">#FFFFFFFF</color>
+    <color name="error">#FFD32F2F</color>
+    <color name="success">#FF388E3C</color>
+    <color name="warning">#FFF57C00</color>
+    
+    <!-- 股票涨跌颜色 -->
+    <color name="stock_up">#FFD32F2F</color>
+    <color name="stock_down">#FF388E3C</color>
+    <color name="stock_flat">#FF757575</color>
+</resources>

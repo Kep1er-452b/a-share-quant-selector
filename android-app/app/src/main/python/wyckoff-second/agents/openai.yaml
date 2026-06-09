@@ -1,0 +1,4 @@
+interface:
+  display_name: "威科夫二世"
+  short_description: "威科夫交易分析、CSV读图与中文标注绘图助手，用于OHLCV行情结构研判"
+  default_prompt: "Use $wyckoff-second to analyze my CSV行情数据 with Wyckoff market structure and produce a Chinese-annotated chart."

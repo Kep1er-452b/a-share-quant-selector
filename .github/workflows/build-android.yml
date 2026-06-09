@@ -1,0 +1,79 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, android-build ]
+    paths:
+      - 'android-app/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      
+    - name: Accept Android SDK licenses
+      run: yes | sdkmanager --licenses || true
+      
+    - name: Install Android SDK components
+      run: |
+        sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+        
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+      
+    - name: Grant execute permission for gradlew
+      working-directory: android-app
+      run: chmod +x gradlew
+      
+    - name: Create gradle wrapper
+      working-directory: android-app
+      run: |
+        gradle wrapper --gradle-version 8.2
+        
+    - name: Build Debug APK
+      working-directory: android-app
+      run: ./gradlew assembleDebug --stacktrace
+      
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: quant-selector-debug-apk
+        path: android-app/app/build/outputs/apk/debug/*.apk
+        retention-days: 30
+        
+    - name: Create Release (on main branch push)
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: android-app/app/build/outputs/apk/debug/*.apk
+        tag_name: build-${{ github.run_number }}
+        name: Android Build ${{ github.run_number }}
+        body: |
+          ## A股量化选股系统 - Android版
+          
+          自动构建的Debug版本APK
+          
+          ### 安装方法
+          1. 下载 `app-debug.apk` 文件
+          2. 在Android手机上打开文件进行安装
+          3. 首次安装需要允许"未知来源"应用
+          
+          ### 功能说明
+          - 完整的选股策略功能
+          - WebView + Flask架构
+          - 支持Android 8.0+
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
