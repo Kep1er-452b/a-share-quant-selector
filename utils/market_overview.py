@@ -8,6 +8,7 @@ import os
 import socket
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -50,6 +51,8 @@ INDUSTRY_FETCH_TIMEOUT_SECONDS = 12
 INDUSTRY_FETCH_MAX_SECONDS = 120
 HEATMAP_SCOPES = ("all", "main", "chinext", "star")
 HEATMAP_METRICS = ("daily", "weekly", "monthly", "five_day")
+SNAPSHOT_SCHEMA_VERSION = 2
+HEATMAP_PAYLOAD_SCHEMA_VERSION = 2
 
 HIDDEN_MARKET_STOCK_CODES = {"300391"}
 HIDDEN_MARKET_STOCK_NAMES = {"长药退"}
@@ -162,6 +165,7 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
 
     latest_date = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
     latest_close = _safe_float(df.iloc[0]["close"])
+    previous_close = _metric_base_close(df, "daily")
     market_cap = normalize_market_cap_yuan(df.iloc[0].get("market_cap"), source_unit="yuan") or 0
     if pd.isna(latest_date) or latest_close is None:
         return None
@@ -181,6 +185,7 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
         "board": _classify_board(code),
         "latest_date": latest_date.strftime("%Y-%m-%d"),
         "latest_price": round(latest_close, 2),
+        "previous_close": round(previous_close, 2) if previous_close is not None else None,
         "market_cap": round(market_cap or 0.0, 2),
         "data_count": len(df),
         "metrics": metrics,
@@ -368,6 +373,8 @@ def snapshot_cache_needs_refresh(data_dir: str = "data") -> bool:
     snapshot = load_snapshot_cache(data_dir)
     if not snapshot:
         return True
+    if snapshot.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        return True
     local_status = _local_stock_data_status(data_dir)
     local_latest = local_status.get("latest_date")
     snapshot_latest = snapshot.get("latest_date")
@@ -420,6 +427,7 @@ def build_snapshot_cache(data_dir: str = "data", progress_callback: Optional[Cal
     records.sort(key=lambda item: str(item.get("code") or ""))
     latest_date = max((item["latest_date"] for item in records), default=None)
     payload = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "latest_date": latest_date,
         "stock_count": len(records),
@@ -886,6 +894,7 @@ def _group_stocks_by_industry(stocks: List[dict], industry_items: Dict[str, str]
                 "children": [],
                 "change_sum": 0.0,
                 "change_count": 0,
+                "changes": [],
             },
         )
         metric_value = stock.get("metrics", {}).get(metric)
@@ -905,15 +914,105 @@ def _group_stocks_by_industry(stocks: List[dict], industry_items: Dict[str, str]
         if metric_value is not None:
             group["change_sum"] += float(metric_value)
             group["change_count"] += 1
+            group["changes"].append(float(metric_value))
 
     result = list(grouped.values())
     result.sort(key=lambda item: item["market_cap"], reverse=True)
     for item in result:
         item["children"].sort(key=lambda child: child["market_cap"], reverse=True)
         item["change_pct"] = round(item["change_sum"] / item["change_count"], 4) if item["change_count"] else None
+        changes = item.pop("changes", [])
+        item["median_change_pct"] = round(float(median(changes)), 2) if changes else None
+        item["up_count"] = len([value for value in changes if value > 0])
+        item["down_count"] = len([value for value in changes if value < 0])
+        item["flat_count"] = len(changes) - item["up_count"] - item["down_count"]
         item.pop("change_sum", None)
         item.pop("change_count", None)
     return result
+
+
+def _stock_limit_rate(stock: dict) -> Optional[float]:
+    if int(stock.get("data_count") or 0) <= 5:
+        return None
+
+    board = stock.get("board")
+    name = _safe_text(stock.get("name")).upper().replace(" ", "")
+    if board in {"chinext", "star"}:
+        return 0.20
+    if name.startswith("ST") or name.startswith("*ST"):
+        return 0.05
+    return 0.10
+
+
+def _limit_price(previous_close: float, rate: float, direction: int) -> float:
+    previous = Decimal(str(previous_close))
+    raw = previous * (Decimal("1") + Decimal(str(rate)) * Decimal(direction))
+    target = raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if abs(target - previous) < Decimal("0.01"):
+        target = previous + Decimal("0.01") * Decimal(direction)
+    return float(max(target, Decimal("0.01")))
+
+
+def _is_price_limit_hit(stock: dict, direction: int) -> bool:
+    rate = _stock_limit_rate(stock)
+    if rate is None:
+        return False
+
+    latest = _safe_float(stock.get("latest_price"))
+    previous = _safe_float(stock.get("previous_close"))
+    change_pct = _safe_float(stock.get("metrics", {}).get("daily"))
+    if previous is None and latest is not None and change_pct is not None and change_pct > -100:
+        previous = latest / (1 + change_pct / 100)
+    if latest is not None and previous is not None and previous > 0:
+        target = _limit_price(previous, rate, direction)
+        return latest >= target - 0.0001 if direction > 0 else latest <= target + 0.0001
+
+    if change_pct is None:
+        return False
+    threshold = rate * 100 - 0.25
+    return change_pct >= threshold if direction > 0 else change_pct <= -threshold
+
+
+def _market_distribution(stocks: List[dict], values: List[float]) -> List[dict]:
+    limit_up_codes = {
+        stock.get("code") for stock in stocks
+        if _is_price_limit_hit(stock, 1)
+    }
+    limit_down_codes = {
+        stock.get("code") for stock in stocks
+        if _is_price_limit_hit(stock, -1)
+    }
+    regular_values = [
+        (stock.get("code"), stock.get("metrics", {}).get("daily"))
+        for stock in stocks
+        if stock.get("metrics", {}).get("daily") is not None
+    ]
+
+    def count_between(lower: float, upper: float, direction: int) -> int:
+        return len([
+            code for code, value in regular_values
+            if code not in limit_up_codes
+            and code not in limit_down_codes
+            and (
+                lower < float(value) <= upper
+                if direction > 0
+                else -upper <= float(value) < -lower
+            )
+        ])
+
+    return [
+        {"key": "limit_up", "label": "涨停", "count": len(limit_up_codes), "direction": "up"},
+        {"key": "up_over_7", "label": ">7%", "count": count_between(7, float("inf"), 1), "direction": "up"},
+        {"key": "up_5_7", "label": "5-7", "count": count_between(5, 7, 1), "direction": "up"},
+        {"key": "up_3_5", "label": "3-5", "count": count_between(3, 5, 1), "direction": "up"},
+        {"key": "up_0_3", "label": "0-3", "count": count_between(0, 3, 1), "direction": "up"},
+        {"key": "flat", "label": "平", "count": len([value for value in values if value == 0]), "direction": "flat"},
+        {"key": "down_0_3", "label": "0-3", "count": count_between(0, 3, -1), "direction": "down"},
+        {"key": "down_3_5", "label": "3-5", "count": count_between(3, 5, -1), "direction": "down"},
+        {"key": "down_5_7", "label": "5-7", "count": count_between(5, 7, -1), "direction": "down"},
+        {"key": "down_over_7", "label": ">7%", "count": count_between(7, float("inf"), -1), "direction": "down"},
+        {"key": "limit_down", "label": "跌停", "count": len(limit_down_codes), "direction": "down"},
+    ]
 
 
 def _build_market_stats(stocks: List[dict], metric: str) -> dict:
@@ -922,16 +1021,26 @@ def _build_market_stats(stocks: List[dict], metric: str) -> dict:
     up_count = len([value for value in values if value > 0])
     down_count = len([value for value in values if value < 0])
     flat_count = len(values) - up_count - down_count
-    return {
+    stats = {
         "up_count": up_count,
         "down_count": down_count,
         "flat_count": flat_count,
         "median_change_pct": round(float(median(values)), 2) if values else None,
     }
+    if metric == "daily":
+        distribution = _market_distribution(stocks, values)
+        stats["limit_up_count"] = distribution[0]["count"]
+        stats["limit_down_count"] = distribution[-1]["count"]
+        stats["distribution"] = distribution
+        stats["limit_counts_available"] = True
+    else:
+        stats["limit_counts_available"] = False
+    return stats
 
 
 def _heatmap_payload_signature(snapshot: dict, industry_cache: dict, index_cache: dict) -> dict:
     return {
+        "schema_version": HEATMAP_PAYLOAD_SCHEMA_VERSION,
         "snapshot_updated_at": snapshot.get("updated_at"),
         "snapshot_latest_date": snapshot.get("latest_date"),
         "industry_updated_at": industry_cache.get("updated_at"),

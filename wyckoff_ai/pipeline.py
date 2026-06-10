@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from utils.csv_manager import CSVManager
+from utils.runtime_paths import wyckoff_results_dir
 from utils.stock_exporter import resolve_stock_query
 
 from .client import DEEPSEEK_MODEL, DeepSeekWyckoffClient, resolve_deepseek_api_key
@@ -31,11 +32,11 @@ class WyckoffPipeline:
         self,
         config: dict | None = None,
         data_dir: str = "data",
-        output_dir: str | Path = "outputs/wyckoff",
+        output_dir: str | Path | None = None,
     ):
         self.config = config or {}
         self.data_dir = data_dir
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir) if output_dir is not None else wyckoff_results_dir()
         self.csv_manager = CSVManager(data_dir)
 
     def _resolve_stock(self, query: str) -> dict[str, Any]:

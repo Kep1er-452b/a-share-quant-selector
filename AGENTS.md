@@ -15,9 +15,9 @@ git status --short --branch
 git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
-- This document was created against commit:
-  `b03832462a0c4ec778e6c54910e21187686b1eb3`
-  (`Add B1 V2.42.61 strategy and grouped selection UI`, 2026-06-07).
+- This document was last reconciled against commit:
+  `1bd8a6821dd4f9e53c867fcf4828b01cae3823b3`
+  (`feat: Add Android app with GitHub Actions build`, 2026-06-09).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -84,6 +84,7 @@ environment variables or ignored local config files, never in committed docs.
 - `utils/data_provider.py`: provider abstraction, update planning, and progress.
 - `utils/provider_router.py`: provider warehouse paths and active-provider state.
 - `utils/csv_manager.py`: validated, locked, atomic CSV reads and writes.
+- `utils/runtime_paths.py`: repository-external selection and Wyckoff output paths.
 - `utils/technical.py`: Tongdaxin-style indicators and shared feature preparation.
 - `utils/market_overview.py`: snapshots, heatmap data, cache health and rebuilds.
 - `web/templates/index.html`: application shell.
@@ -133,6 +134,11 @@ Critical rules:
 ### Market Caches
 
 - Snapshot and heatmap caches are derived data, not primary stock history.
+- Snapshot schema version 2 stores `previous_close` so daily price-limit counts
+  can use exchange tick rounding instead of a percentage-only approximation.
+- Daily limit counts use 10% for ordinary main-board stocks, 5% for main-board
+  ST stocks, and 20% for ChiNext/STAR stocks. The first five stored trading
+  days are excluded from limit counts.
 - Web update progress around `82%` is the transition from target-stock sync to
   market-cache refresh. Inspect `_refresh_market_caches_for_job()` and the update
   status API before blaming the frontend.
@@ -156,9 +162,14 @@ Critical rules:
 
 Current registered strategy families:
 
-- B1: 242B, 242P, V2.42.61, Min J Simple, Min J Complex.
+- B1: 242B, 242P, V2.42.61, Min J Simple, Min J Complex, Min J 61 Complex.
 - B2: Beta.
 - Bowl: Rebound.
+
+`B1MinJSimpleStrategy` is an independent legacy condition based on the Zhixing
+short trend, bull/bear line, and dynamic Min J. It is not derived from the
+complex B1 formula variants. `B1MinJ61ComplexStrategy` is the full V2.42.61
+formula with dynamic Min J replacing the fixed J threshold.
 
 The Selection page receives family metadata from `/api/selection/options`.
 Do not hardcode a second independent grouping table in the frontend.
@@ -224,6 +235,12 @@ At commit `b038324`, the full suite result was:
 54 passed
 ```
 
+The current uncommitted market-pulse and Min J 61 work passed:
+
+```text
+60 passed
+```
+
 Useful runtime checks:
 
 ```bash
@@ -239,33 +256,64 @@ unrelated code change.
 Treat these as runtime artifacts unless the task explicitly concerns them:
 
 - `data/`
-- `outputs/`
 - `logs/`
-- `stock-selected/`
 - caches, provider state, watchlists, exported CSVs, generated charts
 
-Do not delete or rewrite them casually. Do not commit newly generated runtime
-artifacts unless the user explicitly wants them versioned.
+Selection Markdown and Wyckoff analysis artifacts default to:
+
+```text
+~/DocumentsData/A股量化选股系统数据/选股结果
+~/DocumentsData/A股量化选股系统数据/威科夫分析结果
+```
+
+`A_SHARE_QUANT_OUTPUT_ROOT` can override the common parent directory. These
+outputs intentionally live outside the repository. Legacy `stock-selected/`,
+`outputs/`, and `android-app/` paths remain ignored to prevent accidental
+reintroduction. Provider CSV warehouses remain under the ignored `data/`
+directory and must not be moved without an explicit data-migration task.
+
+Do not delete or rewrite runtime artifacts casually. Do not commit newly
+generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `b038324` on `main`, matching `origin/main` when this document
-was created.
+Baseline commit: `1bd8a68` on local `main`; `origin/main` is currently
+`a8d8149`.
 
 State at handoff:
 
 - B1 V2.42.61 is implemented as `B1V24261Strategy`.
+- `B1MinJSimpleStrategy` retains its independent legacy Zhixing conditions.
+- `B1MinJ61ComplexStrategy` is added as a separate full V2.42.61 + dynamic
+  Min J strategy; the historical Min J Complex strategy remains unchanged.
 - Selection strategies are grouped under collapsible B1, B2, and Bowl families.
 - Child strategies remain individually selectable and retain parameter editing.
-- The B1 V2.42.61 formula and Selection API grouping have focused tests.
-- Full test suite passed: `54 passed`.
-- No known implementation work was pending before adding this document.
+- F1 Market Pulse now includes price-limit counts, a Tongdaxin-style breadth
+  distribution, and a sortable all-industry ranking modal.
+- F2 uses its local ticker for the top ten and bottom ten industry returns,
+  rendered red-up and green-down, while the global ticker keeps market breadth.
+- The F1 breadth columns are centered in a compact 650px group rather than
+  stretched across the full panel.
+- Selection and Wyckoff outputs now live under
+  `~/DocumentsData/A股量化选股系统数据`; existing local history was migrated
+  there. Provider CSV data remains in the ignored repository-local `data/`.
+- The repository Android subtree and Android GitHub Actions workflow are
+  removed. The independent project remains at
+  `~/Downloads/android-app`, and `android-app/` is ignored here.
+- Focused strategy/cache/web/runtime-path tests and the full suite passed:
+  `63 passed`.
+- Browser verification covered the compact F1 chart, industry sort modal, F2
+  ticker, and serving a historical Wyckoff chart from the external directory.
+- These task changes remain uncommitted. There is no implementation blocker.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `1bd8a68` (2026-06-09): added the Android app subtree and GitHub Actions
+  workflow; the current uncommitted cleanup removes both after preserving the
+  independent project under `~/Downloads/android-app`.
 - `b038324` (2026-06-07): added B1 V2.42.61, strategy-family metadata, and
   collapsible Selection family UI.
 - `72685d5` (2026-06-02): added manual provider switching through the existing
@@ -291,4 +339,3 @@ After a meaningful task:
    entry only if future agents need the architectural or behavioral decision.
 4. Remove resolved temporary handoff notes. Git remains the detailed history.
 5. Keep this file concise enough to read at the beginning of every new session.
-

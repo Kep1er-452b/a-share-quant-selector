@@ -148,6 +148,24 @@ B1MinJComplexStrategy:
   B1_TREND_TOLERANCE: 0.985
 
 # ============================================
+# B1 Min J 61 Complex
+# 完整 V2.42.61 条件，动态 Min J 替换固定 J <= 13
+# ============================================
+B1MinJ61ComplexStrategy:
+  MIN_HISTORY_DAYS: 160
+  J_VALLEY_MAX: 55
+  LONG_OFFSET: 10
+  MV_MIN_BILLION: 50
+  YANGYIN_RATIO_28: 1.6
+  YANGYIN_RATIO_14: 2.2
+  YANGYIN_RATIO_57: 1.2
+  PLRY_VOL_RATIO: 1.95
+  HALF_DOWN_VOL_RATIO: 0.5
+  TOP_RANGE_RATIO: 0.95
+  FD15_VOL_RATIO: 1.2
+  B1_TREND_TOLERANCE: 0.995
+
+# ============================================
 # B1完美图形匹配 (B1PatternMatch)
 # ============================================
 # 功能说明：

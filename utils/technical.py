@@ -436,6 +436,7 @@ _B1_B2_SHARED_STRATEGIES = {
     'B1V242PStrategy',
     'B1V24261Strategy',
     'B1MinJComplexStrategy',
+    'B1MinJ61ComplexStrategy',
     'B2BetaStrategy',
 }
 
