@@ -51,6 +51,7 @@ from utils.provider_router import (
     provider_data_dir,
     warehouse_summary,
 )
+from utils.runtime_paths import selection_results_dir, wyckoff_results_dir
 from utils.selection_worker import (
     build_worker_context,
     initialize_selection_worker,
@@ -695,7 +696,7 @@ def _build_selection_markdown(results, time_text, meta=None):
 
 
 def _save_selection_markdown(results, time_text, meta=None):
-    output_dir = project_root / "stock-selected"
+    output_dir = selection_results_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", f"{timestamp}-选股内容").strip("-")
@@ -1898,7 +1899,7 @@ def get_wyckoff_config():
 
 
 def _wyckoff_outputs_root():
-    return project_root / 'outputs' / 'wyckoff'
+    return wyckoff_results_dir()
 
 
 def _path_relative_to_project(path):
@@ -2121,7 +2122,11 @@ def analyze_wyckoff_stock():
 
         config = _load_config()
         data_dir = str(_active_data_dir())
-        pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
+        pipeline = WyckoffPipeline(
+            config=config,
+            data_dir=data_dir,
+            output_dir=_wyckoff_outputs_root(),
+        )
         result = pipeline.analyze_stock(query)
         return jsonify(_attach_wyckoff_chart_url(result))
     except WyckoffPipelineError as e:
@@ -2170,7 +2175,11 @@ def _run_wyckoff_job(job_id, query):
 
         config = _load_config()
         data_dir = str(_active_data_dir())
-        pipeline = WyckoffPipeline(config=config, data_dir=data_dir)
+        pipeline = WyckoffPipeline(
+            config=config,
+            data_dir=data_dir,
+            output_dir=_wyckoff_outputs_root(),
+        )
         result = pipeline.analyze_stock(query, progress_callback=progress_callback)
         _attach_wyckoff_chart_url(result)
         _update_wyckoff_job(
@@ -2298,13 +2307,13 @@ def reveal_wyckoff_file():
         if not raw_path:
             return jsonify({'success': False, 'error': '缺少文件路径'}), 400
 
-        outputs_root = (project_root / 'outputs' / 'wyckoff').resolve()
+        outputs_root = _wyckoff_outputs_root().resolve()
         target = Path(raw_path)
         if not target.is_absolute():
             target = project_root / target
         target = target.resolve()
         if outputs_root not in target.parents and target != outputs_root:
-            return jsonify({'success': False, 'error': '只能打开 outputs/wyckoff 下的文件'}), 400
+            return jsonify({'success': False, 'error': '只能打开威科夫分析结果目录下的文件'}), 400
         if not target.exists():
             return jsonify({'success': False, 'error': f'文件不存在: {target}'}), 404
 
@@ -2316,8 +2325,8 @@ def reveal_wyckoff_file():
 
 @app.route('/outputs/wyckoff/charts/<path:filename>')
 def serve_wyckoff_chart(filename):
-    """Serve generated Wyckoff chart PNG files from the ignored outputs folder."""
-    charts_dir = project_root / 'outputs' / 'wyckoff' / 'charts'
+    """Serve legacy flat Wyckoff chart PNG files."""
+    charts_dir = _wyckoff_outputs_root() / 'charts'
     return send_from_directory(charts_dir, filename)
 
 
@@ -2327,7 +2336,7 @@ def serve_wyckoff_file(filename):
     outputs_root = _wyckoff_outputs_root().resolve()
     target = (outputs_root / filename).resolve()
     if outputs_root not in target.parents and target != outputs_root:
-        return jsonify({'success': False, 'error': '只能读取 outputs/wyckoff 下的文件'}), 400
+        return jsonify({'success': False, 'error': '只能读取威科夫分析结果目录下的文件'}), 400
     return send_from_directory(outputs_root, filename)
 
 
@@ -2340,8 +2349,18 @@ def get_dashboard_pulse():
         payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily', refresh=False)
         health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
+        industry_groups = [{
+            'name': group.get('name'),
+            'change_pct': group.get('change_pct'),
+            'median_change_pct': group.get('median_change_pct'),
+            'stock_count': group.get('stock_count', 0),
+            'up_count': group.get('up_count', 0),
+            'down_count': group.get('down_count', 0),
+            'flat_count': group.get('flat_count', 0),
+            'market_cap': group.get('market_cap', 0),
+        } for group in groups]
         ranked_groups = [
-            group for group in groups
+            group for group in industry_groups
             if group.get('change_pct') is not None
         ]
         leaders = sorted(ranked_groups, key=lambda item: item.get('change_pct', 0), reverse=True)[:3]
@@ -2355,6 +2374,7 @@ def get_dashboard_pulse():
                 'ticker_stats': payload.get('ticker_stats', {}),
                 'leaders': leaders,
                 'laggards': laggards,
+                'industry_groups': industry_groups,
                 'header_indices': payload.get('header_indices', []),
                 'cache_health': health,
                 'active_provider': load_active_provider(data_root),

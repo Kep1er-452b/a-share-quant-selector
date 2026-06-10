@@ -35,10 +35,14 @@ env/
 # Data files (large, should not be committed)
 data/
 !data/.gitkeep
+stock-selected/
 
 # Logs
 *.log
 outputs/
+
+# External projects kept outside this repository
+android-app/
 
 # Config with sensitive info (user should create their own)
 config/config.yaml

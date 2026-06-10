@@ -831,6 +831,44 @@
     </div>
 </div>
 
+<div id="market-industry-modal" class="modal-backdrop">
+    <div class="modal-box market-industry-modal-box">
+        <div class="modal-header">
+            <div>
+                <div class="modal-kicker">MARKET INDUSTRY RANKING</div>
+                <span class="modal-title" id="market-industry-modal-title">行业涨跌幅</span>
+            </div>
+            <div class="modal-header-actions">
+                <button class="btn btn-ghost industry-sort-btn active" data-industry-sort="desc" type="button">涨幅优先</button>
+                <button class="btn btn-ghost industry-sort-btn" data-industry-sort="asc" type="button">跌幅优先</button>
+                <button class="modal-close" id="market-industry-modal-close-btn" type="button">X</button>
+            </div>
+        </div>
+        <div class="modal-body">
+            <div class="industry-modal-subtitle" id="market-industry-modal-subtitle">--</div>
+            <div class="table-wrap market-industry-table-wrap">
+                <table class="data-table stable-scroll-table market-industry-table">
+                    <thead>
+                        <tr>
+                            <th>行业</th>
+                            <th class="sortable-industry-header" data-industry-sort-toggle>平均涨跌幅</th>
+                            <th>中位涨跌幅</th>
+                            <th>上涨</th>
+                            <th>下跌</th>
+                            <th>平盘</th>
+                            <th>股票数</th>
+                            <th>总市值(亿)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="market-industry-modal-tbody">
+                        <tr><td colspan="8" class="state-loading">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script src="/static/js/app.js"></script>

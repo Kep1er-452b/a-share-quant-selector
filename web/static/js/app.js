@@ -97,6 +97,8 @@ const state = {
     wyckoffTickerActive: false,
     currentWyckoffResult: null,
     currentWyckoffBatchIndex: null,
+    dashboardIndustryGroups: [],
+    marketIndustrySort: 'desc',
 };
 
 function escapeHtml(value) {
@@ -714,28 +716,71 @@ function buildTickerText(stats, latestDate) {
     const medianText = Number.isFinite(Number(stats?.median_change_pct))
         ? `${Number(stats.median_change_pct).toFixed(2)}%`
         : '--';
-    return [
+    const items = [
         `上涨家数 ${formatNumber(stats?.up_count ?? 0)}`,
         `下跌家数 ${formatNumber(stats?.down_count ?? 0)}`,
+    ];
+    if (stats?.limit_counts_available) {
+        items.push(
+            `涨停家数 ${formatNumber(stats?.limit_up_count ?? 0)}`,
+            `跌停家数 ${formatNumber(stats?.limit_down_count ?? 0)}`,
+        );
+    }
+    items.push(
         `平盘家数 ${formatNumber(stats?.flat_count ?? 0)}`,
         `中位涨幅 ${medianText}`,
         `最新交易日 ${latestDate || '--'}`,
-    ];
+    );
+    return items;
 }
 
-function buildTickerLoopText(stats, latestDate) {
-    const ticker = buildTickerText(stats, latestDate).join('   •   ');
-    return `${ticker}   •   ${ticker}`;
+function buildIndustryTickerLoopHtml(groups) {
+    const ranked = (Array.isArray(groups) ? groups : [])
+        .filter(item => Number.isFinite(Number(item.change_pct)))
+        .sort((left, right) => Number(right.change_pct) - Number(left.change_pct));
+    const items = [
+        ...ranked.slice(0, 10),
+        ...ranked.slice(-10),
+    ]
+        .map(item => `
+            <span class="industry-ticker-item">
+                <span>${escapeHtml(item.name || '--')}</span>
+                <span class="${signedClass(item.change_pct)}">${escapeHtml(formatPercent(item.change_pct))}</span>
+            </span>
+        `);
+    const content = items.length ? items.join('<span class="industry-ticker-separator">•</span>') : '行业涨跌幅暂无数据';
+    return `${content}<span class="industry-ticker-separator">•</span>${content}`;
 }
 
-function formatPulseGroupList(groups) {
+function formatPulseGroupHtml(groups) {
     if (!Array.isArray(groups) || !groups.length) {
-        return '--';
+        return '<span class="pulse-group-empty">--</span>';
     }
-    return groups.map(item => {
-        const pct = Number.isFinite(Number(item.change_pct)) ? formatPercent(item.change_pct) : '--';
-        return `${item.name || '--'} ${pct}`;
-    }).join(' / ');
+    return groups.map(item => `
+        <span class="pulse-group-item">
+            <span>${escapeHtml(item.name || '--')}</span>
+            <span class="${signedClass(item.change_pct)}">${escapeHtml(formatPercent(item.change_pct))}</span>
+        </span>
+    `).join('');
+}
+
+function renderPulseDistribution(distribution) {
+    const items = Array.isArray(distribution) ? distribution : [];
+    const maxCount = Math.max(...items.map(item => Number(item.count) || 0), 1);
+    return items.map(item => {
+        const count = Number(item.count) || 0;
+        const height = count > 0 ? Math.max(6, Math.round((count / maxCount) * 100)) : 2;
+        const direction = ['up', 'down', 'flat'].includes(item.direction) ? item.direction : 'flat';
+        return `
+            <div class="pulse-distribution-column ${direction}">
+                <div class="pulse-distribution-count">${formatNumber(count)}</div>
+                <div class="pulse-distribution-bar-shell">
+                    <div class="pulse-distribution-bar" style="--pulse-bar-height:${height}%"></div>
+                </div>
+                <div class="pulse-distribution-label">${escapeHtml(item.label || '--')}</div>
+            </div>
+        `;
+    }).join('');
 }
 
 function renderDashboardPulse(payload) {
@@ -746,46 +791,85 @@ function renderDashboardPulse(payload) {
 
     const stats = payload?.ticker_stats || {};
     const median = stats.median_change_pct;
+    const upCount = Number(stats.up_count || 0);
+    const downCount = Number(stats.down_count || 0);
+    const directionalTotal = Math.max(upCount + downCount, 1);
+    const upWidth = (upCount / directionalTotal) * 100;
+    const downWidth = 100 - upWidth;
+    state.dashboardIndustryGroups = Array.isArray(payload?.industry_groups)
+        ? payload.industry_groups
+        : [];
     container.innerHTML = `
-        <div class="pulse-card">
-            <div class="pulse-label">ADVANCERS</div>
-            <div class="pulse-value up">${formatNumber(stats.up_count || 0)}</div>
-            <div class="pulse-sub">上涨家数</div>
+        <div class="pulse-summary-grid">
+            <div class="pulse-card">
+                <div class="pulse-label">ADVANCERS</div>
+                <div class="pulse-value up">${formatNumber(upCount)}</div>
+                <div class="pulse-sub">上涨家数</div>
+            </div>
+            <div class="pulse-card">
+                <div class="pulse-label">DECLINERS</div>
+                <div class="pulse-value down">${formatNumber(downCount)}</div>
+                <div class="pulse-sub">下跌家数</div>
+            </div>
+            <div class="pulse-card">
+                <div class="pulse-label">LIMIT UP</div>
+                <div class="pulse-value up">${formatNumber(stats.limit_up_count || 0)}</div>
+                <div class="pulse-sub">涨停家数</div>
+            </div>
+            <div class="pulse-card">
+                <div class="pulse-label">LIMIT DOWN</div>
+                <div class="pulse-value down">${formatNumber(stats.limit_down_count || 0)}</div>
+                <div class="pulse-sub">跌停家数</div>
+            </div>
+            <div class="pulse-card">
+                <div class="pulse-label">UNCHANGED</div>
+                <div class="pulse-value">${formatNumber(stats.flat_count || 0)}</div>
+                <div class="pulse-sub">平盘家数</div>
+            </div>
+            <div class="pulse-card">
+                <div class="pulse-label">MEDIAN MOVE</div>
+                <div class="pulse-value ${signedClass(median)}">${formatPercent(median)}</div>
+                <div class="pulse-sub">全市场中位涨幅</div>
+            </div>
         </div>
-        <div class="pulse-card">
-            <div class="pulse-label">DECLINERS</div>
-            <div class="pulse-value down">${formatNumber(stats.down_count || 0)}</div>
-            <div class="pulse-sub">下跌家数</div>
+        <div class="pulse-distribution-panel">
+            <div class="pulse-distribution-head">
+                <span>MARKET DISTRIBUTION</span>
+                <span>${escapeHtml(payload?.latest_date || '--')} · RED UP / GREEN DOWN</span>
+            </div>
+            <div class="pulse-distribution-chart">
+                ${renderPulseDistribution(stats.distribution)}
+            </div>
+            <div class="pulse-balance-row">
+                <span class="pulse-balance-count up">${formatNumber(upCount)}</span>
+                <div class="pulse-balance-track">
+                    <span class="pulse-balance-up" style="width:${upWidth.toFixed(2)}%"></span>
+                    <span class="pulse-balance-down" style="width:${downWidth.toFixed(2)}%"></span>
+                </div>
+                <span class="pulse-balance-count down">${formatNumber(downCount)}</span>
+            </div>
         </div>
-        <div class="pulse-card">
-            <div class="pulse-label">UNCHANGED</div>
-            <div class="pulse-value">${formatNumber(stats.flat_count || 0)}</div>
-            <div class="pulse-sub">平盘家数</div>
-        </div>
-        <div class="pulse-card">
-            <div class="pulse-label">MEDIAN MOVE</div>
-            <div class="pulse-value ${signedClass(median)}">${formatPercent(median)}</div>
-            <div class="pulse-sub">全市场中位涨幅</div>
-        </div>
-        <div class="pulse-card pulse-card-wide">
-            <div class="pulse-label">STRONG GROUPS</div>
-            <div class="pulse-value up">${escapeHtml(formatPulseGroupList(payload?.leaders))}</div>
-            <div class="pulse-sub">行业涨幅前三</div>
-        </div>
-        <div class="pulse-card pulse-card-wide">
-            <div class="pulse-label">WEAK GROUPS</div>
-            <div class="pulse-value down">${escapeHtml(formatPulseGroupList(payload?.laggards))}</div>
-            <div class="pulse-sub">行业跌幅前三</div>
-        </div>
-        <div class="pulse-card pulse-card-wide">
-            <div class="pulse-label">INDEX WATCH</div>
-            <div class="pulse-value">${escapeHtml(formatPulseGroupList(payload?.header_indices))}</div>
-            <div class="pulse-sub">主要指数快照</div>
-        </div>
-        <div class="pulse-card pulse-card-wide">
-            <div class="pulse-label">COVERAGE</div>
-            <div class="pulse-value">${formatNumber(payload?.stock_count || 0)} / ${formatNumber(payload?.group_count || 0)}</div>
-            <div class="pulse-sub">股票 / 行业分组 · ${escapeHtml(payload?.latest_date || '--')}</div>
+        <div class="pulse-detail-grid">
+            <button class="pulse-card pulse-detail-card pulse-industry-card" data-market-industry-open type="button">
+                <div class="pulse-card-heading">
+                    <span class="pulse-label">INDUSTRY RANKING</span>
+                    <span class="pulse-open-hint">OPEN LIST &gt;</span>
+                </div>
+                <div class="pulse-group-list">${formatPulseGroupHtml(payload?.leaders)}</div>
+                <div class="pulse-group-list">${formatPulseGroupHtml(payload?.laggards)}</div>
+                <div class="pulse-sub">点击查看全部行业，可按涨幅或跌幅排序</div>
+            </button>
+            <div class="pulse-card pulse-detail-card">
+                <div class="pulse-label">INDEX WATCH</div>
+                <div class="pulse-group-list pulse-index-list">${formatPulseGroupHtml(payload?.header_indices)}</div>
+                <div class="pulse-sub">主要指数快照</div>
+            </div>
+            <div class="pulse-card pulse-detail-card">
+                <div class="pulse-label">COVERAGE</div>
+                <div class="pulse-value">${formatNumber(payload?.stock_count || 0)} / ${formatNumber(payload?.group_count || 0)}</div>
+                <div class="pulse-sub">股票 / 行业分组</div>
+                <div class="pulse-coverage-date">${escapeHtml(payload?.latest_date || '--')}</div>
+            </div>
         </div>
     `;
 }
@@ -1046,6 +1130,58 @@ async function loadDashboardPulse() {
             healthContainer.innerHTML = `<div class="state-empty">DATA WATCH LOAD FAILED: ${escapeHtml(error.message)}</div>`;
         }
     }
+}
+
+function renderMarketIndustryModal() {
+    const tbody = document.getElementById('market-industry-modal-tbody');
+    if (!tbody) {
+        return;
+    }
+
+    const direction = state.marketIndustrySort === 'asc' ? 1 : -1;
+    const groups = [...state.dashboardIndustryGroups]
+        .filter(item => Number.isFinite(Number(item.change_pct)))
+        .sort((left, right) => {
+            const changeDiff = (Number(left.change_pct) - Number(right.change_pct)) * direction;
+            if (changeDiff !== 0) {
+                return changeDiff;
+            }
+            return String(left.name || '').localeCompare(String(right.name || ''), 'zh-CN');
+        });
+
+    document.querySelectorAll('[data-industry-sort]').forEach(button => {
+        button.classList.toggle('active', button.dataset.industrySort === state.marketIndustrySort);
+    });
+    document.getElementById('market-industry-modal-title').textContent =
+        state.marketIndustrySort === 'asc' ? '行业跌幅排序' : '行业涨幅排序';
+    document.getElementById('market-industry-modal-subtitle').textContent =
+        `${formatNumber(groups.length)} 个行业 · ${state.marketIndustrySort === 'asc' ? '跌幅优先' : '涨幅优先'} · 平均涨跌幅为行业内股票等权平均`;
+
+    tbody.innerHTML = groups.map(item => `
+        <tr>
+            <td>${escapeHtml(item.name || '--')}</td>
+            <td class="mono metric-value ${signedClass(item.change_pct)}">${escapeHtml(formatPercent(item.change_pct))}</td>
+            <td class="mono metric-value ${signedClass(item.median_change_pct)}">${escapeHtml(formatPercent(item.median_change_pct))}</td>
+            <td class="mono price-up">${formatNumber(item.up_count || 0)}</td>
+            <td class="mono price-down">${formatNumber(item.down_count || 0)}</td>
+            <td class="mono">${formatNumber(item.flat_count || 0)}</td>
+            <td class="mono">${formatNumber(item.stock_count || 0)}</td>
+            <td class="mono">${formatNumber(((Number(item.market_cap) || 0) / 1e8).toFixed(2))}</td>
+        </tr>
+    `).join('');
+}
+
+function openMarketIndustryModal() {
+    if (!state.dashboardIndustryGroups.length) {
+        toast('行业数据尚未加载完成', 'error');
+        return;
+    }
+    renderMarketIndustryModal();
+    document.getElementById('market-industry-modal').classList.add('active');
+}
+
+function closeMarketIndustryModal() {
+    document.getElementById('market-industry-modal').classList.remove('active');
 }
 
 function formatCompactAmount(value) {
@@ -1487,7 +1623,7 @@ function renderHeatmapPayload(data) {
     document.getElementById('heatmap-metric-label').textContent = heatmapMetricLabel(state.heatmapMetric);
     document.getElementById('heatmap-stock-count').textContent = `${formatNumber(data.stock_count || 0)} 只股票`;
     const tickerText = buildTickerText(data.ticker_stats, data.latest_date).join('   •   ');
-    document.getElementById('heatmap-ticker-track').textContent = buildTickerLoopText(data.ticker_stats, data.latest_date);
+    document.getElementById('heatmap-ticker-track').innerHTML = buildIndustryTickerLoopHtml(data.groups);
     updateGlobalTicker(`${heatmapScopeLabel(state.heatmapScope)}   ${tickerText}`);
     renderHeatmapIndices(data.header_indices || []);
     renderHeatmapChart(data.groups || []);
@@ -2561,7 +2697,7 @@ async function pollWyckoffJob() {
         if (job.status === 'done') {
             stopWyckoffProgress();
             renderWyckoffResult(job.result);
-            updateGlobalTicker(`WYCKOFF READY   ${job.result?.stock?.code || ''} ${job.result?.stock?.name || ''}   图表已保存到 ${job.result?.paths?.chart_path || 'outputs/wyckoff'}`);
+            updateGlobalTicker(`WYCKOFF READY   ${job.result?.stock?.code || ''} ${job.result?.stock?.name || ''}   图表已保存到 ${job.result?.paths?.chart_path || '威科夫分析结果目录'}`);
             setWyckoffStatus('READY', 'highlight');
             setStatus('ready');
             toast(`威科夫分析完成: ${job.result?.stock?.code || ''}`, 'success', 4200);
@@ -4725,6 +4861,11 @@ function bindEvents() {
         }
         switchActiveProvider(button.dataset.providerSwitch);
     });
+    document.getElementById('dashboard-market-pulse').addEventListener('click', event => {
+        if (event.target.closest('[data-market-industry-open]')) {
+            openMarketIndustryModal();
+        }
+    });
 
     document.getElementById('halt-btn').addEventListener('click', openHaltConfirm);
     document.getElementById('cancel-halt-btn').addEventListener('click', closeHaltConfirm);
@@ -4827,6 +4968,23 @@ function bindEvents() {
         viewStockDetail(row.dataset.code, row.dataset.name || '');
     });
     document.getElementById('industry-modal-close-btn').addEventListener('click', closeIndustryModal);
+    document.getElementById('market-industry-modal').addEventListener('click', event => {
+        const sortButton = event.target.closest('[data-industry-sort]');
+        if (sortButton) {
+            state.marketIndustrySort = sortButton.dataset.industrySort;
+            renderMarketIndustryModal();
+            return;
+        }
+        if (event.target.closest('[data-industry-sort-toggle]')) {
+            state.marketIndustrySort = state.marketIndustrySort === 'asc' ? 'desc' : 'asc';
+            renderMarketIndustryModal();
+            return;
+        }
+        if (event.target.id === 'market-industry-modal') {
+            closeMarketIndustryModal();
+        }
+    });
+    document.getElementById('market-industry-modal-close-btn').addEventListener('click', closeMarketIndustryModal);
     document.addEventListener('fullscreenchange', syncHeatmapFullscreenState);
     document.addEventListener('webkitfullscreenchange', syncHeatmapFullscreenState);
 

@@ -17,6 +17,7 @@ from strategy.b1_v24261 import B1V24261Strategy
 from strategy.b2_beta import B2BetaStrategy
 from strategy.b1_min_j_simple import B1MinJSimpleStrategy
 from strategy.b1_min_j_complex import B1MinJComplexStrategy
+from strategy.b1_min_j_61_complex import B1MinJ61ComplexStrategy
 
 # 策略类映射
 STRATEGIES = {
@@ -27,6 +28,7 @@ STRATEGIES = {
     'B2BetaStrategy': B2BetaStrategy,
     'B1MinJSimpleStrategy': B1MinJSimpleStrategy,
     'B1MinJComplexStrategy': B1MinJComplexStrategy,
+    'B1MinJ61ComplexStrategy': B1MinJ61ComplexStrategy,
 }
 
 __all__ = [
@@ -37,5 +39,6 @@ __all__ = [
     'B2BetaStrategy',
     'B1MinJSimpleStrategy',
     'B1MinJComplexStrategy',
+    'B1MinJ61ComplexStrategy',
     'STRATEGIES'
 ]

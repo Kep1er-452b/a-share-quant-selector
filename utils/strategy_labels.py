@@ -12,6 +12,7 @@ CATEGORY_LABELS = {
     "b2_beta": "🚀 B2选股Beta版",
     "b1_min_j_simple": "🔻 B1MinJSimple",
     "b1_min_j_complex": "🧩 B1MinJComplex",
+    "b1_min_j_61_complex": "🧩 B1 Min J 61 Complex",
 }
 
 CATEGORY_DISPLAY_ORDER = [
@@ -24,6 +25,7 @@ CATEGORY_DISPLAY_ORDER = [
     "b2_beta",
     "b1_min_j_simple",
     "b1_min_j_complex",
+    "b1_min_j_61_complex",
 ]
 
 INVALID_STOCK_NAME_KEYWORDS = ("退", "未知", "退市", "已退")
@@ -79,14 +81,20 @@ STRATEGY_UI_METADATA = {
     "B1MinJSimpleStrategy": {
         "group": "b1",
         "label": "Min J Simple",
-        "description": "动态 Min J 简化版",
+        "description": "独立旧版：知行趋势 + 动态 Min J",
         "order": 40,
     },
     "B1MinJComplexStrategy": {
         "group": "b1",
         "label": "Min J Complex",
-        "description": "动态 Min J 完整版",
+        "description": "历史版：B1 V2.42P + 动态 Min J",
         "order": 50,
+    },
+    "B1MinJ61ComplexStrategy": {
+        "group": "b1",
+        "label": "Min J 61 Complex",
+        "description": "完整 V2.42.61 条件 + 动态 Min J",
+        "order": 60,
     },
     "B2BetaStrategy": {
         "group": "b2",
