@@ -17,7 +17,7 @@ from threading import Lock
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.csv_manager import CSVManager
-from utils.data_provider import BaseDataProvider, normalize_market_cap_yuan
+from utils.data_provider import BaseDataProvider, DataProviderError, normalize_market_cap_yuan
 
 # 设置请求会话
 session = requests.Session()
@@ -97,6 +97,7 @@ class AKShareFetcher(BaseDataProvider):
         self.stock_names_file = Path(data_dir) / 'stock_names.json'
         data_source_config = (config or {}).get('data_source', {}) if isinstance(config, dict) else {}
         akshare_config = data_source_config.get('akshare', {}) if isinstance(data_source_config, dict) else {}
+        tencent_config = data_source_config.get('tencent', {}) if isinstance(data_source_config, dict) else {}
         self.akshare_timeout = self._coerce_number(
             akshare_config.get('timeout_seconds') or os.getenv('ASHARE_AK_TIMEOUT_SECONDS'),
             default=12.0,
@@ -121,6 +122,26 @@ class AKShareFetcher(BaseDataProvider):
                     cast=int,
                 ),
             )
+        if self.provider_name == "tencent":
+            self._sync_max_workers = min(
+                self._sync_max_workers,
+                self._coerce_number(
+                    tencent_config.get('max_workers') or os.getenv('ASHARE_TENCENT_MAX_WORKERS'),
+                    default=4,
+                    cast=int,
+                ),
+            )
+        self.tencent_request_interval = max(
+            self._coerce_number(
+                tencent_config.get('min_request_interval_seconds')
+                or os.getenv('ASHARE_TENCENT_MIN_REQUEST_INTERVAL_SECONDS'),
+                default=0.2,
+                cast=float,
+            ),
+            0.0,
+        )
+        self._tencent_request_lock = Lock()
+        self._tencent_next_request_at = 0.0
         self.allow_mock_data = bool(
             akshare_config.get('allow_mock_data', False)
             or str(os.getenv('ASHARE_ALLOW_MOCK_DATA', '')).strip().lower() in {'1', 'true', 'yes'}
@@ -143,6 +164,28 @@ class AKShareFetcher(BaseDataProvider):
         with self._runtime_lock:
             return dict(self._runtime_stats)
 
+    @staticmethod
+    def _is_tencent_quote_url(url):
+        return 'gtimg.cn' in str(url or '').lower()
+
+    def _wait_for_tencent_request_slot(self):
+        if self.tencent_request_interval <= 0:
+            return
+        with self._tencent_request_lock:
+            now = time.monotonic()
+            scheduled_at = max(now, self._tencent_next_request_at)
+            self._tencent_next_request_at = scheduled_at + self.tencent_request_interval
+        wait_seconds = scheduled_at - now
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    @staticmethod
+    def _is_tencent_waf_response(response):
+        if getattr(response, 'status_code', None) != 501:
+            return False
+        body = str(getattr(response, 'text', '') or '')[:1000].lower()
+        return 'waf.tencent.com/501page.html' in body
+
     def _request_get(self, url, *, params=None, headers=None, timeout=None):
         """
         Try the user's normal network first, then direct mode.
@@ -158,6 +201,8 @@ class AKShareFetcher(BaseDataProvider):
         last_error = None
         for attempt in range(max(self.network_retries, 1)):
             for mode, trust_env in attempts:
+                if self._is_tencent_quote_url(url):
+                    self._wait_for_tencent_request_slot()
                 request_session = requests.Session()
                 request_session.trust_env = trust_env
                 try:
@@ -167,9 +212,17 @@ class AKShareFetcher(BaseDataProvider):
                         timeout=timeout,
                         headers=headers,
                     )
+                    if self._is_tencent_waf_response(response):
+                        self._note_runtime_stat('tencent_waf_501')
+                        raise DataProviderError(
+                            "Tencent 行情接口触发 WAF 501 拦截。请停止重复更新并等待限制解除；"
+                            "如正在使用 VPN/代理，请关闭代理或将 web.ifzq.gtimg.cn 设为直连后重试。"
+                        )
                     response.raise_for_status()
                     self._note_runtime_stat(f"http_{mode}_success")
                     return response
+                except DataProviderError:
+                    raise
                 except requests.RequestException as exc:
                     last_error = exc
                     self._note_runtime_stat(f"http_{mode}_error")
@@ -615,6 +668,8 @@ class AKShareFetcher(BaseDataProvider):
                     return self._mark_data_source(df, source)
             
             return None
+        except DataProviderError:
+            raise
         except Exception as e:
             print(f"  HTTP获取历史数据失败: {e}")
             return None
@@ -853,6 +908,8 @@ class AKShareFetcher(BaseDataProvider):
                     return self._mark_data_source(df, source)
             
             return None
+        except DataProviderError:
+            raise
         except Exception as e:
             print(f"  获取更新数据失败: {e}")
             return None

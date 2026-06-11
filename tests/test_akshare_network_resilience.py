@@ -1,7 +1,10 @@
 import pandas as pd
+import pytest
 
 import utils.akshare_fetcher as akshare_fetcher
 from utils.akshare_fetcher import AKShareFetcher
+from utils.data_provider import DataProviderError
+from utils.tencent_fetcher import TencentFetcher
 
 
 def _sample_history(source):
@@ -114,3 +117,76 @@ def test_recent_listing_short_history_is_accepted(tmp_path):
 
     assert coverage["ok"] is True
     assert coverage["recent_listing"] is True
+
+
+def test_tencent_provider_uses_conservative_parallelism(tmp_path):
+    fetcher = TencentFetcher(data_dir=str(tmp_path))
+    configured = TencentFetcher(
+        data_dir=str(tmp_path / "configured"),
+        config={"data_source": {"tencent": {"max_workers": 2}}},
+    )
+
+    assert fetcher._sync_max_workers == 4
+    assert configured._sync_max_workers == 2
+
+
+def test_tencent_waf_response_aborts_without_route_retry(monkeypatch, tmp_path):
+    fetcher = TencentFetcher(
+        data_dir=str(tmp_path),
+        config={"data_source": {"tencent": {"min_request_interval_seconds": 0}}},
+    )
+    calls = []
+
+    class FakeResponse:
+        status_code = 501
+        text = (
+            '<script>window.location.href='
+            '"https://waf.tencent.com/501page.html?id=test"</script>'
+        )
+
+        def raise_for_status(self):
+            raise AssertionError("WAF response should be detected first")
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, url, **kwargs):
+            calls.append((url, self.trust_env))
+            return FakeResponse()
+
+    monkeypatch.setattr(akshare_fetcher.requests, "Session", FakeSession)
+
+    with pytest.raises(DataProviderError, match="WAF 501"):
+        fetcher._request_get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        )
+
+    assert calls == [
+        ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get", True),
+    ]
+    assert fetcher.get_runtime_stats()["tencent_waf_501"] == 1
+
+
+def test_sync_batch_propagates_data_provider_error(monkeypatch, tmp_path):
+    fetcher = TencentFetcher(data_dir=str(tmp_path))
+
+    def fail_sync(*args, **kwargs):
+        raise DataProviderError("Tencent WAF blocked")
+
+    monkeypatch.setattr(fetcher, "_sync_one_incremental", fail_sync)
+
+    with pytest.raises(DataProviderError, match="WAF blocked"):
+        fetcher._sync_parallel_batch(
+            [{"code": "000001", "name": "平安银行"}],
+            latest_trade_date=pd.Timestamp("2026-06-11").date(),
+            status_map={"000001": {"latest_date": "2026-06-10"}},
+            market_cap_map={},
+            progress_state={
+                "processed": 0,
+                "total": 1,
+                "planned_total": 1,
+                "retry": 0,
+                "success": 0,
+                "failed": 0,
+            },
+        )
