@@ -1,0 +1,78 @@
+{
+  "incident_id": "20260611-193419",
+  "type": "emergency_stop",
+  "reason": "用户手动触发事故急停",
+  "created_at": "2026-06-11T19:34:19",
+  "pid": 94875,
+  "shutdown_delay_seconds": 1.2,
+  "request": {
+    "remote_addr": "127.0.0.1",
+    "path": "/api/emergency_stop",
+    "method": "POST",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+  },
+  "tasks": {
+    "update_jobs": [
+      {
+        "job_id": "98b578a62913",
+        "status": "halted",
+        "created_at": "2026-06-11 19:31:45",
+        "updated_at": "2026-06-11 19:34:19",
+        "started_at": "2026-06-11 19:31:45",
+        "finished_at": "2026-06-11 19:34:19",
+        "elapsed_seconds": 153,
+        "error": "用户手动触发事故急停",
+        "progress_pct": 13,
+        "current_step": "增量补齐",
+        "current_stock": {
+          "code": "002998",
+          "name": "优彩资源"
+        },
+        "provider": "tencent",
+        "processed_count": 581,
+        "total_count": 3365,
+        "cache_refresh": null,
+        "logs": [
+          {
+            "time": "2026-06-11 19:31:45",
+            "message": "更新任务已创建，等待执行。"
+          },
+          {
+            "time": "2026-06-11 19:31:45",
+            "message": "开始执行数据更新，数据源: tencent。"
+          },
+          {
+            "time": "2026-06-11 19:31:46",
+            "message": "正在获取 tencent 目标股票池。"
+          },
+          {
+            "time": "2026-06-11 19:31:46",
+            "message": "目标股票池 5178 只，准备开始同步。"
+          },
+          {
+            "time": "2026-06-11 19:32:51",
+            "message": "增量补齐: *ST生物(000504) 1/2785"
+          },
+          {
+            "time": "2026-06-11 19:33:13",
+            "message": "增量补齐: 光正眼科(002524) 150/2934"
+          },
+          {
+            "time": "2026-06-11 19:33:37",
+            "message": "增量补齐: 美亚光电(002690) 300/3084"
+          },
+          {
+            "time": "2026-06-11 19:34:02",
+            "message": "增量补齐: 三晖电气(002857) 450/3234"
+          },
+          {
+            "time": "2026-06-11 19:34:19",
+            "message": "事故急停触发，系统即将退出。"
+          }
+        ]
+      }
+    ],
+    "selection_jobs": [],
+    "wyckoff_jobs": []
+  }
+}

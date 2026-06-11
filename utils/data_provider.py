@@ -339,6 +339,10 @@ class BaseDataProvider:
                 for future in done:
                     try:
                         result = future.result()
+                    except DataProviderError:
+                        for pending_future in pending:
+                            pending_future.cancel()
+                        raise
                     except Exception as exc:
                         item = futures[future]
                         result = {
@@ -419,6 +423,10 @@ class BaseDataProvider:
                 for future in done:
                     try:
                         result = future.result()
+                    except DataProviderError:
+                        for pending_future in pending:
+                            pending_future.cancel()
+                        raise
                     except Exception as exc:
                         item = futures[future]
                         result = {

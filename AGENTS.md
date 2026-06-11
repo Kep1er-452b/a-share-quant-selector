@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `1bd8a6821dd4f9e53c867fcf4828b01cae3823b3`
-  (`feat: Add Android app with GitHub Actions build`, 2026-06-09).
+  `26bfddf6cb09963ed5a11a53f386303cfa19f94a`
+  (`Relocate runtime outputs and remove legacy Android subtree`, 2026-06-10).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -235,10 +235,10 @@ At commit `b038324`, the full suite result was:
 54 passed
 ```
 
-The current uncommitted market-pulse and Min J 61 work passed:
+The current uncommitted Tencent WAF hardening passed:
 
 ```text
-60 passed
+66 passed
 ```
 
 Useful runtime checks:
@@ -277,8 +277,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `1bd8a68` on local `main`; `origin/main` is currently
-`a8d8149`.
+Baseline commit: `26bfddf` on local `main`; `origin/main` is also `26bfddf`.
 
 State at handoff:
 
@@ -304,16 +303,29 @@ State at handoff:
   `63 passed`.
 - Browser verification covered the compact F1 chart, industry sort modal, F2
   ticker, and serving a historical Wyckoff chart from the external directory.
-- These task changes remain uncommitted. There is no implementation blocker.
+- On 2026-06-11, repeated Tencent updates began receiving Tencent WAF HTTP 501
+  HTML instead of market-data JSON after roughly 1,350 incremental requests.
+  With the previous 24-worker default and route retry loop, each failure became
+  a full refresh retry and the planned total expanded by thousands.
+- The current uncommitted hardening limits Tencent to four workers, spaces
+  Tencent requests by at least 0.2 seconds, detects the WAF 501 page, and
+  propagates it as a batch-fatal `DataProviderError` instead of retrying every
+  stock. Focused tests and the full suite pass: `66 passed`.
+- A live single-request check still received WAF 501 after the fix. Do not run
+  another Tencent full-market update until the restriction clears or
+  `web.ifzq.gtimg.cn` is routed directly outside the VPN/proxy. AkShare remains
+  the active provider with latest trade date 2026-06-11.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `26bfddf` (2026-06-10): moved selection/Wyckoff runtime outputs outside the
+  repository and removed the legacy Android subtree after preserving its
+  independent checkout.
 - `1bd8a68` (2026-06-09): added the Android app subtree and GitHub Actions
-  workflow; the current uncommitted cleanup removes both after preserving the
-  independent project under `~/Downloads/android-app`.
+  workflow.
 - `b038324` (2026-06-07): added B1 V2.42.61, strategy-family metadata, and
   collapsible Selection family UI.
 - `72685d5` (2026-06-02): added manual provider switching through the existing
