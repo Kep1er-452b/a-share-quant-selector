@@ -74,6 +74,7 @@ def test_status_accepts_existing_short_job_ids():
             web_server.selection_jobs.pop(selection_job_id, None)
         with web_server.update_jobs_lock:
             web_server.update_jobs.pop(update_job_id, None)
+            web_server.update_cancel_events.pop(update_job_id, None)
 
 
 def test_stock_snapshot_rows_are_sorted_by_code_before_pagination(monkeypatch):
@@ -197,10 +198,87 @@ def test_write_endpoints_validate_payload_shape_and_lengths():
 
     response = client.post("/api/update/start", json=[], headers=_headers())
     assert response.status_code == 400
-
     response = client.post(
         "/api/watchlist",
         json={"query": "0" * 81},
         headers=_headers(),
     )
     assert response.status_code == 400
+
+
+def test_update_cancel_requires_session_token_and_marks_running_job():
+    client = web_server.app.test_client()
+    job_id = web_server._create_update_job("akshare")
+    web_server._update_update_job(job_id, status="running")
+
+    try:
+        response = client.post(f"/api/update/cancel/{job_id}")
+        assert response.status_code == 403
+
+        response = client.post(
+            f"/api/update/cancel/{job_id}",
+            headers=_headers(),
+        )
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["success"] is True
+        assert payload["data"]["cancel_requested"] is True
+        assert payload["data"]["current_step"] == "正在停止此次更新"
+        assert web_server.update_cancel_events[job_id].is_set()
+        assert any(
+            "保留日志" in item["message"]
+            for item in payload["data"]["logs"]
+        )
+    finally:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.pop(job_id, None)
+            web_server.update_cancel_events.pop(job_id, None)
+
+
+def test_update_cancel_releases_failed_job_without_overwriting_error():
+    client = web_server.app.test_client()
+    job_id = web_server._create_update_job("tencent")
+    web_server._update_update_job(
+        job_id,
+        status="failed",
+        error="WAF 501",
+        error_report_path="/tmp/update-error.json",
+    )
+
+    try:
+        response = client.post(
+            f"/api/update/cancel/{job_id}",
+            headers=_headers(),
+        )
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["data"]["status"] == "failed"
+        assert payload["data"]["error"] == "WAF 501"
+        assert payload["data"]["error_report_path"] == "/tmp/update-error.json"
+        assert web_server.update_cancel_events[job_id].is_set() is False
+    finally:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.pop(job_id, None)
+            web_server.update_cancel_events.pop(job_id, None)
+
+
+def test_pre_cancelled_update_job_finishes_as_cancelled(monkeypatch, tmp_path):
+    job_id = web_server._create_update_job("akshare")
+    web_server.update_cancel_events[job_id].set()
+    report_path = tmp_path / "cancelled-update.json"
+    monkeypatch.setattr(web_server, "write_error_report", lambda *args, **kwargs: report_path)
+    monkeypatch.setattr(web_server, "_append_system_log", lambda *args, **kwargs: None)
+
+    try:
+        web_server._run_update_job(job_id, "akshare", "")
+
+        with web_server.update_jobs_lock:
+            job = dict(web_server.update_jobs[job_id])
+        assert job["status"] == "cancelled"
+        assert job["current_step"] == "更新已停止"
+        assert job["error_report_path"] == str(report_path)
+        assert any("已写入的数据和现有日志均已保留" in item["message"] for item in job["logs"])
+    finally:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.pop(job_id, None)
+            web_server.update_cancel_events.pop(job_id, None)

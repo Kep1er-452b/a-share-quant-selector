@@ -119,6 +119,7 @@ def warehouse_summary(data_dir: str | Path, provider: str) -> dict:
         "last_error_report_path": state.get("last_error_report_path"),
         "status_summary": state.get("status_summary") or {},
         "runtime_stats": state.get("runtime_stats") or {},
+        "runtime_diagnostics": state.get("runtime_diagnostics") or {},
     }
 
 

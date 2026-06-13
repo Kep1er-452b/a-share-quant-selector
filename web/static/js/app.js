@@ -50,6 +50,7 @@ const state = {
     currentSelectionJobId: null,
     updatePollTimer: null,
     currentUpdateJobId: null,
+    currentUpdateJob: null,
     indexKlineChart: null,
     currentIndexSymbol: 'sh000001',
     localProgressTimer: null,
@@ -3170,10 +3171,41 @@ function setUpdateModalStep(step) {
     }
     if (step === 'provider') {
         title.textContent = '选择更新数据源';
+        renderUpdateStopAction(null);
     } else if (step === 'token') {
         title.textContent = '选择 Tushare Token';
+        renderUpdateStopAction(null);
     } else {
         title.textContent = '更新任务执行中';
+    }
+}
+
+function renderUpdateStopAction(job, forceVisible = false) {
+    const actions = document.getElementById('update-progress-actions');
+    const button = document.getElementById('update-stop-btn');
+    const note = document.getElementById('update-stop-note');
+    if (!actions || !button || !note) {
+        return;
+    }
+
+    const status = String(job?.status || '').toLowerCase();
+    const active = ['queued', 'running'].includes(status);
+    const terminal = ['error', 'failed', 'cancelled'].includes(status);
+    const visible = forceVisible || active || terminal;
+    actions.classList.toggle('active', visible);
+    button.disabled = Boolean(job?.cancel_requested);
+    button.textContent = job?.cancel_requested
+        ? '正在停止此次更新...'
+        : '停止此次更新并保留日志';
+
+    if (terminal) {
+        note.textContent = job?.error_report_path
+            ? `任务已结束。日志已保留在 ${job.error_report_path}`
+            : '任务已结束。点击按钮释放弹窗，现有任务日志会保留。';
+    } else if (forceVisible && !active) {
+        note.textContent = '状态同步异常。可释放此次任务弹窗；已有日志不会被删除。';
+    } else {
+        note.textContent = '仅停止本次更新；已写入的数据和任务日志都会保留。';
     }
 }
 
@@ -3259,6 +3291,7 @@ function openUpdateModal() {
         return;
     }
     state.updateProvider = null;
+    state.currentUpdateJob = null;
     document.getElementById('update-tushare-token').value = '';
     renderUpdateTokenPrompt();
     renderUpdateProviderOptions();
@@ -3271,7 +3304,54 @@ function closeUpdateModal() {
     document.getElementById('update-modal').classList.remove('active');
 }
 
+function releaseCurrentUpdateTask() {
+    stopUpdatePolling();
+    state.currentUpdateJobId = null;
+    state.currentUpdateJob = null;
+    renderUpdateStopAction(null);
+    const updateButton = document.getElementById('update-data-btn');
+    if (updateButton) {
+        updateButton.disabled = false;
+    }
+    closeUpdateModal();
+}
+
+async function stopUpdateJobAndKeepLogs() {
+    const button = document.getElementById('update-stop-btn');
+    const jobId = state.currentUpdateJobId;
+    if (button) {
+        button.disabled = true;
+        button.textContent = '正在停止此次更新...';
+    }
+
+    if (!jobId) {
+        releaseCurrentUpdateTask();
+        return;
+    }
+
+    try {
+        const result = await apiFetch(`/api/update/cancel/${jobId}`, {
+            method: 'POST',
+        }, {
+            allowWhenHalted: true,
+            interpretHalt: false,
+        });
+        if (!result.success) {
+            throw new Error(result.error || '停止更新失败');
+        }
+        if (result.data) {
+            renderUpdateJob(result.data);
+        }
+        toast(result.message || '已停止此次更新，日志已保留', 'success');
+    } catch (error) {
+        toast(`已释放更新弹窗；后端停止状态暂无法确认。${error.message}`, 'error', 5200);
+    } finally {
+        releaseCurrentUpdateTask();
+    }
+}
+
 async function startUpdateJob(provider, token = '') {
+    state.currentUpdateJob = null;
     setUpdateModalStep('progress');
     document.getElementById('update-provider-value').textContent = provider.toUpperCase();
     document.getElementById('update-progress-headline').textContent = '正在启动更新任务...';
@@ -3303,6 +3383,7 @@ async function startUpdateJob(provider, token = '') {
 }
 
 function renderUpdateJob(job) {
+    state.currentUpdateJob = job;
     const percent = Number(job.progress_pct || 0);
     const updateButton = document.getElementById('update-data-btn');
     if (updateButton) {
@@ -3320,6 +3401,7 @@ function renderUpdateJob(job) {
         : (job.current_stock
             ? `当前处理: ${job.current_stock.name || '未知'} (${job.current_stock.code || '--'})`
             : (job.current_step || '更新任务进行中...'));
+    renderUpdateStopAction(job);
 
     const logs = Array.isArray(job.logs) ? [...job.logs].reverse() : [];
     document.getElementById('update-progress-logs').innerHTML = logs.map(item => `
@@ -3358,6 +3440,8 @@ async function pollUpdateJobStatus() {
         if (job.status === 'completed') {
             stopUpdatePolling();
             state.currentUpdateJobId = null;
+            state.currentUpdateJob = job;
+            renderUpdateStopAction(null);
             const updateButton = document.getElementById('update-data-btn');
             if (updateButton) {
                 updateButton.disabled = false;
@@ -3376,14 +3460,14 @@ async function pollUpdateJobStatus() {
             return;
         }
 
-        if (job.status === 'error') {
+        if (['error', 'failed', 'cancelled'].includes(job.status)) {
             stopUpdatePolling();
-            state.currentUpdateJobId = null;
             const updateButton = document.getElementById('update-data-btn');
             if (updateButton) {
                 updateButton.disabled = false;
             }
-            toast(`更新失败: ${job.error || '未知错误'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`, 'error');
+            const prefix = job.status === 'cancelled' ? '更新已停止' : '更新失败';
+            toast(`${prefix}: ${job.error || '任务已结束'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`, job.status === 'cancelled' ? 'info' : 'error');
             return;
         }
 
@@ -3394,7 +3478,12 @@ async function pollUpdateJobStatus() {
         }
     } catch (error) {
         stopUpdatePolling();
-        state.currentUpdateJobId = null;
+        state.currentUpdateJob = {
+            job_id: state.currentUpdateJobId,
+            status: 'status_error',
+            error: error.message,
+        };
+        renderUpdateStopAction(state.currentUpdateJob, true);
         const updateButton = document.getElementById('update-data-btn');
         if (updateButton) {
             updateButton.disabled = false;
@@ -4910,6 +4999,7 @@ function bindEvents() {
     document.getElementById('update-token-confirm-btn').addEventListener('click', async () => {
         await startUpdateJob('tushare', document.getElementById('update-tushare-token').value.trim());
     });
+    document.getElementById('update-stop-btn').addEventListener('click', stopUpdateJobAndKeepLogs);
     document.getElementById('update-modal-close-btn').addEventListener('click', closeUpdateModal);
     document.getElementById('update-modal').addEventListener('click', event => {
         if (event.target.id === 'update-modal') {

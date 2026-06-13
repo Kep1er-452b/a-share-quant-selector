@@ -97,6 +97,75 @@ def test_fetch_update_falls_back_to_tencent_when_akshare_fails(monkeypatch, tmp_
     assert fetcher.get_runtime_stats()["tencent_update_fallback_success"] == 1
 
 
+def test_fetch_update_retries_eastmoney_direct_before_tencent(monkeypatch, tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+
+    def fail_akshare_history(**kwargs):
+        raise akshare_fetcher.requests.exceptions.ProxyError("system proxy closed")
+
+    direct_frame = _sample_history("akshare:eastmoney:direct:update").head(5)
+    monkeypatch.setattr(akshare_fetcher.ak, "stock_zh_a_hist", fail_akshare_history)
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_eastmoney_history_direct",
+        lambda *args, **kwargs: direct_frame,
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_stock_update_http",
+        lambda *args, **kwargs: pytest.fail("Tencent fallback should not run"),
+    )
+
+    frame = fetcher.fetch_stock_update("000001", days=3)
+
+    assert frame is direct_frame
+    assert set(frame["data_source"]) == {"akshare:eastmoney:direct:update"}
+    assert fetcher.get_runtime_stats()["akshare_update_error"] == 1
+    assert fetcher.get_runtime_stats()["akshare_direct_retry_success"] == 1
+
+
+def test_eastmoney_direct_retry_ignores_system_proxy(monkeypatch, tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    seen = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": {
+                    "klines": [
+                        "2026-06-12,10.00,10.50,10.80,9.90,1234,56789,1.2,5.0,0.5,2.3"
+                    ]
+                }
+            }
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, url, **kwargs):
+            seen["url"] = url
+            seen["trust_env"] = self.trust_env
+            seen["params"] = kwargs["params"]
+            return FakeResponse()
+
+    monkeypatch.setattr(akshare_fetcher.requests, "Session", FakeSession)
+
+    frame = fetcher._fetch_eastmoney_history_direct(
+        "000001",
+        "20260601",
+        "20260613",
+        "akshare:eastmoney:direct:update",
+    )
+
+    assert seen["trust_env"] is False
+    assert seen["params"]["secid"] == "0.000001"
+    assert frame.iloc[0]["close"] == 10.5
+    assert frame.iloc[0]["turnover"] == 2.3
+    assert frame.iloc[0]["data_source"] == "akshare:eastmoney:direct:update"
+
+
 def test_recent_listing_short_history_is_accepted(tmp_path):
     fetcher = AKShareFetcher(data_dir=str(tmp_path))
     recent = pd.DataFrame(
@@ -127,7 +196,83 @@ def test_tencent_provider_uses_conservative_parallelism(tmp_path):
     )
 
     assert fetcher._sync_max_workers == 4
+    assert fetcher.tencent_request_interval == 0.5
     assert configured._sync_max_workers == 2
+    no_delay = TencentFetcher(
+        data_dir=str(tmp_path / "no-delay"),
+        config={"data_source": {"tencent": {"min_request_interval_seconds": 0}}},
+    )
+    assert no_delay.tencent_request_interval == 0
+
+
+def test_akshare_tencent_waf_fallback_is_isolated_and_circuit_breaks(monkeypatch, tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    fallback_calls = []
+
+    def fail_akshare_history(**kwargs):
+        raise RuntimeError("ConnectionResetError: no-VPN route closed")
+
+    def fail_tencent_fallback(*args, **kwargs):
+        fallback_calls.append(args[0])
+        raise DataProviderError("Tencent WAF 501 blocked")
+
+    monkeypatch.setattr(akshare_fetcher.ak, "stock_zh_a_hist", fail_akshare_history)
+    monkeypatch.setattr(fetcher, "_fetch_stock_update_http", fail_tencent_fallback)
+
+    assert fetcher.fetch_stock_update("000001", days=3) is None
+    assert fetcher.fetch_stock_update("000002", days=3) is None
+
+    assert fallback_calls == ["000001"]
+    assert fetcher.get_runtime_stats()["tencent_fallback_blocked"] == 1
+    assert fetcher.get_runtime_stats()["tencent_fallback_skipped"] == 1
+    diagnostics = fetcher.get_runtime_diagnostics()
+    assert diagnostics["tencent_fallback_blocked"] is True
+    assert diagnostics["tencent_fallback_error"] == "Tencent WAF 501 blocked"
+    assert diagnostics["network_error_samples"] == [
+        {
+            "stage": "akshare_update",
+            "stock_code": "000001",
+            "error_type": "RuntimeError",
+            "message": "ConnectionResetError: no-VPN route closed",
+        },
+        {
+            "stage": "update_tencent_fallback",
+            "stock_code": "000001",
+            "error_type": "DataProviderError",
+            "message": "Tencent WAF 501 blocked",
+        },
+        {
+            "stage": "akshare_update",
+            "stock_code": "000002",
+            "error_type": "RuntimeError",
+            "message": "ConnectionResetError: no-VPN route closed",
+        },
+    ]
+
+
+def test_provider_error_context_includes_sync_progress_and_network_samples(tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    fetcher._active_sync_context = {
+        "latest_trade_date": "2026-06-12",
+        "target_count": 5183,
+        "incremental_count": 2784,
+    }
+    fetcher._active_sync_progress = {
+        "processed": 591,
+        "total": 2784,
+        "failed": 1,
+    }
+    fetcher._record_network_error(
+        "akshare_update",
+        "000001",
+        RuntimeError("RemoteDisconnected"),
+    )
+
+    context = fetcher.get_error_context()
+
+    assert context["sync_progress"]["processed"] == 591
+    assert context["sync_assessment"]["target_count"] == 5183
+    assert context["runtime_diagnostics"]["network_error_samples"][0]["message"] == "RemoteDisconnected"
 
 
 def test_tencent_waf_response_aborts_without_route_retry(monkeypatch, tmp_path):
