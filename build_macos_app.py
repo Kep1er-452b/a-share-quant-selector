@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 
@@ -17,6 +18,7 @@ EXECUTABLE_NAME = "AStockQuantSelector"
 PYTHON_PATH = PROJECT_ROOT / ".venv" / "bin" / "python"
 LAUNCHER_PATH = PROJECT_ROOT / "launch_desktop_app.py"
 ICON_PATH = PROJECT_ROOT / "assets" / "app_icon.icns"
+RUNTIME_ICON_NAME = "runtime_icon.png"
 
 
 INFO_PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -53,6 +55,27 @@ INFO_PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+def write_runtime_icon(target_path: Path) -> None:
+    from AppKit import NSBitmapImageRep, NSPNGFileType, NSWorkspace
+
+    workspace = NSWorkspace.sharedWorkspace()
+    workspace.noteFileSystemChanged_(str(APP_PATH))
+    image = workspace.iconForFile_(str(APP_PATH))
+    image.setSize_((1024, 1024))
+    representation = NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation())
+    png_data = representation.representationUsingType_properties_(NSPNGFileType, {})
+    if png_data is None:
+        raise RuntimeError("无法生成带透明圆角的运行时 App 图标")
+    target_path.write_bytes(bytes(png_data))
+
+
+def sign_app() -> None:
+    subprocess.run(
+        ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(APP_PATH)],
+        check=True,
+    )
+
+
 def build() -> None:
     if not PYTHON_PATH.exists():
         raise FileNotFoundError(f"未找到项目 Python: {PYTHON_PATH}")
@@ -77,15 +100,22 @@ def build() -> None:
     executable.write_text(
         f"""#!/bin/bash
 set -euo pipefail
+APP_BUNDLE="$(cd "$(dirname "$0")/../.." && pwd)"
 PROJECT_ROOT="{PROJECT_ROOT}"
 PYTHON="{PYTHON_PATH}"
 LAUNCHER="{LAUNCHER_PATH}"
+export A_SHARE_QUANT_APP_BUNDLE="$APP_BUNDLE"
 cd "$PROJECT_ROOT"
 exec "$PYTHON" "$LAUNCHER"
 """,
         encoding="utf-8",
     )
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    # NSWorkspace adds a disabled badge to unsigned app icons.
+    sign_app()
+    write_runtime_icon(resources / RUNTIME_ICON_NAME)
+    sign_app()
 
     # Helps Finder refresh metadata after replacing an app bundle.
     os.utime(APP_PATH, None)

@@ -28,6 +28,9 @@ except Exception:  # pragma: no cover - surfaced in runtime validation
 
 APP_NAME = "A股量化选股系统"
 PROJECT_ROOT = Path(__file__).resolve().parent
+APP_ICON = PROJECT_ROOT / "assets" / "app_icon.icns"
+APP_BUNDLE_ENV = "A_SHARE_QUANT_APP_BUNDLE"
+RUNTIME_ICON_NAME = "runtime_icon.png"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "desktop_app_launcher.log"
@@ -44,6 +47,15 @@ def configure_local_proxy_bypass() -> None:
             if item not in parts:
                 parts.append(item)
         os.environ[name] = ",".join(parts)
+
+
+def runtime_icon_path() -> Path | None:
+    app_bundle = os.environ.get(APP_BUNDLE_ENV, "").strip()
+    if not app_bundle:
+        return None
+
+    icon_path = Path(app_bundle) / "Contents" / "Resources" / RUNTIME_ICON_NAME
+    return icon_path if icon_path.is_file() else None
 
 
 def setup_logging() -> None:
@@ -108,6 +120,7 @@ def validate_environment(require_webview: bool = False) -> list[str]:
         (PROJECT_ROOT / ".venv" / "bin" / "python", "项目 .venv/bin/python 不存在"),
         (PROJECT_ROOT / "web_server.py", "web_server.py 不存在"),
         (PROJECT_ROOT / "web" / "templates" / "index.html", "Web 首页模板不存在"),
+        (APP_ICON, "App 图标不存在"),
         (DEFAULT_CONFIG, "config/config.yaml 不存在"),
     ]
     for path, message in checks:
@@ -309,7 +322,11 @@ def run_gui() -> int:
             ))
 
     threading.Thread(target=boot, name="desktop-launcher-boot", daemon=True).start()
-    webview.start(debug=False)
+    start_options = {"debug": False}
+    icon_path = runtime_icon_path()
+    if icon_path is not None:
+        start_options["icon"] = str(icon_path)
+    webview.start(**start_options)
     return 0
 
 

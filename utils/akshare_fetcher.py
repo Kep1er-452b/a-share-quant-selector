@@ -131,11 +131,13 @@ class AKShareFetcher(BaseDataProvider):
                     cast=int,
                 ),
             )
+        tencent_interval = tencent_config.get('min_request_interval_seconds')
+        if tencent_interval is None:
+            tencent_interval = os.getenv('ASHARE_TENCENT_MIN_REQUEST_INTERVAL_SECONDS')
         self.tencent_request_interval = max(
             self._coerce_number(
-                tencent_config.get('min_request_interval_seconds')
-                or os.getenv('ASHARE_TENCENT_MIN_REQUEST_INTERVAL_SECONDS'),
-                default=0.2,
+                tencent_interval,
+                default=0.5,
                 cast=float,
             ),
             0.0,
@@ -148,6 +150,11 @@ class AKShareFetcher(BaseDataProvider):
         )
         self._runtime_stats = {}
         self._runtime_lock = Lock()
+        self._network_diagnostics_lock = Lock()
+        self._network_error_samples = []
+        self._tencent_fallback_lock = Lock()
+        self._tencent_fallback_blocked = False
+        self._tencent_fallback_error = None
 
     @staticmethod
     def _coerce_number(value, default, cast=float):
@@ -163,6 +170,52 @@ class AKShareFetcher(BaseDataProvider):
     def get_runtime_stats(self) -> dict:
         with self._runtime_lock:
             return dict(self._runtime_stats)
+
+    def _record_network_error(self, stage, stock_code, error):
+        sample = {
+            "stage": str(stage),
+            "stock_code": str(stock_code).zfill(6),
+            "error_type": type(error).__name__,
+            "message": str(error)[:1000],
+        }
+        with self._network_diagnostics_lock:
+            if len(self._network_error_samples) < 12:
+                self._network_error_samples.append(sample)
+
+    def get_runtime_diagnostics(self) -> dict:
+        with self._network_diagnostics_lock:
+            return {
+                "network_error_samples": list(self._network_error_samples),
+                "tencent_fallback_blocked": self._tencent_fallback_blocked,
+                "tencent_fallback_error": self._tencent_fallback_error,
+                "network_policy": {
+                    "sync_max_workers": self._sync_max_workers,
+                    "tencent_min_request_interval_seconds": self.tencent_request_interval,
+                },
+            }
+
+    def _run_tencent_fallback(self, stock_code, stage, callback):
+        """
+        Keep Tencent WAF failures fatal for the Tencent provider, but isolate
+        AkShare's optional fallback so it cannot abort the whole AkShare job.
+        """
+        if self.provider_name != "akshare":
+            return callback()
+
+        with self._tencent_fallback_lock:
+            if self._tencent_fallback_blocked:
+                self._note_runtime_stat("tencent_fallback_skipped")
+                return None
+            try:
+                return callback()
+            except DataProviderError as exc:
+                self._record_network_error(f"{stage}_tencent_fallback", stock_code, exc)
+                with self._network_diagnostics_lock:
+                    self._tencent_fallback_blocked = True
+                    self._tencent_fallback_error = str(exc)[:1000]
+                self._note_runtime_stat("tencent_fallback_blocked")
+                print(f"  腾讯兜底已停用，本轮 AkShare 更新将继续: {exc}")
+                return None
 
     @staticmethod
     def _is_tencent_quote_url(url):
@@ -215,8 +268,8 @@ class AKShareFetcher(BaseDataProvider):
                     if self._is_tencent_waf_response(response):
                         self._note_runtime_stat('tencent_waf_501')
                         raise DataProviderError(
-                            "Tencent 行情接口触发 WAF 501 拦截。请停止重复更新并等待限制解除；"
-                            "如正在使用 VPN/代理，请关闭代理或将 web.ifzq.gtimg.cn 设为直连后重试。"
+                            "Tencent 行情接口触发 WAF 501 拦截，通常与出口 IP 风控或连续请求频率有关。"
+                            "请停止重复更新并等待限制解除；切换 VPN/代理不一定立即生效。"
                         )
                     response.raise_for_status()
                     self._note_runtime_stat(f"http_{mode}_success")
@@ -792,6 +845,55 @@ class AKShareFetcher(BaseDataProvider):
         df = df.sort_values('date', ascending=False)
         return self._mark_data_source(df, source)
 
+    def _fetch_eastmoney_history_direct(self, stock_code, start_date, end_date, source):
+        """Retry AkShare's Eastmoney history endpoint without system proxy settings."""
+        market_code = 1 if str(stock_code).startswith('6') else 0
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "klt": "101",
+            "fqt": "1",
+            "secid": f"{market_code}.{stock_code}",
+            "beg": start_date,
+            "end": end_date,
+        }
+        direct_session = requests.Session()
+        direct_session.trust_env = False
+        response = direct_session.get(url, params=params, timeout=self.akshare_timeout)
+        response.raise_for_status()
+        payload = response.json()
+        klines = ((payload.get("data") or {}).get("klines") or [])
+        records = []
+        for line in klines:
+            values = str(line).split(",")
+            if len(values) < 11:
+                continue
+            records.append({
+                "date": values[0],
+                "open": values[1],
+                "close": values[2],
+                "high": values[3],
+                "low": values[4],
+                "volume": values[5],
+                "amount": values[6],
+                "turnover": values[10],
+            })
+        if not records:
+            return None
+
+        frame = pd.DataFrame(records)
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        for column in ["open", "close", "high", "low", "volume", "amount", "turnover"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["date", "open", "close", "high", "low"])
+        if frame.empty:
+            return None
+        frame["market_cap"] = 0
+        frame = frame.sort_values("date", ascending=False)
+        return self._mark_data_source(frame, source)
+
     def fetch_stock_history(self, stock_code, years=6):
         """
         抓取单只股票历史数据
@@ -821,12 +923,35 @@ class AKShareFetcher(BaseDataProvider):
                 print(f"  akshare历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
         except Exception as e:
             self._note_runtime_stat('akshare_history_error')
+            self._record_network_error('akshare_history', stock_code, e)
             print(f"  akshare获取失败: {e}")
+            if isinstance(e, requests.exceptions.RequestException):
+                try:
+                    direct_df = self._fetch_eastmoney_history_direct(
+                        stock_code,
+                        start_str,
+                        end_str,
+                        'akshare:eastmoney:direct',
+                    )
+                except Exception as direct_error:
+                    self._note_runtime_stat('akshare_direct_retry_error')
+                    self._record_network_error('akshare_history_direct', stock_code, direct_error)
+                    print(f"  akshare直连重试失败: {direct_error}")
+                else:
+                    coverage = self._history_coverage_report(direct_df, years=years)
+                    if coverage['ok']:
+                        self._note_runtime_stat('akshare_direct_retry_success')
+                        return direct_df
+                    self._note_runtime_stat('akshare_direct_retry_short')
 
-        fallback_df = self._fetch_stock_history_http(
+        fallback_df = self._run_tencent_fallback(
             stock_code,
-            years=years,
-            source='tencent:fqkline:fallback',
+            'history',
+            lambda: self._fetch_stock_history_http(
+                stock_code,
+                years=years,
+                source='tencent:fqkline:fallback',
+            ),
         )
         coverage = self._history_coverage_report(fallback_df, years=years)
         if coverage['ok']:
@@ -936,12 +1061,33 @@ class AKShareFetcher(BaseDataProvider):
                 return normalized
         except Exception as e:
             self._note_runtime_stat('akshare_update_error')
+            self._record_network_error('akshare_update', stock_code, e)
             print(f"  akshare获取更新数据失败: {e}")
+            if isinstance(e, requests.exceptions.RequestException):
+                try:
+                    direct_df = self._fetch_eastmoney_history_direct(
+                        stock_code,
+                        start_date.strftime("%Y%m%d"),
+                        end_date.strftime("%Y%m%d"),
+                        'akshare:eastmoney:direct:update',
+                    )
+                except Exception as direct_error:
+                    self._note_runtime_stat('akshare_direct_retry_error')
+                    self._record_network_error('akshare_update_direct', stock_code, direct_error)
+                    print(f"  akshare直连重试失败: {direct_error}")
+                else:
+                    if direct_df is not None and not direct_df.empty:
+                        self._note_runtime_stat('akshare_direct_retry_success')
+                        return direct_df
 
-        fallback_df = self._fetch_stock_update_http(
+        fallback_df = self._run_tencent_fallback(
             stock_code,
-            days=days,
-            source='tencent:fqkline:update:fallback',
+            'update',
+            lambda: self._fetch_stock_update_http(
+                stock_code,
+                days=days,
+                source='tencent:fqkline:update:fallback',
+            ),
         )
         if fallback_df is not None and not fallback_df.empty:
             self._note_runtime_stat('tencent_update_fallback_success')

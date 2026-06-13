@@ -89,6 +89,7 @@ selection_jobs = {}
 selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
+update_cancel_events = {}
 wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
 watchlist_lock = Lock()
@@ -1007,6 +1008,11 @@ def _find_running_update_job():
     return None
 
 
+def _update_cancel_event(job_id):
+    with update_jobs_lock:
+        return update_cancel_events.get(job_id)
+
+
 def _create_update_job(provider):
     job_id = uuid.uuid4().hex[:12]
     now = _job_timestamp()
@@ -1028,12 +1034,15 @@ def _create_update_job(provider):
         'started_at': None,
         'finished_at': None,
         'error': None,
+        'error_report_path': None,
+        'cancel_requested': False,
         'logs': [],
         'cache_refresh': None,
     }
     _append_job_log(job, '更新任务已创建，等待执行。')
     with update_jobs_lock:
         update_jobs[job_id] = job
+        update_cancel_events[job_id] = Event()
     return job_id
 
 
@@ -1414,12 +1423,32 @@ def _provider_switch_warnings(data_root, provider, provider_state=None):
 def _run_update_job(job_id, provider_name, provider_token):
     config = _load_config()
     data_dir = str(_config_value(config, 'data_dir', default='data'))
+    provider = None
+    cancel_event = _update_cancel_event(job_id)
+
+    def is_cancelled():
+        return bool(cancel_event and cancel_event.is_set())
+
+    def ensure_update_continues():
+        if is_cancelled():
+            raise InterruptedError('用户已停止此次更新')
+        if _is_halted():
+            raise InterruptedError('系统已急停')
+
+    def error_context(stage):
+        context = {'job_id': job_id, 'provider': provider_name, 'stage': stage}
+        if provider is not None:
+            try:
+                provider_context = provider.get_error_context()
+            except Exception as diagnostic_error:
+                context['provider_diagnostics_error'] = str(diagnostic_error)
+            else:
+                if provider_context:
+                    context['provider_context'] = provider_context
+        return context
 
     try:
-        if _is_halted():
-            _update_update_job(job_id, status='halted', error='系统已急停')
-            _append_update_job_log(job_id, '任务因系统急停而终止。')
-            return
+        ensure_update_continues()
 
         _update_update_job(
             job_id,
@@ -1449,6 +1478,7 @@ def _run_update_job(job_id, provider_name, provider_token):
         )
         _append_update_job_log(job_id, f'正在获取 {provider_name} 目标股票池。')
         target_universe = provider.get_target_universe(board='all', max_stocks=None)
+        ensure_update_continues()
         _update_update_job(
             job_id,
             total_count=len(target_universe),
@@ -1493,13 +1523,10 @@ def _run_update_job(job_id, provider_name, provider_token):
             max_stocks=None,
             purpose='run',
             progress_callback=progress_callback,
-            halt_checker=_is_halted,
+            halt_checker=lambda: _is_halted() or is_cancelled(),
         )
 
-        if _is_halted():
-            _update_update_job(job_id, status='halted', error='系统已急停')
-            _append_update_job_log(job_id, '任务因系统急停而终止。')
-            return
+        ensure_update_continues()
 
         provider_state = warehouse_summary(data_dir, provider_name)
         coverage_ratio = _provider_update_coverage(provider_state)
@@ -1513,11 +1540,26 @@ def _run_update_job(job_id, provider_name, provider_token):
                 f"本次更新覆盖率过低 ({stock_count}/{target_count})，"
                 "疑似网络/代理或数据源连接异常；已跳过缓存刷新，保留当前 active provider。"
             )
+            failure_context = error_context('low_coverage')
+            failure_context['provider_state'] = provider_state
+            error_report_path = write_error_report(
+                'update',
+                DataProviderError(message),
+                failure_context,
+                error_id=job_id,
+            )
             _append_update_job_log(job_id, message)
+            _append_update_job_log(job_id, f'错误日志: {error_report_path}')
             _append_system_log(
                 'update_job_failed_low_coverage',
                 message,
-                {'job_id': job_id, 'provider': provider_name, 'summary': provider_state, 'sync_summary': sync_summary},
+                {
+                    'job_id': job_id,
+                    'provider': provider_name,
+                    'summary': provider_state,
+                    'sync_summary': sync_summary,
+                    'error_report_path': str(error_report_path),
+                },
             )
             _update_update_job(
                 job_id,
@@ -1526,6 +1568,7 @@ def _run_update_job(job_id, provider_name, provider_token):
                 current_step='更新失败',
                 current_stock=None,
                 error=message,
+                error_report_path=str(error_report_path),
                 finished_at=_job_timestamp(),
                 cache_refresh={'skipped': 'low_coverage'},
             )
@@ -1548,7 +1591,9 @@ def _run_update_job(job_id, provider_name, provider_token):
             )
             _update_update_job(job_id, cache_refresh={'skipped': 'low_coverage'})
         else:
+            ensure_update_continues()
             _refresh_market_caches_for_job(job_id, provider_dir)
+            ensure_update_continues()
             provider_state = warehouse_summary(data_dir, provider_name)
         switch_allowed = (
             provider_state.get('stock_count', 0) > 0
@@ -1584,20 +1629,48 @@ def _run_update_job(job_id, provider_name, provider_token):
             '数据更新与缓存重建已完成。',
             {'job_id': job_id, 'provider': provider_name, 'provider_state': provider_state},
         )
-    except InterruptedError:
-        _update_update_job(
-            job_id,
-            status='halted',
-            error='系统已急停',
-            current_stock=None,
-            finished_at=_job_timestamp(),
-        )
-        _append_update_job_log(job_id, '任务因系统急停而终止。')
+    except InterruptedError as exc:
+        if is_cancelled() and not _is_halted():
+            message = '用户已停止此次更新；已写入的数据和现有日志均已保留。'
+            error_report_path = write_error_report(
+                'update',
+                exc,
+                error_context('cancelled'),
+                error_id=job_id,
+            )
+            _update_update_job(
+                job_id,
+                status='cancelled',
+                current_step='更新已停止',
+                error=message,
+                error_report_path=str(error_report_path),
+                current_stock=None,
+                finished_at=_job_timestamp(),
+            )
+            _append_update_job_log(job_id, f'{message} 错误日志: {error_report_path}')
+            _append_system_log(
+                'update_job_cancelled',
+                message,
+                {
+                    'job_id': job_id,
+                    'provider': provider_name,
+                    'error_report_path': str(error_report_path),
+                },
+            )
+        else:
+            _update_update_job(
+                job_id,
+                status='halted',
+                error='系统已急停',
+                current_stock=None,
+                finished_at=_job_timestamp(),
+            )
+            _append_update_job_log(job_id, '任务因系统急停而终止。')
     except DataProviderError as exc:
         error_report_path = write_error_report(
             'update',
             exc,
-            {'job_id': job_id, 'provider': provider_name, 'stage': 'data_provider'},
+            error_context('data_provider'),
             error_id=job_id,
         )
         _update_update_job(
@@ -1618,7 +1691,7 @@ def _run_update_job(job_id, provider_name, provider_token):
         error_report_path = write_error_report(
             'update',
             exc,
-            {'job_id': job_id, 'provider': provider_name, 'stage': 'unexpected'},
+            error_context('unexpected'),
             error_id=job_id,
         )
         _update_update_job(
@@ -3027,6 +3100,51 @@ def get_update_job_status(job_id):
             'success': True,
             'data': _serialize_job(job),
         })
+
+
+@app.route('/api/update/cancel/<job_id>', methods=['POST'])
+def cancel_update_job(job_id):
+    """停止单个更新任务，不触发全局急停并保留任务日志。"""
+    try:
+        job_id = _validate_job_id(job_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+
+    with update_jobs_lock:
+        job = update_jobs.get(job_id)
+        if not job:
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+
+        status = str(job.get('status') or '').lower()
+        if status in {'completed', 'error', 'failed', 'halted', 'cancelled'}:
+            return jsonify({
+                'success': True,
+                'message': '任务已结束，现有日志已保留。',
+                'data': _serialize_job(job),
+            })
+
+        cancel_event = update_cancel_events.get(job_id)
+        if cancel_event is None:
+            cancel_event = Event()
+            update_cancel_events[job_id] = cancel_event
+        cancel_event.set()
+        job['cancel_requested'] = True
+        job['current_step'] = '正在停止此次更新'
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        _append_job_log(job, '用户请求停止此次更新；正在结束任务并保留日志。')
+        serialized = _serialize_job(job)
+
+    _append_system_log(
+        'update_job_cancel_requested',
+        '用户请求停止此次更新。',
+        {'job_id': job_id, 'provider': job.get('provider')},
+    )
+    return jsonify({
+        'success': True,
+        'message': '停止请求已提交，已写入的数据和日志将保留。',
+        'data': serialized,
+    })
 
 
 @app.route('/api/watchlist', methods=['GET'])

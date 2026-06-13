@@ -2564,6 +2564,44 @@ body.heatmap-focus-active #heatmap-chart {
     justify-content: flex-end;
 }
 
+.update-progress-actions {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px;
+    border: 1px solid var(--verydim);
+    background: var(--bg-input);
+}
+
+.update-progress-actions.active {
+    display: flex;
+}
+
+.update-stop-note {
+    color: var(--dim);
+    font-size: 10px;
+    line-height: 1.5;
+}
+
+.update-stop-btn {
+    flex: 0 0 auto;
+    min-width: 210px;
+    border-color: var(--down);
+    color: var(--down);
+}
+
+.update-stop-btn:hover,
+.update-stop-btn:focus {
+    background: var(--down);
+    color: #ffffff;
+}
+
+.update-stop-btn:disabled {
+    border-color: var(--verydim);
+    color: var(--dim);
+}
+
 .export-confirm-body {
     gap: 14px;
 }

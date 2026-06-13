@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `26bfddf6cb09963ed5a11a53f386303cfa19f94a`
-  (`Relocate runtime outputs and remove legacy Android subtree`, 2026-06-10).
+  `8c18a0948cb5da6cb3caaf96ed9f49249c433f8c`
+  (`Harden Tencent fetches against WAF 501 throttling`, 2026-06-11).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -235,10 +235,10 @@ At commit `b038324`, the full suite result was:
 54 passed
 ```
 
-The current uncommitted Tencent WAF hardening passed:
+The current uncommitted desktop, provider-network, and update-cancellation fixes passed:
 
 ```text
-66 passed
+75 passed
 ```
 
 Useful runtime checks:
@@ -277,7 +277,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `26bfddf` on local `main`; `origin/main` is also `26bfddf`.
+Baseline commit: `8c18a09` on local `main`; `origin/main` is also `8c18a09`.
 
 State at handoff:
 
@@ -307,20 +307,64 @@ State at handoff:
   HTML instead of market-data JSON after roughly 1,350 incremental requests.
   With the previous 24-worker default and route retry loop, each failure became
   a full refresh retry and the planned total expanded by thousands.
-- The current uncommitted hardening limits Tencent to four workers, spaces
+- The committed Tencent hardening limits Tencent to four workers, spaces
   Tencent requests by at least 0.2 seconds, detects the WAF 501 page, and
   propagates it as a batch-fatal `DataProviderError` instead of retrying every
-  stock. Focused tests and the full suite pass: `66 passed`.
-- A live single-request check still received WAF 501 after the fix. Do not run
-  another Tencent full-market update until the restriction clears or
-  `web.ifzq.gtimg.cn` is routed directly outside the VPN/proxy. AkShare remains
-  the active provider with latest trade date 2026-06-11.
+  stock.
+- Three captured failures on 2026-06-12 show Tencent WAF 501 both without VPN
+  and through an AkShare job. The AkShare traceback proves its primary request
+  failed first, then its optional Tencent fallback raised WAF and incorrectly
+  aborted the entire AkShare batch. The failed jobs had already written about
+  662, 592, and 6 stock CSVs, while provider state remained stale because the
+  fatal exception bypassed final state persistence.
+- The current uncommitted network fix raises Tencent's default request spacing
+  to 0.5 seconds. Explicit Tencent jobs still stop immediately on WAF, but an
+  AkShare job now disables only its Tencent fallback for the rest of that run
+  and continues without propagating the fallback error. AkShare also retries
+  Eastmoney directly after a real `requests` network exception before using
+  Tencent.
+- Provider state and update error reports now retain bounded primary/fallback
+  exception samples, request policy, assessment counts, and interrupted
+  progress. Low-coverage failures also create a report under `logs/errors/`.
+  This is the primary evidence path when the user's no-VPN environment cannot
+  be reproduced during a Codex session.
+- The Web update modal previously handled `error` but not the low-coverage
+  terminal status `failed`, so polling continued forever and kept reopening the
+  modal. The frontend now treats `failed`, `error`, and `cancelled` as terminal
+  failure states and exposes `停止此次更新并保留日志` for both active and
+  failed tasks.
+- `POST /api/update/cancel/<job_id>` sets a per-update cancellation event
+  instead of the global HALT event. Active cancellation preserves already
+  written CSVs, job feed entries, and a persisted error-report snapshot; a
+  task that already failed keeps its original report. Browser verification used
+  an isolated simulated `failed` job and confirmed the button releases the
+  modal, leaves UPDATE enabled, and produces no browser console errors.
+- On 2026-06-13 with VPN connected, a one-stock AkShare probe saw the system
+  proxy close the Eastmoney request and the direct retry also disconnect;
+  Tencent fallback succeeded. This confirms the failure is route/provider
+  dependent, not simply "VPN on versus off." Do not run a full-market provider
+  update merely to validate this fix.
+- The desktop App restart-after-EXIT incident was caused by an external
+  `launchctl submit` job named
+  `com.openai.codex.a-share-quant-selector`, not by the shutdown endpoint. The
+  job was removed and must not be recreated for ordinary App restarts.
+- The source `assets/app_icon.icns` has opaque black corners. The App bundle
+  masks them normally, but passing that file directly to `webview.start()`
+  exposes a black square in the Dock. `build_macos_app.py` now signs the bundle,
+  exports macOS's masked icon as transparent `runtime_icon.png`, then signs the
+  finished App again. The launcher only passes that generated PNG to pywebview.
+- Focused launcher/network/update-cancellation checks, environment validation,
+  App launch, Computer Use EXIT verification, and the full suite pass:
+  `75 passed`. After EXIT, the process and port 5080 remained stopped and no
+  relaunch job appeared.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `8c18a09` (2026-06-11): throttled Tencent requests and converted WAF HTTP 501
+  responses into batch-fatal update errors instead of per-stock retry storms.
 - `26bfddf` (2026-06-10): moved selection/Wyckoff runtime outputs outside the
   repository and removed the legacy Android subtree after preserving its
   independent checkout.

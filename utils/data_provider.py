@@ -92,6 +92,8 @@ class BaseDataProvider:
         self._sync_lock = Lock()
         self._sync_max_workers = min(max(os.cpu_count() or 4, 1), 24)
         self.last_sync_summary = None
+        self._active_sync_context = {}
+        self._active_sync_progress = None
 
     def configure_storage(self, root_dir: str | Path, provider_name: str | None = None):
         """Attach the provider to the shared storage root used for active routing."""
@@ -544,6 +546,25 @@ class BaseDataProvider:
         """Provider hook for exposing lightweight sync diagnostics."""
         return {}
 
+    def get_runtime_diagnostics(self) -> dict:
+        """Provider hook for exposing structured error details."""
+        return {}
+
+    def get_error_context(self) -> dict:
+        """Return a JSON-safe snapshot suitable for persisted error reports."""
+        context = {}
+        runtime_stats = self.get_runtime_stats()
+        if runtime_stats:
+            context["runtime_stats"] = runtime_stats
+        runtime_diagnostics = self.get_runtime_diagnostics()
+        if runtime_diagnostics:
+            context["runtime_diagnostics"] = runtime_diagnostics
+        if self._active_sync_context:
+            context["sync_assessment"] = dict(self._active_sync_context)
+        if self._active_sync_progress is not None:
+            context["sync_progress"] = dict(self._active_sync_progress)
+        return context
+
     def classify_board(self, stock_code: str, metadata: Optional[dict] = None) -> str:
         """按元数据优先、代码前缀回退的方式划分板块"""
         metadata = metadata or {}
@@ -789,6 +810,9 @@ class BaseDataProvider:
         runtime_stats = self.get_runtime_stats()
         if runtime_stats:
             payload["runtime_stats"] = runtime_stats
+        runtime_diagnostics = self.get_runtime_diagnostics()
+        if runtime_diagnostics:
+            payload["runtime_diagnostics"] = runtime_diagnostics
         write_provider_state(self.storage_root_dir, self.provider_name, payload)
         return payload
 
@@ -874,6 +898,8 @@ class BaseDataProvider:
         up_to_date = []
         incremental = []
         full_refresh = []
+        self._active_sync_context = {}
+        self._active_sync_progress = None
 
         for item in target_universe:
             code = item["code"]
@@ -886,6 +912,13 @@ class BaseDataProvider:
             else:
                 full_refresh.append(item)
 
+        self._active_sync_context = {
+            "latest_trade_date": latest_trade_date_str,
+            "target_count": len(target_universe),
+            "up_to_date_count": len(up_to_date),
+            "incremental_count": len(incremental),
+            "full_refresh_count": len(full_refresh),
+        }
         print("\n📋 目标股票池概览")
         print(f"  板块: {BOARD_LABELS.get(board, board)}")
         print(f"  目标数量: {len(target_universe)} 只")
@@ -958,6 +991,7 @@ class BaseDataProvider:
             "success": 0,
             "failed": 0,
         }
+        self._active_sync_progress = progress_state
         tracker = ProgressTracker(total_work or 1, label="同步进度")
         success_count = 0
         failed_count = 0
