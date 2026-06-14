@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `8c18a0948cb5da6cb3caaf96ed9f49249c433f8c`
-  (`Harden Tencent fetches against WAF 501 throttling`, 2026-06-11).
+  `5a2e14b22f4bf506c309082ff1205502d1c37054`
+  (`Harden update cancellation and desktop app icon handling`, 2026-06-13).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -235,10 +235,10 @@ At commit `b038324`, the full suite result was:
 54 passed
 ```
 
-The current uncommitted desktop, provider-network, and update-cancellation fixes passed:
+The current uncommitted adaptive provider-throttling fix passed:
 
 ```text
-75 passed
+78 passed
 ```
 
 Useful runtime checks:
@@ -317,12 +317,25 @@ State at handoff:
   aborted the entire AkShare batch. The failed jobs had already written about
   662, 592, and 6 stock CSVs, while provider state remained stale because the
   fatal exception bypassed final state persistence.
-- The current uncommitted network fix raises Tencent's default request spacing
-  to 0.5 seconds. Explicit Tencent jobs still stop immediately on WAF, but an
+- The committed network fix raised Tencent's default request spacing to 0.5
+  seconds. Explicit Tencent jobs still stop immediately on WAF, but an
   AkShare job now disables only its Tencent fallback for the rest of that run
   and continues without propagating the fallback error. AkShare also retries
   Eastmoney directly after a real `requests` network exception before using
   Tencent.
+- The current uncommitted throughput adjustment starts Tencent at 0.35 seconds
+  plus up to 0.05 seconds of jitter, pauses 8 seconds after each 400 requests,
+  backs off toward 1.2 seconds on 403/429/5xx responses, and cautiously recovers
+  after sustained success. WAF 501 remains batch-fatal.
+- AkShare now treats primary and direct connectivity as run-scoped route
+  states. A confirmed primary network failure avoids repeating that failed
+  route for every stock; the direct route uses a four-second probe and is
+  reused on success or disabled for the rest of the run on failure.
+- A 2026-06-14 VPN-connected probe fetched 20 Tencent stocks successfully in
+  7.21 seconds (2.77 requests/second) with no throttling response. Two AkShare
+  updates completed through the primary route in 0.37 and 0.35 seconds. This is
+  a bounded probe, not proof that the user's no-VPN route will behave exactly
+  the same during a full-market update.
 - Provider state and update error reports now retain bounded primary/fallback
   exception samples, request policy, assessment counts, and interrupted
   progress. Low-coverage failures also create a report under `logs/errors/`.
@@ -353,10 +366,10 @@ State at handoff:
   exposes a black square in the Dock. `build_macos_app.py` now signs the bundle,
   exports macOS's masked icon as transparent `runtime_icon.png`, then signs the
   finished App again. The launcher only passes that generated PNG to pywebview.
-- Focused launcher/network/update-cancellation checks, environment validation,
-  App launch, Computer Use EXIT verification, and the full suite pass:
-  `75 passed`. After EXIT, the process and port 5080 remained stopped and no
-  relaunch job appeared.
+- Focused launcher/network/update-cancellation/throttling checks, environment
+  validation, App launch, Computer Use EXIT verification, and the full suite
+  pass: `78 passed`. After EXIT, the process and port 5080 remained stopped and
+  no relaunch job appeared.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
