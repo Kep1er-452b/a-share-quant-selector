@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -35,6 +36,7 @@ BOARD_LABELS = {
 MAX_REASONABLE_MARKET_CAP_YUAN = 20_000_000_000_000
 MIN_REASONABLE_MARKET_CAP_YUAN = 1_000_000
 DATA_SYNC_IDLE_TIMEOUT_SECONDS = 90
+DATA_SYNC_POLL_SECONDS = 1
 
 
 def normalize_market_cap_yuan(value, source_unit: str = "yuan") -> Optional[int]:
@@ -155,10 +157,19 @@ class BaseDataProvider:
 
     def _save_stock_names(self, stock_dict: Dict[str, str]) -> None:
         """保存股票名称到本地"""
+        self.stock_names_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".json",
+            prefix="stock_names_",
+            dir=str(self.stock_names_file.parent),
+        )
         try:
-            with open(self.stock_names_file, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(stock_dict, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.stock_names_file)
         except Exception as e:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             print(f"  保存股票名称失败: {e}")
 
     @staticmethod
@@ -234,7 +245,39 @@ class BaseDataProvider:
         except Exception as e:
             print(f"  保存抓取状态失败: {e}")
 
-    def _sync_one_incremental(self, item: dict, latest_trade_date, status_map: dict, market_cap_map: dict) -> dict:
+    @staticmethod
+    def _qfq_anchor_changed(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> bool:
+        if new_df is None or new_df.empty or "adj_factor" not in new_df.columns:
+            return False
+        new_factors = pd.to_numeric(new_df["adj_factor"], errors="coerce").dropna()
+        if new_factors.empty:
+            return False
+        if existing_df is None or existing_df.empty or "adj_factor" not in existing_df.columns:
+            return True
+        existing_with_factor = existing_df.copy()
+        existing_with_factor["adj_factor"] = pd.to_numeric(existing_with_factor["adj_factor"], errors="coerce")
+        existing_with_factor = existing_with_factor.dropna(subset=["adj_factor"])
+        if existing_with_factor.empty:
+            return True
+        new_with_factor = new_df.copy()
+        new_with_factor["adj_factor"] = pd.to_numeric(new_with_factor["adj_factor"], errors="coerce")
+        new_with_factor = new_with_factor.dropna(subset=["adj_factor"])
+        existing_latest = existing_with_factor.assign(
+            _date=pd.to_datetime(existing_with_factor["date"], errors="coerce")
+        ).sort_values("_date", ascending=False).iloc[0]
+        new_latest = new_with_factor.assign(
+            _date=pd.to_datetime(new_with_factor["date"], errors="coerce")
+        ).sort_values("_date", ascending=False).iloc[0]
+        return abs(float(existing_latest["adj_factor"]) - float(new_latest["adj_factor"])) > 1e-10
+
+    def _sync_one_incremental(
+        self,
+        item: dict,
+        latest_trade_date,
+        status_map: dict,
+        market_cap_map: dict,
+        write_guard=None,
+    ) -> dict:
         """抓取单只股票的增量数据（线程安全）。"""
         code = item["code"]
         name = item.get("name", "")
@@ -246,12 +289,25 @@ class BaseDataProvider:
         df = self.fetch_stock_update(code, days=min(trading_days_needed, 1000))
         df = self._apply_market_cap_override(code, df, market_cap_map)
         if df is not None and not df.empty:
-            self.csv_manager.update_stock(code, df)
-            merged_df = self.csv_manager.read_stock(code)
-            adjustment_gaps = detect_adjustment_gaps(merged_df, stock_code=code)
+            if write_guard and not write_guard():
+                return {"code": code, "name": name, "ok": False, "cancelled": True}
+            if self._qfq_anchor_changed(existing_df, df):
+                return {
+                    "code": code,
+                    "name": name,
+                    "ok": False,
+                    "fallback_full": True,
+                    "qfq_anchor_changed": True,
+                }
+            prepared_new_df = self.csv_manager._preserve_existing_metrics(existing_df, df)
+            merged_df = pd.concat([existing_df, prepared_new_df], ignore_index=True)
+            adjustment_gaps = detect_adjustment_gaps(
+                merged_df,
+                stock_code=code,
+                list_date=item.get("list_date"),
+                board=item.get("board"),
+            )
             if adjustment_gaps:
-                if existing_df is not None and not existing_df.empty:
-                    self.csv_manager.write_stock(code, existing_df)
                 return {
                     "code": code,
                     "name": name,
@@ -260,13 +316,20 @@ class BaseDataProvider:
                     "adjustment_gap": True,
                     "gaps": adjustment_gaps[:5],
                 }
+            self.csv_manager.update_stock(code, df, write_guard=write_guard)
             refreshed = self._inspect_local_stock(code, latest_trade_date)
             refreshed["status"] = "incremental_updated"
             refreshed["reason"] = "incremental_ok"
             return {"code": code, "name": name, "ok": True, "refreshed": refreshed, "rows": len(df)}
         return {"code": code, "name": name, "ok": False, "fallback_full": True}
 
-    def _sync_one_full_refresh(self, item: dict, latest_trade_date, market_cap_map: dict) -> dict:
+    def _sync_one_full_refresh(
+        self,
+        item: dict,
+        latest_trade_date,
+        market_cap_map: dict,
+        write_guard=None,
+    ) -> dict:
         """全量重抓单只股票（线程安全）。"""
         code = item["code"]
         name = item.get("name", "")
@@ -274,7 +337,14 @@ class BaseDataProvider:
         df = self.fetch_stock_history(code, years=6)
         df = self._apply_market_cap_override(code, df, market_cap_map)
         if df is not None and not df.empty:
-            adjustment_gaps = detect_adjustment_gaps(df, stock_code=code)
+            if write_guard and not write_guard():
+                return {"code": code, "name": name, "ok": False, "cancelled": True}
+            adjustment_gaps = detect_adjustment_gaps(
+                df,
+                stock_code=code,
+                list_date=item.get("list_date"),
+                board=item.get("board"),
+            )
             if adjustment_gaps:
                 return {
                     "code": code,
@@ -284,7 +354,7 @@ class BaseDataProvider:
                     "preserved_existing": bool(existing_df is not None and not existing_df.empty),
                     "gaps": adjustment_gaps[:5],
                 }
-            self.csv_manager.write_stock(code, df)
+            self.csv_manager.write_stock(code, df, write_guard=write_guard)
             refreshed = self._inspect_local_stock(code, latest_trade_date)
             refreshed["status"] = "full_refreshed"
             refreshed["reason"] = "full_refresh_ok"
@@ -306,19 +376,33 @@ class BaseDataProvider:
             return [], []
         ok_list = []
         fallback_list = []
+        cancel_event = Event()
+        write_guard = lambda: not cancel_event.is_set() and not (halt_checker and halt_checker())
         max_workers = min(self._sync_max_workers, max(len(items), 1))
         pool = ThreadPoolExecutor(max_workers=max_workers)
         try:
-            futures = {pool.submit(self._sync_one_incremental, item, latest_trade_date, status_map, market_cap_map): item for item in items}
+            futures = {
+                pool.submit(
+                    self._sync_one_incremental,
+                    item,
+                    latest_trade_date,
+                    status_map,
+                    market_cap_map,
+                    write_guard,
+                ): item
+                for item in items
+            }
             pending = set(futures)
             last_completion = time.monotonic()
             while pending:
                 if halt_checker and halt_checker():
+                    cancel_event.set()
                     raise InterruptedError("系统已急停")
-                done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                done, pending = wait(pending, timeout=DATA_SYNC_POLL_SECONDS, return_when=FIRST_COMPLETED)
                 if not done:
                     if time.monotonic() - last_completion < DATA_SYNC_IDLE_TIMEOUT_SECONDS:
                         continue
+                    cancel_event.set()
                     for future in pending:
                         future.cancel()
                         item = futures[future]
@@ -327,7 +411,11 @@ class BaseDataProvider:
                             "name": item.get("name", ""),
                             "ok": False,
                             "timeout": True,
+                            "fallback_full": True,
                         }
+                        fallback_item = dict(item)
+                        fallback_item["_worker_error"] = "sync_timeout"
+                        fallback_list.append(fallback_item)
                         self._emit_batch_progress(
                             item=item,
                             result=result,
@@ -342,6 +430,7 @@ class BaseDataProvider:
                     try:
                         result = future.result()
                     except DataProviderError:
+                        cancel_event.set()
                         for pending_future in pending:
                             pending_future.cancel()
                         raise
@@ -360,6 +449,8 @@ class BaseDataProvider:
                         fallback_item = dict(futures[future])
                         if result.get("adjustment_gap"):
                             fallback_item["_adjustment_gap_result"] = result
+                        if result.get("qfq_anchor_changed"):
+                            fallback_item["_qfq_anchor_changed"] = True
                         if result.get("error"):
                             fallback_item["_worker_error"] = result.get("error")
                         fallback_list.append(fallback_item)
@@ -372,6 +463,7 @@ class BaseDataProvider:
                         progress_state=progress_state,
                     )
         finally:
+            cancel_event.set()
             pool.shutdown(wait=False, cancel_futures=True)
         return ok_list, fallback_list
 
@@ -389,19 +481,32 @@ class BaseDataProvider:
             return [], []
         ok_list = []
         failed_list = []
+        cancel_event = Event()
+        write_guard = lambda: not cancel_event.is_set() and not (halt_checker and halt_checker())
         max_workers = min(self._sync_max_workers, max(len(items), 1))
         pool = ThreadPoolExecutor(max_workers=max_workers)
         try:
-            futures = {pool.submit(self._sync_one_full_refresh, item, latest_trade_date, market_cap_map): item for item in items}
+            futures = {
+                pool.submit(
+                    self._sync_one_full_refresh,
+                    item,
+                    latest_trade_date,
+                    market_cap_map,
+                    write_guard,
+                ): item
+                for item in items
+            }
             pending = set(futures)
             last_completion = time.monotonic()
             while pending:
                 if halt_checker and halt_checker():
+                    cancel_event.set()
                     raise InterruptedError("系统已急停")
-                done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                done, pending = wait(pending, timeout=DATA_SYNC_POLL_SECONDS, return_when=FIRST_COMPLETED)
                 if not done:
                     if time.monotonic() - last_completion < DATA_SYNC_IDLE_TIMEOUT_SECONDS:
                         continue
+                    cancel_event.set()
                     for future in pending:
                         future.cancel()
                         item = futures[future]
@@ -426,6 +531,7 @@ class BaseDataProvider:
                     try:
                         result = future.result()
                     except DataProviderError:
+                        cancel_event.set()
                         for pending_future in pending:
                             pending_future.cancel()
                         raise
@@ -450,6 +556,7 @@ class BaseDataProvider:
                         progress_state=progress_state,
                     )
         finally:
+            cancel_event.set()
             pool.shutdown(wait=False, cancel_futures=True)
         return ok_list, failed_list
 
@@ -790,9 +897,10 @@ class BaseDataProvider:
             for code, info in status_map.items()
             if info.get("status") == "adjustment_warning"
         }
+        is_complete = usable_count == target_count and failed_count == 0 and warning_count == 0
         payload = {
             "provider": self.provider_name,
-            "status": "completed" if failed_count == 0 and warning_count == 0 else "partial",
+            "status": "completed" if is_complete else "partial",
             "board": board,
             "board_label": BOARD_LABELS.get(board, board),
             "max_stocks": max_stocks,
@@ -803,7 +911,7 @@ class BaseDataProvider:
             "failed_count": failed_count,
             "warning_count": warning_count,
             "coverage_ratio": coverage_ratio,
-            "is_complete": failed_count == 0 and warning_count == 0,
+            "is_complete": is_complete,
             "status_summary": final_summary,
             "warnings": warnings,
         }
@@ -1046,6 +1154,10 @@ class BaseDataProvider:
                             current_stock={"code": item.get("code"), "name": item.get("name", "")},
                             adjustment_gaps=gap_result.get("gaps", []),
                         )
+                    elif item.get("_worker_error") == "sync_timeout":
+                        status_map[item["code"]]["reason"] = "incremental_timeout_full_refresh"
+                    elif item.get("_qfq_anchor_changed"):
+                        status_map[item["code"]]["reason"] = "qfq_anchor_changed_full_refresh"
                     else:
                         status_map[item["code"]]["reason"] = "incremental_failed"
 
