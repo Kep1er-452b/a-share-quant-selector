@@ -13,9 +13,14 @@ data_source:
   default_provider: "akshare"  # 可选: akshare / tushare
   akshare:
     allow_mock_data: false  # 仅演示/开发时可显式改为 true，真实选股请保持 false
+    direct_retry_timeout_seconds: 4  # 直连仅用于线路探测，失败后本轮自动熔断
   tencent:
     max_workers: 4  # Tencent WAF 对高并发敏感，建议保持保守并发
-    min_request_interval_seconds: 0.5
+    min_request_interval_seconds: 0.35
+    request_jitter_seconds: 0.05
+    cooldown_every_requests: 400
+    cooldown_seconds: 8
+    max_request_interval_seconds: 1.2
   tushare:
     token: ""  # 推荐优先使用环境变量 TUSHARE_TOKEN 或本机 config/config_local.yaml
 

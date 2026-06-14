@@ -113,6 +113,15 @@ class AKShareFetcher(BaseDataProvider):
             default=2,
             cast=int,
         )
+        self.akshare_direct_retry_timeout = max(
+            self._coerce_number(
+                akshare_config.get('direct_retry_timeout_seconds')
+                or os.getenv('ASHARE_AK_DIRECT_RETRY_TIMEOUT_SECONDS'),
+                default=4.0,
+                cast=float,
+            ),
+            1.0,
+        )
         if self.provider_name == "akshare":
             self._sync_max_workers = min(
                 self._sync_max_workers,
@@ -137,11 +146,46 @@ class AKShareFetcher(BaseDataProvider):
         self.tencent_request_interval = max(
             self._coerce_number(
                 tencent_interval,
-                default=0.5,
+                default=0.35,
                 cast=float,
             ),
             0.0,
         )
+        self.tencent_request_jitter = max(
+            self._coerce_number(
+                tencent_config.get('request_jitter_seconds'),
+                default=0.05,
+                cast=float,
+            ),
+            0.0,
+        )
+        self.tencent_cooldown_every = max(
+            self._coerce_number(
+                tencent_config.get('cooldown_every_requests'),
+                default=400,
+                cast=int,
+            ),
+            0,
+        )
+        self.tencent_cooldown_seconds = max(
+            self._coerce_number(
+                tencent_config.get('cooldown_seconds'),
+                default=8.0,
+                cast=float,
+            ),
+            0.0,
+        )
+        self.tencent_max_request_interval = max(
+            self._coerce_number(
+                tencent_config.get('max_request_interval_seconds'),
+                default=1.2,
+                cast=float,
+            ),
+            self.tencent_request_interval,
+        )
+        self._tencent_current_interval = self.tencent_request_interval
+        self._tencent_success_streak = 0
+        self._tencent_request_count = 0
         self._tencent_request_lock = Lock()
         self._tencent_next_request_at = 0.0
         self.allow_mock_data = bool(
@@ -155,6 +199,10 @@ class AKShareFetcher(BaseDataProvider):
         self._tencent_fallback_lock = Lock()
         self._tencent_fallback_blocked = False
         self._tencent_fallback_error = None
+        self._akshare_direct_lock = Lock()
+        self._akshare_direct_route = "unknown"
+        self._akshare_primary_lock = Lock()
+        self._akshare_primary_route = "unknown"
 
     @staticmethod
     def _coerce_number(value, default, cast=float):
@@ -190,7 +238,15 @@ class AKShareFetcher(BaseDataProvider):
                 "tencent_fallback_error": self._tencent_fallback_error,
                 "network_policy": {
                     "sync_max_workers": self._sync_max_workers,
-                    "tencent_min_request_interval_seconds": self.tencent_request_interval,
+                    "tencent_base_interval_seconds": self.tencent_request_interval,
+                    "tencent_current_interval_seconds": round(self._tencent_current_interval, 4),
+                    "tencent_request_jitter_seconds": self.tencent_request_jitter,
+                    "tencent_cooldown_every_requests": self.tencent_cooldown_every,
+                    "tencent_cooldown_seconds": self.tencent_cooldown_seconds,
+                    "tencent_request_count": self._tencent_request_count,
+                    "akshare_direct_retry_timeout_seconds": self.akshare_direct_retry_timeout,
+                    "akshare_primary_route": self._akshare_primary_route,
+                    "akshare_direct_route": self._akshare_direct_route,
                 },
             }
 
@@ -227,10 +283,44 @@ class AKShareFetcher(BaseDataProvider):
         with self._tencent_request_lock:
             now = time.monotonic()
             scheduled_at = max(now, self._tencent_next_request_at)
-            self._tencent_next_request_at = scheduled_at + self.tencent_request_interval
+            self._tencent_request_count += 1
+            if (
+                self.tencent_cooldown_every > 0
+                and self._tencent_request_count > 1
+                and (self._tencent_request_count - 1) % self.tencent_cooldown_every == 0
+            ):
+                scheduled_at += self.tencent_cooldown_seconds
+                self._note_runtime_stat('tencent_periodic_cooldown')
+            jitter = random.uniform(0.0, self.tencent_request_jitter) if self.tencent_request_jitter else 0.0
+            self._tencent_next_request_at = scheduled_at + self._tencent_current_interval + jitter
         wait_seconds = scheduled_at - now
         if wait_seconds > 0:
             time.sleep(wait_seconds)
+
+    def _slow_tencent_requests(self, reason):
+        with self._tencent_request_lock:
+            self._tencent_current_interval = min(
+                self.tencent_max_request_interval,
+                max(
+                    self._tencent_current_interval * 1.5,
+                    self._tencent_current_interval + 0.1,
+                ),
+            )
+            self._tencent_success_streak = 0
+        self._note_runtime_stat(f'tencent_throttle_backoff_{reason}')
+
+    def _note_tencent_request_success(self):
+        with self._tencent_request_lock:
+            self._tencent_success_streak += 1
+            if self._tencent_success_streak < 200:
+                return
+            self._tencent_success_streak = 0
+            if self._tencent_current_interval > self.tencent_request_interval:
+                self._tencent_current_interval = max(
+                    self.tencent_request_interval,
+                    self._tencent_current_interval * 0.9,
+                )
+                self._note_runtime_stat('tencent_throttle_recovered')
 
     @staticmethod
     def _is_tencent_waf_response(response):
@@ -267,11 +357,16 @@ class AKShareFetcher(BaseDataProvider):
                     )
                     if self._is_tencent_waf_response(response):
                         self._note_runtime_stat('tencent_waf_501')
+                        self._slow_tencent_requests('waf_501')
                         raise DataProviderError(
                             "Tencent 行情接口触发 WAF 501 拦截，通常与出口 IP 风控或连续请求频率有关。"
                             "请停止重复更新并等待限制解除；切换 VPN/代理不一定立即生效。"
                         )
+                    if response.status_code in {403, 429, 500, 502, 503, 504}:
+                        self._slow_tencent_requests(f'http_{response.status_code}')
                     response.raise_for_status()
+                    if self._is_tencent_quote_url(url):
+                        self._note_tencent_request_success()
                     self._note_runtime_stat(f"http_{mode}_success")
                     return response
                 except DataProviderError:
@@ -316,12 +411,12 @@ class AKShareFetcher(BaseDataProvider):
                         query_codes.append(f"sh{code}")
                     else:
                         query_codes.append(f"sz{code}")
-                
+
                 url = f"https://qt.gtimg.cn/q={','.join(query_codes)}"
                 resp = self._request_get(url, timeout=self.tencent_timeout, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
-                
+
                 lines = resp.text.strip().split(';')
                 for line in lines:
                     if 'v_' in line and '~' in line:
@@ -861,7 +956,7 @@ class AKShareFetcher(BaseDataProvider):
         }
         direct_session = requests.Session()
         direct_session.trust_env = False
-        response = direct_session.get(url, params=params, timeout=self.akshare_timeout)
+        response = direct_session.get(url, params=params, timeout=self.akshare_direct_retry_timeout)
         response.raise_for_status()
         payload = response.json()
         klines = ((payload.get("data") or {}).get("klines") or [])
@@ -894,55 +989,127 @@ class AKShareFetcher(BaseDataProvider):
         frame = frame.sort_values("date", ascending=False)
         return self._mark_data_source(frame, source)
 
+    def _try_eastmoney_direct(self, stock_code, start_date, end_date, source):
+        if self._akshare_direct_route == "blocked":
+            self._note_runtime_stat('akshare_direct_retry_skipped')
+            return None
+        if self._akshare_direct_route == "available":
+            try:
+                return self._fetch_eastmoney_history_direct(
+                    stock_code,
+                    start_date,
+                    end_date,
+                    source,
+                )
+            except Exception as exc:
+                self._note_runtime_stat('akshare_direct_retry_error')
+                self._record_network_error(f'{source}_failed', stock_code, exc)
+                with self._akshare_direct_lock:
+                    self._akshare_direct_route = "blocked"
+                return None
+
+        with self._akshare_direct_lock:
+            if self._akshare_direct_route == "blocked":
+                self._note_runtime_stat('akshare_direct_retry_skipped')
+                return None
+            if self._akshare_direct_route == "available":
+                return self._try_eastmoney_direct(
+                    stock_code,
+                    start_date,
+                    end_date,
+                    source,
+                )
+            try:
+                frame = self._fetch_eastmoney_history_direct(
+                    stock_code,
+                    start_date,
+                    end_date,
+                    source,
+                )
+            except Exception as exc:
+                self._akshare_direct_route = "blocked"
+                self._note_runtime_stat('akshare_direct_retry_error')
+                self._record_network_error(f'{source}_probe', stock_code, exc)
+                print(f"  akshare直连探测失败，本轮不再重复探测: {exc}")
+                return None
+            if frame is not None and not frame.empty:
+                self._akshare_direct_route = "available"
+                self._note_runtime_stat('akshare_direct_retry_success')
+                return frame
+            self._akshare_direct_route = "blocked"
+            self._note_runtime_stat('akshare_direct_retry_short')
+            return None
+
+    def _mark_akshare_primary_success(self):
+        with self._akshare_primary_lock:
+            self._akshare_primary_route = "available"
+
+    def _mark_akshare_primary_network_failure(self):
+        with self._akshare_primary_lock:
+            if self._akshare_primary_route == "available":
+                self._note_runtime_stat('akshare_primary_transient_error')
+                return
+            self._akshare_primary_route = "blocked"
+        self._note_runtime_stat('akshare_primary_route_blocked')
+
     def fetch_stock_history(self, stock_code, years=6):
         """
         抓取单只股票历史数据
         前复权，按日期倒序排列
         """
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=365 * years)
-            start_str = start_date.strftime("%Y%m%d")
-            end_str = end_date.strftime("%Y%m%d")
-            
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_str,
-                end_date=end_str,
-                adjust="qfq",
-                timeout=self.akshare_timeout,
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365 * years)
+        start_str = start_date.strftime("%Y%m%d")
+        end_str = end_date.strftime("%Y%m%d")
+
+        primary_blocked = self._akshare_primary_route == "blocked"
+        if primary_blocked:
+            self._note_runtime_stat('akshare_primary_route_skipped')
+            direct_df = self._try_eastmoney_direct(
+                stock_code,
+                start_str,
+                end_str,
+                'akshare:eastmoney:direct',
             )
-            
-            if df is not None and not df.empty:
-                df = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist')
-                coverage = self._history_coverage_report(df, years=years)
-                if coverage['ok']:
-                    self._note_runtime_stat('akshare_history_success')
-                    return df
-                print(f"  akshare历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
-        except Exception as e:
-            self._note_runtime_stat('akshare_history_error')
-            self._record_network_error('akshare_history', stock_code, e)
-            print(f"  akshare获取失败: {e}")
-            if isinstance(e, requests.exceptions.RequestException):
-                try:
-                    direct_df = self._fetch_eastmoney_history_direct(
+            coverage = self._history_coverage_report(direct_df, years=years)
+            if coverage['ok']:
+                return direct_df
+
+        if not primary_blocked:
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_str,
+                    end_date=end_str,
+                    adjust="qfq",
+                    timeout=self.akshare_timeout,
+                )
+
+                if df is not None and not df.empty:
+                    df = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist')
+                    coverage = self._history_coverage_report(df, years=years)
+                    if coverage['ok']:
+                        self._mark_akshare_primary_success()
+                        self._note_runtime_stat('akshare_history_success')
+                        return df
+                    print(f"  akshare历史数据不足: {coverage['rows']}条/{coverage['span_days']}天")
+            except Exception as e:
+                self._note_runtime_stat('akshare_history_error')
+                self._record_network_error('akshare_history', stock_code, e)
+                print(f"  akshare获取失败: {e}")
+                if isinstance(e, requests.exceptions.RequestException):
+                    self._mark_akshare_primary_network_failure()
+                    direct_df = self._try_eastmoney_direct(
                         stock_code,
                         start_str,
                         end_str,
                         'akshare:eastmoney:direct',
                     )
-                except Exception as direct_error:
-                    self._note_runtime_stat('akshare_direct_retry_error')
-                    self._record_network_error('akshare_history_direct', stock_code, direct_error)
-                    print(f"  akshare直连重试失败: {direct_error}")
-                else:
-                    coverage = self._history_coverage_report(direct_df, years=years)
-                    if coverage['ok']:
-                        self._note_runtime_stat('akshare_direct_retry_success')
-                        return direct_df
-                    self._note_runtime_stat('akshare_direct_retry_short')
+                    if direct_df is not None and not direct_df.empty:
+                        coverage = self._history_coverage_report(direct_df, years=years)
+                        if coverage['ok']:
+                            return direct_df
 
         fallback_df = self._run_tencent_fallback(
             stock_code,
@@ -1044,40 +1211,49 @@ class AKShareFetcher(BaseDataProvider):
         抓取近期数据用于增量更新。
         market_cap 由调用方通过 _apply_market_cap_override 批量注入，此处不再逐股请求。
         """
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=max(days * 4 + 10, 20))
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.strftime("%Y%m%d"),
-                end_date=end_date.strftime("%Y%m%d"),
-                adjust="qfq",
-                timeout=self.akshare_timeout,
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=max(days * 4 + 10, 20))
+
+        primary_blocked = self._akshare_primary_route == "blocked"
+        if primary_blocked:
+            self._note_runtime_stat('akshare_primary_route_skipped')
+            direct_df = self._try_eastmoney_direct(
+                stock_code,
+                start_date.strftime("%Y%m%d"),
+                end_date.strftime("%Y%m%d"),
+                'akshare:eastmoney:direct:update',
             )
-            normalized = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist:update')
-            if normalized is not None and not normalized.empty:
-                self._note_runtime_stat('akshare_update_success')
-                return normalized
-        except Exception as e:
-            self._note_runtime_stat('akshare_update_error')
-            self._record_network_error('akshare_update', stock_code, e)
-            print(f"  akshare获取更新数据失败: {e}")
-            if isinstance(e, requests.exceptions.RequestException):
-                try:
-                    direct_df = self._fetch_eastmoney_history_direct(
+            if direct_df is not None and not direct_df.empty:
+                return direct_df
+
+        if not primary_blocked:
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.strftime("%Y%m%d"),
+                    end_date=end_date.strftime("%Y%m%d"),
+                    adjust="qfq",
+                    timeout=self.akshare_timeout,
+                )
+                normalized = self._normalize_akshare_history(stock_code, df, 'akshare:stock_zh_a_hist:update')
+                if normalized is not None and not normalized.empty:
+                    self._mark_akshare_primary_success()
+                    self._note_runtime_stat('akshare_update_success')
+                    return normalized
+            except Exception as e:
+                self._note_runtime_stat('akshare_update_error')
+                self._record_network_error('akshare_update', stock_code, e)
+                print(f"  akshare获取更新数据失败: {e}")
+                if isinstance(e, requests.exceptions.RequestException):
+                    self._mark_akshare_primary_network_failure()
+                    direct_df = self._try_eastmoney_direct(
                         stock_code,
                         start_date.strftime("%Y%m%d"),
                         end_date.strftime("%Y%m%d"),
                         'akshare:eastmoney:direct:update',
                     )
-                except Exception as direct_error:
-                    self._note_runtime_stat('akshare_direct_retry_error')
-                    self._record_network_error('akshare_update_direct', stock_code, direct_error)
-                    print(f"  akshare直连重试失败: {direct_error}")
-                else:
                     if direct_df is not None and not direct_df.empty:
-                        self._note_runtime_stat('akshare_direct_retry_success')
                         return direct_df
 
         fallback_df = self._run_tencent_fallback(

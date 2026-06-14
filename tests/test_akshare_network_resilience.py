@@ -99,8 +99,11 @@ def test_fetch_update_falls_back_to_tencent_when_akshare_fails(monkeypatch, tmp_
 
 def test_fetch_update_retries_eastmoney_direct_before_tencent(monkeypatch, tmp_path):
     fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    primary_calls = []
+    direct_calls = []
 
     def fail_akshare_history(**kwargs):
+        primary_calls.append(kwargs["symbol"])
         raise akshare_fetcher.requests.exceptions.ProxyError("system proxy closed")
 
     direct_frame = _sample_history("akshare:eastmoney:direct:update").head(5)
@@ -108,7 +111,7 @@ def test_fetch_update_retries_eastmoney_direct_before_tencent(monkeypatch, tmp_p
     monkeypatch.setattr(
         fetcher,
         "_fetch_eastmoney_history_direct",
-        lambda *args, **kwargs: direct_frame,
+        lambda *args, **kwargs: direct_calls.append(args[0]) or direct_frame,
     )
     monkeypatch.setattr(
         fetcher,
@@ -117,11 +120,50 @@ def test_fetch_update_retries_eastmoney_direct_before_tencent(monkeypatch, tmp_p
     )
 
     frame = fetcher.fetch_stock_update("000001", days=3)
+    second_frame = fetcher.fetch_stock_update("000002", days=3)
 
     assert frame is direct_frame
+    assert second_frame is direct_frame
+    assert primary_calls == ["000001"]
+    assert direct_calls == ["000001", "000002"]
     assert set(frame["data_source"]) == {"akshare:eastmoney:direct:update"}
     assert fetcher.get_runtime_stats()["akshare_update_error"] == 1
     assert fetcher.get_runtime_stats()["akshare_direct_retry_success"] == 1
+    assert fetcher.get_runtime_stats()["akshare_primary_route_skipped"] == 1
+
+
+def test_akshare_failed_direct_probe_is_not_repeated(monkeypatch, tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    primary_calls = []
+    direct_calls = []
+
+    def fail_akshare_history(**kwargs):
+        primary_calls.append(kwargs["symbol"])
+        raise akshare_fetcher.requests.exceptions.ProxyError("system proxy closed")
+
+    def fail_direct(*args, **kwargs):
+        direct_calls.append(args[0])
+        raise akshare_fetcher.requests.exceptions.ConnectionError("direct route closed")
+
+    monkeypatch.setattr(akshare_fetcher.ak, "stock_zh_a_hist", fail_akshare_history)
+    monkeypatch.setattr(fetcher, "_fetch_eastmoney_history_direct", fail_direct)
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_stock_update_http",
+        lambda stock_code, **kwargs: _sample_history(kwargs["source"]).head(5),
+    )
+
+    first = fetcher.fetch_stock_update("000001", days=3)
+    second = fetcher.fetch_stock_update("000002", days=3)
+
+    assert not first.empty
+    assert not second.empty
+    assert primary_calls == ["000001"]
+    assert direct_calls == ["000001"]
+    assert fetcher.get_runtime_stats()["akshare_primary_route_blocked"] == 1
+    assert fetcher.get_runtime_stats()["akshare_primary_route_skipped"] == 1
+    assert fetcher.get_runtime_stats()["akshare_direct_retry_error"] == 1
+    assert fetcher.get_runtime_stats()["akshare_direct_retry_skipped"] == 1
 
 
 def test_eastmoney_direct_retry_ignores_system_proxy(monkeypatch, tmp_path):
@@ -196,13 +238,58 @@ def test_tencent_provider_uses_conservative_parallelism(tmp_path):
     )
 
     assert fetcher._sync_max_workers == 4
-    assert fetcher.tencent_request_interval == 0.5
+    assert fetcher.tencent_request_interval == 0.35
+    assert fetcher.tencent_request_jitter == 0.05
+    assert fetcher.tencent_cooldown_every == 400
+    assert fetcher.tencent_cooldown_seconds == 8
     assert configured._sync_max_workers == 2
     no_delay = TencentFetcher(
         data_dir=str(tmp_path / "no-delay"),
         config={"data_source": {"tencent": {"min_request_interval_seconds": 0}}},
     )
     assert no_delay.tencent_request_interval == 0
+
+
+def test_tencent_throttle_backs_off_and_recovers(tmp_path):
+    fetcher = TencentFetcher(data_dir=str(tmp_path))
+
+    fetcher._slow_tencent_requests("http_429")
+    slowed_interval = fetcher._tencent_current_interval
+
+    assert slowed_interval > fetcher.tencent_request_interval
+    for _ in range(200):
+        fetcher._note_tencent_request_success()
+
+    assert fetcher._tencent_current_interval < slowed_interval
+    assert fetcher._tencent_current_interval >= fetcher.tencent_request_interval
+    assert fetcher.get_runtime_stats()["tencent_throttle_backoff_http_429"] == 1
+    assert fetcher.get_runtime_stats()["tencent_throttle_recovered"] == 1
+
+
+def test_tencent_scheduler_inserts_periodic_cooldown(monkeypatch, tmp_path):
+    fetcher = TencentFetcher(
+        data_dir=str(tmp_path),
+        config={
+            "data_source": {
+                "tencent": {
+                    "min_request_interval_seconds": 0.35,
+                    "request_jitter_seconds": 0,
+                    "cooldown_every_requests": 2,
+                    "cooldown_seconds": 3,
+                }
+            }
+        },
+    )
+    sleeps = []
+    monkeypatch.setattr(akshare_fetcher.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(akshare_fetcher.time, "sleep", sleeps.append)
+
+    fetcher._wait_for_tencent_request_slot()
+    fetcher._wait_for_tencent_request_slot()
+    fetcher._wait_for_tencent_request_slot()
+
+    assert sleeps == pytest.approx([0.35, 3.7])
+    assert fetcher.get_runtime_stats()["tencent_periodic_cooldown"] == 1
 
 
 def test_akshare_tencent_waf_fallback_is_isolated_and_circuit_breaks(monkeypatch, tmp_path):
