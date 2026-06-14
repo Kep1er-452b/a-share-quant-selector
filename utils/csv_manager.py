@@ -112,10 +112,12 @@ class CSVManager:
         result["market_cap"] = result["market_cap"].fillna(0)
         return result
     
-    def write_stock(self, stock_code, df):
+    def write_stock(self, stock_code, df, write_guard=None):
         """写入股票数据（自动去重排序，原子写入）"""
         path = self.get_stock_path(stock_code)
         with self._lock_for_path(path):
+            if write_guard and not write_guard():
+                raise InterruptedError(f"{stock_code} 写入已取消")
             df = self._validate_stock_dataframe(df)
 
             # 去重：按日期去重，保留最后出现的
@@ -134,6 +136,8 @@ class CSVManager:
             try:
                 os.close(tmp_fd)
                 df.to_csv(tmp_path, index=False)
+                if write_guard and not write_guard():
+                    raise InterruptedError(f"{stock_code} 写入已取消")
                 os.replace(tmp_path, str(path))
             except Exception:
                 if os.path.exists(tmp_path):
@@ -171,20 +175,22 @@ class CSVManager:
 
         return result
     
-    def update_stock(self, stock_code, new_df):
+    def update_stock(self, stock_code, new_df, write_guard=None):
         """增量更新股票数据"""
         path = self.get_stock_path(stock_code)
         with self._lock_for_path(path):
+            if write_guard and not write_guard():
+                raise InterruptedError(f"{stock_code} 写入已取消")
             existing_df = self.read_stock(stock_code)
 
             if existing_df.empty:
-                return self.write_stock(stock_code, new_df)
+                return self.write_stock(stock_code, new_df, write_guard=write_guard)
 
             new_df = self._preserve_existing_metrics(existing_df, new_df)
 
             # 合并数据
             combined = pd.concat([existing_df, new_df], ignore_index=True)
-            return self.write_stock(stock_code, combined)
+            return self.write_stock(stock_code, combined, write_guard=write_guard)
     
     def list_all_stocks(self):
         """列出所有已保存的股票代码"""

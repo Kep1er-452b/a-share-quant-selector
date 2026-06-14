@@ -206,6 +206,73 @@ def test_write_endpoints_validate_payload_shape_and_lengths():
     assert response.status_code == 400
 
 
+def test_selection_endpoints_reject_running_update():
+    client = web_server.app.test_client()
+    job_id = web_server._create_update_job("tushare")
+    web_server._update_update_job(job_id, status="running")
+
+    try:
+        sync_response = client.post("/api/select", json={}, headers=_headers())
+        async_response = client.post("/api/select/start", json={}, headers=_headers())
+
+        assert sync_response.status_code == 409
+        assert async_response.status_code == 409
+        assert "数据更新任务" in sync_response.get_json()["error"]
+    finally:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.pop(job_id, None)
+            web_server.update_cancel_events.pop(job_id, None)
+
+
+def test_selection_job_surfaces_strategy_errors(monkeypatch, tmp_path):
+    class Manager:
+        data_dir = tmp_path
+
+        @staticmethod
+        def list_all_stocks():
+            return ["000001"]
+
+    monkeypatch.setattr(web_server, "_active_csv_manager", lambda: Manager())
+    monkeypatch.setattr(web_server, "_load_stock_names", lambda: {"000001": "Test"})
+    monkeypatch.setattr(web_server, "_get_web_selection_settings", lambda: {
+        "backend": "sequential",
+        "max_workers": 1,
+        "chunk_size": 1,
+    })
+    monkeypatch.setattr(web_server, "_resolve_selection_backend", lambda *args: "sequential")
+    monkeypatch.setattr(web_server, "build_worker_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(web_server, "_save_selection_markdown", lambda *args, **kwargs: str(tmp_path / "result.md"))
+    monkeypatch.setattr(web_server, "process_selection_chunk", lambda *args, **kwargs: {
+        "processed_count": 1,
+        "valid_count": 1,
+        "skipped_count": 0,
+        "results_by_strategy": {"B1V242BStrategy": []},
+        "error_counts": {"B1V242BStrategy": 1},
+        "error_details": [{
+            "code": "000001",
+            "name": "Test",
+            "strategy": "B1V242BStrategy",
+            "error": "boom",
+            "type": "RuntimeError",
+        }],
+        "last_processed_code": "000001",
+        "last_processed_name": "Test",
+    })
+    job_id = web_server._create_selection_job(["main"], ["B1V242BStrategy"])
+
+    try:
+        web_server._run_selection_job(job_id, ["main"], ["B1V242BStrategy"])
+        with web_server.selection_jobs_lock:
+            job = dict(web_server.selection_jobs[job_id])
+
+        assert job["status"] == "completed_with_warnings"
+        assert job["error_counts"] == {"B1V242BStrategy": 1}
+        assert job["error_details"][0]["error"] == "boom"
+    finally:
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.pop(job_id, None)
+
+
 def test_update_cancel_requires_session_token_and_marks_running_job():
     client = web_server.app.test_client()
     job_id = web_server._create_update_job("akshare")

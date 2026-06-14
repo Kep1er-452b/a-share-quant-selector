@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `5a2e14b22f4bf506c309082ff1205502d1c37054`
-  (`Harden update cancellation and desktop app icon handling`, 2026-06-13).
+  `1b350aab84c29934454d05166345d689993fc55d`
+  (`Harden AkShare routing and Tencent throttling`, 2026-06-14).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -235,10 +235,10 @@ At commit `b038324`, the full suite result was:
 54 passed
 ```
 
-The current uncommitted adaptive provider-throttling fix passed:
+The current uncommitted selection/Tushare integrity fix passed:
 
 ```text
-78 passed
+87 passed
 ```
 
 Useful runtime checks:
@@ -277,7 +277,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `8c18a09` on local `main`; `origin/main` is also `8c18a09`.
+Baseline commit: `1b350aa` on local `main`; `origin/main` is also `1b350aa`.
 
 State at handoff:
 
@@ -323,7 +323,7 @@ State at handoff:
   and continues without propagating the fallback error. AkShare also retries
   Eastmoney directly after a real `requests` network exception before using
   Tencent.
-- The current uncommitted throughput adjustment starts Tencent at 0.35 seconds
+- The committed throughput adjustment starts Tencent at 0.35 seconds
   plus up to 0.05 seconds of jitter, pauses 8 seconds after each 400 requests,
   backs off toward 1.2 seconds on 403/429/5xx responses, and cautiously recovers
   after sustained success. WAF 501 remains batch-fatal.
@@ -370,12 +370,35 @@ State at handoff:
   validation, App launch, Computer Use EXIT verification, and the full suite
   pass: `78 passed`. After EXIT, the process and port 5080 remained stopped and
   no relaunch job appeared.
+- The current uncommitted data-integrity fix makes update and selection starts
+  mutually exclusive under one admission lock, and selection jobs now persist
+  bounded strategy error counts/details with a `completed_with_warnings`
+  terminal state instead of presenting calculation failures as clean zero-hit
+  runs.
+- Tushare refreshes `stock_basic` at the start of each update with cached
+  fallback, atomically persists stock names/metadata plus a refresh timestamp,
+  and exposes `list_date` to the sync pipeline.
+- Tushare qfq responses now retain optional `adj_factor`. Old CSVs without the
+  factor and files whose latest factor anchor changed are routed to a full
+  refresh before any incremental merge.
+- Adjustment-gap validation exempts actual stored trading rows in the listing
+  no-limit window: five rows for ChiNext/STAR and the listing row for main
+  board stocks. It does not infer listing age from the first row of a truncated
+  non-Tushare history.
+- Timed-out sync batches set a write guard checked inside the CSV file lock and
+  immediately before atomic replace. Incremental timeouts are explicitly
+  queued for full refresh; full-refresh timeouts are persisted as failures, and
+  stale statuses can no longer produce a completed provider state.
+- Focused selection/provider/Web tests pass: `29 passed`. Python/JavaScript
+  syntax checks, `git diff --check`, and the full suite pass: `87 passed`.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `1b350aa` (2026-06-14): made AkShare route selection run-scoped and added
+  adaptive Tencent throttling/diagnostics.
 - `8c18a09` (2026-06-11): throttled Tencent requests and converted WAF HTTP 501
   responses into batch-fatal update errors instead of per-stock retry storms.
 - `26bfddf` (2026-06-10): moved selection/Wyckoff runtime outputs outside the

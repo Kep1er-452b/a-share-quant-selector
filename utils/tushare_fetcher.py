@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.request
 from collections import deque
@@ -42,6 +43,7 @@ class TushareFetcher(BaseDataProvider):
         self.ts.set_token(self.token)
         self.pro = self.ts.pro_api(self.token)
         self.stock_meta_file = Path(data_dir) / "tushare_stock_map.json"
+        self.stock_meta_refresh_file = Path(data_dir) / "tushare_stock_map_state.json"
         self.daily_basic_calls = deque()
         self.daily_basic_limit_per_minute = 180
         self.daily_basic_rate_limit_wait = 62
@@ -271,17 +273,41 @@ class TushareFetcher(BaseDataProvider):
         return {}
 
     def _save_stock_metadata(self, stock_map):
+        self.stock_meta_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".json",
+            prefix="tushare_stock_map_",
+            dir=str(self.stock_meta_file.parent),
+        )
         try:
-            with open(self.stock_meta_file, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(stock_map, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.stock_meta_file)
+            state = {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "stock_count": len(stock_map),
+            }
+            fd, state_tmp_path = tempfile.mkstemp(
+                suffix=".json",
+                prefix="tushare_stock_map_state_",
+                dir=str(self.stock_meta_refresh_file.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+                os.replace(state_tmp_path, self.stock_meta_refresh_file)
+            except Exception:
+                if os.path.exists(state_tmp_path):
+                    os.unlink(state_tmp_path)
+                raise
         except Exception as e:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             print(f"  保存 Tushare 股票映射失败: {e}")
 
     def get_stock_universe(self, max_retries=3):
+        stock_dict = self.get_all_stock_codes(max_retries=max_retries)
         metadata = self._load_stock_metadata()
-        if not metadata:
-            self.get_all_stock_codes(max_retries=max_retries)
-            metadata = self._load_stock_metadata()
 
         if metadata:
             universe = []
@@ -293,10 +319,22 @@ class TushareFetcher(BaseDataProvider):
                     "market": info.get("market"),
                     "exchange": info.get("exchange"),
                     "ts_code": info.get("ts_code"),
+                    "list_date": info.get("list_date"),
                 })
             return universe
 
-        return super().get_stock_universe(max_retries=max_retries)
+        return [
+            {
+                "code": str(code).zfill(6),
+                "name": name,
+                "board": self.classify_board(code),
+                "market": None,
+                "exchange": None,
+                "ts_code": self._to_ts_code(code),
+                "list_date": None,
+            }
+            for code, name in sorted(stock_dict.items())
+        ]
 
     def _to_ts_code(self, stock_code: str) -> str:
         stock_code = str(stock_code).zfill(6)
@@ -677,6 +715,9 @@ class TushareFetcher(BaseDataProvider):
         result["volume"] = self._numeric_column(result, "vol") if "vol" in result.columns else self._numeric_column(result, "volume")
 
         keep_columns = ["date", "open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"]
+        if "adj_factor" in result.columns:
+            result["adj_factor"] = self._numeric_column(result, "adj_factor", default=np.nan)
+            keep_columns.append("adj_factor")
         result = result[keep_columns]
         result["date"] = pd.to_datetime(result["date"])
         result = result.sort_values("date", ascending=False)
@@ -752,6 +793,7 @@ class TushareFetcher(BaseDataProvider):
                 asset="E",
                 freq="D",
                 adj="qfq",
+                adjfactor=True,
                 start_date=start_str,
                 end_date=end_str
             )
@@ -780,6 +822,7 @@ class TushareFetcher(BaseDataProvider):
                 asset="E",
                 freq="D",
                 adj="qfq",
+                adjfactor=True,
                 start_date=start_str,
                 end_date=end_str
             )

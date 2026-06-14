@@ -133,6 +133,51 @@ def test_vectorized_adjustment_detection_matches_loop_reference():
     assert repaired.iloc[0]["date"] > repaired.iloc[-1]["date"]
 
 
+def test_adjustment_detection_exempts_actual_ipo_trading_rows():
+    frame = pd.DataFrame({
+        "date": pd.to_datetime([
+            "2024-09-30",
+            "2024-10-08",
+            "2024-10-09",
+            "2024-10-10",
+            "2024-10-11",
+            "2024-10-14",
+        ]),
+        "open": [10, 14, 20, 28, 40, 20],
+        "high": [11, 15, 21, 29, 41, 21],
+        "low": [9, 13, 19, 27, 39, 19],
+        "close": [10, 14, 20, 28, 40, 20],
+    })
+
+    gaps = detect_adjustment_gaps(
+        frame,
+        stock_code="301001",
+        list_date="20240930",
+        board="chinext",
+    )
+
+    assert [gap["date"] for gap in gaps] == ["2024-10-14"]
+
+
+def test_main_board_only_exempts_listing_day():
+    frame = pd.DataFrame({
+        "date": pd.to_datetime(["2024-09-30", "2024-10-08", "2024-10-09"]),
+        "open": [10, 14, 20],
+        "high": [11, 15, 21],
+        "low": [9, 13, 19],
+        "close": [10, 14, 20],
+    })
+
+    gaps = detect_adjustment_gaps(
+        frame,
+        stock_code="601001",
+        list_date="20240930",
+        board="main",
+    )
+
+    assert [gap["date"] for gap in gaps] == ["2024-10-08", "2024-10-09"]
+
+
 def test_provider_can_bootstrap_stock_names_from_shared_cache(tmp_path):
     tushare_dir = tmp_path / "providers" / "tushare"
     tushare_dir.mkdir(parents=True)

@@ -90,6 +90,8 @@ selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
 update_cancel_events = {}
+job_admission_lock = Lock()
+sync_selection_active = False
 wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
 watchlist_lock = Lock()
@@ -659,7 +661,23 @@ def _build_selection_markdown(results, time_text, meta=None):
         "",
     ]
 
-    if not total_count:
+    error_counts = {
+        name: int(count)
+        for name, count in (meta.get('error_counts') or {}).items()
+        if int(count or 0) > 0
+    }
+    if error_counts:
+        lines.extend([
+            "## 执行警告",
+            "",
+            f"本次共有 {sum(error_counts.values())} 次策略计算异常，结果可能不完整。",
+            "",
+        ])
+        for strategy_name, count in error_counts.items():
+            lines.append(f"- {strategy_name}: {count} 次")
+        lines.append("")
+
+    if not total_count and not error_counts:
         lines.extend(["本次执行未筛出符合条件的股票。", ""])
 
     for strategy_name in strategies:
@@ -1008,6 +1026,25 @@ def _find_running_update_job():
     return None
 
 
+def _selection_conflict_response():
+    running_update = _find_running_update_job()
+    if running_update:
+        return jsonify({
+            'success': False,
+            'error': '当前有数据更新任务正在执行，请等待完成后再选股',
+            'job': running_update,
+        }), 409
+
+    running_selection = _find_running_job()
+    if running_selection or sync_selection_active:
+        return jsonify({
+            'success': False,
+            'error': '已有选股任务正在执行',
+            'job': running_selection,
+        }), 409
+    return None
+
+
 def _update_cancel_event(job_id):
     with update_jobs_lock:
         return update_cancel_events.get(job_id)
@@ -1071,6 +1108,8 @@ def _create_selection_job(requested_boards, requested_strategies, formula_spec=N
         'results': None,
         'result_time': None,
         'selection_report_path': None,
+        'error_counts': {strategy_name: 0 for strategy_name in requested_strategies},
+        'error_details': [],
         'error': None,
         'logs': [],
     }
@@ -1156,6 +1195,7 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
         valid_total_count = 0
         skipped_count = 0
         error_counts = {strategy_name: 0 for strategy_name in requested_strategies}
+        error_details = []
 
         def consume_chunk(chunk_result):
             nonlocal completed_candidates, valid_total_count, skipped_count
@@ -1168,6 +1208,9 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                     chunk_result['results_by_strategy'].get(strategy_name, [])
                 )
                 error_counts[strategy_name] += chunk_result['error_counts'].get(strategy_name, 0)
+            remaining_error_slots = max(0, 100 - len(error_details))
+            if remaining_error_slots:
+                error_details.extend((chunk_result.get('error_details') or [])[:remaining_error_slots])
 
             selected_count = sum(len(items) for items in results.values())
             current_stock = None
@@ -1186,6 +1229,8 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                 selected_count=selected_count,
                 current_stock=current_stock,
                 progress_pct=progress_pct,
+                error_counts=dict(error_counts),
+                error_details=list(error_details),
             )
             if current_stock:
                 _append_job_log_by_id(
@@ -1239,22 +1284,30 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
             'skipped_stock_count': skipped_count,
             'backend': backend,
             'formula': formula_spec,
+            'error_counts': error_counts,
+            'error_details': error_details,
         }
         report_path = _save_selection_markdown(results, result_time, report_meta)
+        total_errors = sum(error_counts.values())
 
         _update_job(
             job_id,
-            status='completed',
+            status='completed_with_warnings' if total_errors else 'completed',
             progress_pct=100,
             completed_candidates=len(candidates),
             results=results,
             result_time=result_time,
             selection_report_path=report_path,
             current_stock=None,
+            error_counts=error_counts,
+            error_details=error_details,
         )
         _append_job_log_by_id(
             job_id,
-            f"执行完成，共命中 {sum(len(items) for items in results.values())} 条信号。"
+            (
+                f"执行完成，共命中 {sum(len(items) for items in results.values())} 条信号，"
+                f"策略异常 {total_errors} 次。"
+            )
         )
         _append_job_log_by_id(job_id, f"选股记录已保存: {report_path}")
     except Exception as exc:
@@ -2474,7 +2527,7 @@ def activate_data_provider():
             }), 409
 
         running_selection = _find_running_job()
-        if running_selection:
+        if running_selection or sync_selection_active:
             return jsonify({
                 'success': False,
                 'error': '当前有选股任务正在执行，请等待完成后再切换数据源',
@@ -2505,7 +2558,16 @@ def activate_data_provider():
             }), 400
 
         warnings = _provider_switch_warnings(data_root, provider, provider_state)
-        activate_provider(data_root, provider, provider_state)
+        with job_admission_lock:
+            running_update = _find_running_update_job()
+            running_selection = _find_running_job()
+            if running_update or running_selection or sync_selection_active:
+                return jsonify({
+                    'success': False,
+                    'error': '任务状态已变化，请等待当前更新或选股完成后再切换数据源',
+                    'job': running_update or running_selection,
+                }), 409
+            activate_provider(data_root, provider, provider_state)
         active_state = load_active_provider(data_root)
         _append_system_log(
             'manual_provider_switch',
@@ -2534,7 +2596,16 @@ def activate_data_provider():
 @app.route('/api/select', methods=['POST'])
 def run_selection():
     """执行选股"""
+    global sync_selection_active
+    admitted = False
     try:
+        with job_admission_lock:
+            conflict_response = _selection_conflict_response()
+            if conflict_response:
+                return conflict_response
+            sync_selection_active = True
+            admitted = True
+
         payload = request.get_json(silent=True)
         if payload is None:
             payload = {}
@@ -2580,6 +2651,7 @@ def run_selection():
         valid_total_count = 0
         skipped_count = 0
         error_counts = {strategy_name: 0 for strategy_name in requested_strategies}
+        error_details = []
 
         def consume_chunk(chunk_result):
             nonlocal valid_total_count, skipped_count
@@ -2591,6 +2663,9 @@ def run_selection():
                     chunk_result['results_by_strategy'].get(strategy_name, [])
                 )
                 error_counts[strategy_name] += chunk_result['error_counts'].get(strategy_name, 0)
+            remaining_error_slots = max(0, 100 - len(error_details))
+            if remaining_error_slots:
+                error_details.extend((chunk_result.get('error_details') or [])[:remaining_error_slots])
 
         if backend == 'process':
             with ProcessPoolExecutor(
@@ -2649,6 +2724,8 @@ def run_selection():
             'skipped_stock_count': skipped_count,
             'backend': backend,
             'formula': formula_spec,
+            'error_counts': error_counts,
+            'error_details': error_details,
         }
         report_path = _save_selection_markdown(results, result_time, meta)
 
@@ -2668,6 +2745,10 @@ def run_selection():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+    finally:
+        if admitted:
+            with job_admission_lock:
+                sync_selection_active = False
 
 
 @app.route('/api/select/start', methods=['POST'])
@@ -2676,14 +2757,6 @@ def start_selection_job():
     try:
         if _is_halted():
             return _halted_response()
-
-        running_job = _find_running_job()
-        if running_job:
-            return jsonify({
-                'success': False,
-                'error': '已有选股任务正在执行',
-                'job': running_job,
-            }), 409
 
         payload = request.get_json(silent=True)
         if payload is None:
@@ -2695,7 +2768,11 @@ def start_selection_job():
         requested_strategies = _parse_requested_strategies(payload.get('strategies'), allow_empty=bool(formula_spec))
         requested_strategies = _append_formula_strategy(requested_strategies, formula_spec)
 
-        job_id = _create_selection_job(requested_boards, requested_strategies, formula_spec)
+        with job_admission_lock:
+            conflict_response = _selection_conflict_response()
+            if conflict_response:
+                return conflict_response
+            job_id = _create_selection_job(requested_boards, requested_strategies, formula_spec)
         thread = Thread(
             target=_run_selection_job,
             args=(job_id, requested_boards, requested_strategies, formula_spec),
@@ -3038,22 +3115,6 @@ def start_update_job():
         if _is_halted():
             return _halted_response()
 
-        running_job = _find_running_update_job()
-        if running_job:
-            return jsonify({
-                'success': False,
-                'error': '已有更新任务正在执行',
-                'job': running_job,
-            }), 409
-
-        running_selection = _find_running_job()
-        if running_selection:
-            return jsonify({
-                'success': False,
-                'error': '当前有选股任务正在执行，请等待完成后再更新数据',
-                'job': running_selection,
-            }), 409
-
         payload = request.get_json(silent=True)
         if payload is None:
             payload = {}
@@ -3064,7 +3125,23 @@ def start_update_job():
             return jsonify({'success': False, 'error': '不支持的数据源'}), 400
 
         tushare_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
-        job_id = _create_update_job(provider)
+        with job_admission_lock:
+            running_job = _find_running_update_job()
+            if running_job:
+                return jsonify({
+                    'success': False,
+                    'error': '已有更新任务正在执行',
+                    'job': running_job,
+                }), 409
+
+            running_selection = _find_running_job()
+            if running_selection or sync_selection_active:
+                return jsonify({
+                    'success': False,
+                    'error': '当前有选股任务正在执行，请等待完成后再更新数据',
+                    'job': running_selection,
+                }), 409
+            job_id = _create_update_job(provider)
         thread = Thread(
             target=_run_update_job,
             args=(job_id, provider, tushare_token),

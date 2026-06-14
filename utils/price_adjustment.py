@@ -32,6 +32,8 @@ def detect_adjustment_gaps(
     df: pd.DataFrame,
     threshold: float = DEFAULT_GAP_THRESHOLD,
     stock_code: str | None = None,
+    list_date=None,
+    board: str | None = None,
 ) -> list[dict]:
     """Find likely mixed-qfq discontinuities in an ascending analysis series."""
     prices = _prepare_prices(df)
@@ -66,6 +68,16 @@ def detect_adjustment_gaps(
         (factor > 0) &
         (factor <= 5)
     )
+
+    if list_date:
+        listed_on = pd.to_datetime(list_date, errors="coerce")
+        if pd.notna(listed_on):
+            listed_rows = prices.index[prices["date"] >= listed_on].tolist()
+            exemption_count = 5 if board in {"chinext", "star"} else 1
+            exempt_rows = set(listed_rows[:exemption_count])
+            for row_index in exempt_rows:
+                if row_index > 0:
+                    is_gap[row_index - 1] = False
     
     gap_indices = np.where(is_gap)[0]
     

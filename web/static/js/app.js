@@ -3988,15 +3988,20 @@ function renderSelectionResults(results, time, meta = {}) {
     const selectedStrategies = meta.strategies || getSelectedStrategies();
     const stockPoolSize = meta.stock_pool_size || 0;
     const reportPath = meta.selection_report_path || '';
+    const errorCounts = meta.error_counts || {};
+    const strategyErrorTotal = Object.values(errorCounts)
+        .reduce((sum, count) => sum + (Number(count) || 0), 0);
 
     let totalCount = 0;
     strategies.forEach(name => {
         totalCount += (results[name] || []).length;
     });
 
-    document.getElementById('selection-results-headline').textContent = totalCount
-        ? `本次共命中 ${formatNumber(totalCount)} 条信号`
-        : '本次执行未筛出符合条件的股票';
+    document.getElementById('selection-results-headline').textContent = strategyErrorTotal
+        ? `本次命中 ${formatNumber(totalCount)} 条信号，另有 ${formatNumber(strategyErrorTotal)} 次策略异常`
+        : (totalCount
+            ? `本次共命中 ${formatNumber(totalCount)} 条信号`
+            : '本次执行未筛出符合条件的股票');
     document.getElementById('selection-results-meta').textContent = time || 'Run Complete';
 
     let html = `
@@ -4029,8 +4034,15 @@ function renderSelectionResults(results, time, meta = {}) {
                     <span class="value">${formatNumber(selectedBoards.length)}</span>
                 </div>
             </div>
-        </div>
+            </div>
     `;
+    if (strategyErrorTotal) {
+        const errorSummary = Object.entries(errorCounts)
+            .filter(([, count]) => Number(count) > 0)
+            .map(([name, count]) => `${escapeHtml(displayStrategyName(name, meta))}: ${formatNumber(count)} 次`)
+            .join('；');
+        html += `<div class="state-empty">策略执行存在异常，结果可能不完整。${errorSummary}</div>`;
+    }
     if (reportPath) {
         html += `<div class="state-empty">选股记录已保存: ${escapeHtml(reportPath)}</div>`;
     }
@@ -4251,7 +4263,7 @@ async function pollSelectionJobStatus() {
 
         renderSelectionProgress(job);
 
-        if (job.status === 'completed') {
+        if (job.status === 'completed' || job.status === 'completed_with_warnings') {
             stopSelectionPolling();
             clearSavedSelectionState();
             setRunButtonsLoading(false);
@@ -4261,8 +4273,16 @@ async function pollSelectionJobStatus() {
                 strategies: job.strategies || getSelectedStrategies(),
                 stock_pool_size: job.total_candidates || 0,
                 selection_report_path: job.selection_report_path || '',
+                error_counts: job.error_counts || {},
+                error_details: job.error_details || [],
             });
-            toast(job.selection_report_path ? '选股执行完成，Markdown 已保存' : '选股执行完成', 'success');
+            const hasWarnings = job.status === 'completed_with_warnings';
+            toast(
+                hasWarnings
+                    ? '选股执行完成，但部分策略计算异常'
+                    : (job.selection_report_path ? '选股执行完成，Markdown 已保存' : '选股执行完成'),
+                hasWarnings ? 'info' : 'success'
+            );
             return;
         }
 
@@ -5205,15 +5225,18 @@ async function restoreSelectionStateIfNeeded() {
         }
 
         const job = result.data;
-        if (job.status === 'completed' || job.status === 'error' || job.status === 'halted') {
+        if (job.status === 'completed' || job.status === 'completed_with_warnings' || job.status === 'error' || job.status === 'halted') {
             clearSavedSelectionState();
             if (saved.currentPage === 'selection') {
                 switchPage('selection');
-                if (job.status === 'completed' && job.results) {
+                if ((job.status === 'completed' || job.status === 'completed_with_warnings') && job.results) {
                     renderSelectionResults(job.results || {}, job.result_time, {
                         boards: job.boards || getSelectedBoards(),
                         strategies: job.strategies || getSelectedStrategies(),
                         stock_pool_size: job.total_candidates || 0,
+                        selection_report_path: job.selection_report_path || '',
+                        error_counts: job.error_counts || {},
+                        error_details: job.error_details || [],
                     });
                 }
             }
