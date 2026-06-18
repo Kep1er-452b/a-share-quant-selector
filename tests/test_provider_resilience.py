@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from threading import Lock
 
@@ -60,6 +61,33 @@ def test_tushare_proxy_fallback_retries_generic_sdk_error(monkeypatch):
     assert fetcher._prefer_direct_network is True
 
 
+def test_tushare_daily_basic_date_cache_deduplicates_concurrent_requests(monkeypatch):
+    fetcher = TushareFetcher.__new__(TushareFetcher)
+    fetcher.daily_basic_cache_lock = Lock()
+    fetcher.daily_basic_by_date_cache = {}
+    fetcher.daily_basic_by_date_failures = set()
+    fetcher.daily_basic_cache_hits = 0
+    fetcher.daily_basic_rate_limit_wait = 0
+    fetcher.daily_basic_calls = []
+    call_count = 0
+    call_lock = Lock()
+
+    def daily_basic(**kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+        time.sleep(0.02)
+        return pd.DataFrame({"ts_code": ["000001.SZ"], "trade_date": [kwargs["trade_date"]]})
+
+    monkeypatch.setattr(fetcher, "_call_daily_basic", daily_basic)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        frames = list(pool.map(fetcher._fetch_daily_basic_trade_date, ["20260618"] * 8))
+
+    assert call_count == 1
+    assert fetcher.daily_basic_cache_hits == 7
+    assert all(len(frame) == 1 for frame in frames)
+
+
 def _history_frame(adj_factor=None):
     frame = pd.DataFrame({
         "date": pd.date_range("2025-01-01", periods=80, freq="B"),
@@ -98,7 +126,7 @@ def test_qfq_anchor_change_requires_full_refresh(tmp_path):
     assert provider.csv_manager.read_stock("000001")["adj_factor"].iloc[0] == 1.0
 
 
-def test_old_qfq_csv_requires_one_time_full_refresh(tmp_path):
+def test_old_qfq_csv_migrates_incrementally_when_overlap_matches(tmp_path):
     class Provider(BaseDataProvider):
         def fetch_stock_update(self, stock_code, days=10):
             return _history_frame(adj_factor=1.0).head(5)
@@ -114,7 +142,59 @@ def test_old_qfq_csv_requires_one_time_full_refresh(tmp_path):
         {},
     )
 
+    assert result["ok"] is True
+    migrated = provider.csv_manager.read_stock("000001")
+    assert "adj_factor" in migrated.columns
+    assert migrated["adj_factor"].notna().sum() == 5
+
+
+def test_old_qfq_csv_requires_full_refresh_when_overlap_changed(tmp_path):
+    class Provider(BaseDataProvider):
+        def fetch_stock_update(self, stock_code, days=10):
+            changed = _history_frame(adj_factor=1.0).head(5)
+            changed[["open", "high", "low", "close"]] *= 0.5
+            return changed
+
+    provider = Provider(str(tmp_path))
+    provider.csv_manager.write_stock("000001", _history_frame())
+    status_map = {"000001": {"latest_date": "2025-04-21"}}
+
+    result = provider._sync_one_incremental(
+        {"code": "000001", "name": "Test", "board": "main"},
+        date(2025, 4, 22),
+        status_map,
+        {},
+    )
+
+    assert result["fallback_full"] is True
     assert result["qfq_anchor_changed"] is True
+
+
+def test_full_refresh_retry_is_not_reported_as_failed_progress():
+    events = []
+    progress_state = {
+        "processed": 0,
+        "total": 1,
+        "planned_total": 1,
+        "retry": 0,
+        "success": 0,
+        "failed": 0,
+        "warning": 0,
+    }
+
+    BaseDataProvider._emit_batch_progress(
+        item={"code": "000001", "name": "Test"},
+        result={"ok": False, "fallback_full": True, "qfq_anchor_changed": True},
+        stage="sync",
+        current_step="增量转全量重抓",
+        progress_callback=events.append,
+        progress_state=progress_state,
+    )
+
+    assert progress_state["retry"] == 1
+    assert progress_state["failed"] == 0
+    assert events[-1]["failed_count"] == 0
+    assert events[-1]["retry_count"] == 1
 
 
 def test_incremental_timeout_prevents_late_csv_write(monkeypatch, tmp_path):

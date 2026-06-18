@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `1b350aab84c29934454d05166345d689993fc55d`
-  (`Harden AkShare routing and Tencent throttling`, 2026-06-14).
+  `8875a11d1c0310e9b4445eac8b7c9aa681645173`
+  (`Harden selection and Tushare sync integrity`, 2026-06-14).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -277,7 +277,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `1b350aa` on local `main`; `origin/main` is also `1b350aa`.
+Baseline commit: `8875a11` on local `main`; `origin/main` is also `8875a11`.
 
 State at handoff:
 
@@ -378,9 +378,14 @@ State at handoff:
 - Tushare refreshes `stock_basic` at the start of each update with cached
   fallback, atomically persists stock names/metadata plus a refresh timestamp,
   and exposes `list_date` to the sync pipeline.
-- Tushare qfq responses now retain optional `adj_factor`. Old CSVs without the
-  factor and files whose latest factor anchor changed are routed to a full
-  refresh before any incremental merge.
+- Tushare qfq responses retain optional `adj_factor`. For legacy CSVs without
+  the factor, the current uncommitted fix compares overlapping OHLC rows: a
+  matching overlap migrates incrementally, while a mismatch or missing overlap
+  still forces a full refresh. Files whose stored latest factor anchor changed
+  also continue to require a full refresh.
+- Tushare `daily_basic` trade-date cache misses are serialized so concurrent
+  stock workers cannot duplicate the same API request. Incremental-to-full
+  fallbacks are counted as retries rather than live failures in update progress.
 - Adjustment-gap validation exempts actual stored trading rows in the listing
   no-limit window: five rows for ChiNext/STAR and the listing row for main
   board stocks. It does not infer listing age from the first row of a truncated
@@ -389,14 +394,22 @@ State at handoff:
   immediately before atomic replace. Incremental timeouts are explicitly
   queued for full refresh; full-refresh timeouts are persisted as failures, and
   stale statuses can no longer produce a completed provider state.
-- Focused selection/provider/Web tests pass: `29 passed`. Python/JavaScript
-  syntax checks, `git diff --check`, and the full suite pass: `87 passed`.
+- On 2026-06-18, a real full-market Tushare update completed in 34m53s:
+  4,816 incremental updates, 379 full refreshes, 12 adjustment warnings, and
+  zero failures. Coverage reached 5,204/5,207 (99.7695%), market caches were
+  rebuilt, and active provider switched to Tushare. An immediate second full
+  update handled only 54 work items, finished data sync in six seconds, and
+  completed with zero failures, confirming the migration is one-time.
+- Focused provider/Web tests pass: `26 passed`. Python syntax checks,
+  `git diff --check`, and the full suite pass: `90 passed`.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `8875a11` (2026-06-14): made update/selection admission mutually exclusive
+  and hardened Tushare metadata, adjustment, timeout, and state integrity.
 - `1b350aa` (2026-06-14): made AkShare route selection run-scoped and added
   adaptive Tencent throttling/diagnostics.
 - `8c18a09` (2026-06-11): throttled Tencent requests and converted WAF HTTP 501

@@ -253,12 +253,12 @@ class BaseDataProvider:
         if new_factors.empty:
             return False
         if existing_df is None or existing_df.empty or "adj_factor" not in existing_df.columns:
-            return True
+            return not BaseDataProvider._qfq_overlap_matches(existing_df, new_df)
         existing_with_factor = existing_df.copy()
         existing_with_factor["adj_factor"] = pd.to_numeric(existing_with_factor["adj_factor"], errors="coerce")
         existing_with_factor = existing_with_factor.dropna(subset=["adj_factor"])
         if existing_with_factor.empty:
-            return True
+            return not BaseDataProvider._qfq_overlap_matches(existing_df, new_df)
         new_with_factor = new_df.copy()
         new_with_factor["adj_factor"] = pd.to_numeric(new_with_factor["adj_factor"], errors="coerce")
         new_with_factor = new_with_factor.dropna(subset=["adj_factor"])
@@ -269,6 +269,45 @@ class BaseDataProvider:
             _date=pd.to_datetime(new_with_factor["date"], errors="coerce")
         ).sort_values("_date", ascending=False).iloc[0]
         return abs(float(existing_latest["adj_factor"]) - float(new_latest["adj_factor"])) > 1e-10
+
+    @staticmethod
+    def _qfq_overlap_matches(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> bool:
+        """Validate a legacy qfq CSV by comparing the overlap before adding adj_factor."""
+        price_columns = ["open", "high", "low", "close"]
+        required_columns = {"date", *price_columns}
+        if (
+            existing_df is None
+            or existing_df.empty
+            or new_df is None
+            or new_df.empty
+            or not required_columns.issubset(existing_df.columns)
+            or not required_columns.issubset(new_df.columns)
+        ):
+            return False
+
+        existing = existing_df[["date", *price_columns]].copy()
+        incoming = new_df[["date", *price_columns]].copy()
+        existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
+        incoming["date"] = pd.to_datetime(incoming["date"], errors="coerce")
+        existing = existing.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+        incoming = incoming.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+        overlap = existing.merge(incoming, on="date", suffixes=("_existing", "_new"))
+        if overlap.empty:
+            return False
+
+        compared_values = 0
+        for column in price_columns:
+            old_values = pd.to_numeric(overlap[f"{column}_existing"], errors="coerce")
+            new_values = pd.to_numeric(overlap[f"{column}_new"], errors="coerce")
+            valid = old_values.notna() & new_values.notna()
+            if not valid.any():
+                continue
+            compared_values += int(valid.sum())
+            difference = (old_values[valid] - new_values[valid]).abs()
+            tolerance = 1e-4 + new_values[valid].abs() * 1e-5
+            if (difference > tolerance).any():
+                return False
+        return compared_values > 0
 
     def _sync_one_incremental(
         self,
@@ -454,11 +493,12 @@ class BaseDataProvider:
                         if result.get("error"):
                             fallback_item["_worker_error"] = result.get("error")
                         fallback_list.append(fallback_item)
+                    progress_step = "增量转全量重抓" if result.get("fallback_full") else "增量补齐"
                     self._emit_batch_progress(
                         item=futures[future],
                         result=result,
                         stage="sync",
-                        current_step="增量补齐",
+                        current_step=progress_step,
                         progress_callback=progress_callback,
                         progress_state=progress_state,
                     )
@@ -579,6 +619,10 @@ class BaseDataProvider:
         progress_state["processed"] = progress_state.get("processed", 0) + 1
         if result.get("ok"):
             progress_state["success"] = progress_state.get("success", 0) + 1
+        elif result.get("fallback_full"):
+            pass
+        elif result.get("adjustment_warning"):
+            progress_state["warning"] = progress_state.get("warning", 0) + 1
         else:
             progress_state["failed"] = progress_state.get("failed", 0) + 1
 
@@ -598,6 +642,7 @@ class BaseDataProvider:
             },
             "success_count": progress_state.get("success", 0),
             "failed_count": progress_state.get("failed", 0),
+            "warning_count": progress_state.get("warning", 0),
         })
 
     def _profile_key(self, board: str, max_stocks=None) -> str:
@@ -1098,6 +1143,7 @@ class BaseDataProvider:
             "retry": 0,
             "success": 0,
             "failed": 0,
+            "warning": 0,
         }
         self._active_sync_progress = progress_state
         tracker = ProgressTracker(total_work or 1, label="同步进度")
@@ -1134,7 +1180,7 @@ class BaseDataProvider:
             for r in ok_results:
                 status_map[r["code"]] = r["refreshed"]
             if fallback_items:
-                print(f"    增量失败 {len(fallback_items)} 只，转为全量重抓")
+                print(f"    增量需重试 {len(fallback_items)} 只，转为全量重抓")
                 for item in fallback_items:
                     if item["code"] not in {i["code"] for i in full_refresh}:
                         full_refresh.append(item)

@@ -57,6 +57,7 @@ class TushareFetcher(BaseDataProvider):
         self._sync_max_workers = min(self._sync_max_workers, 8)
         self.proxy_fallback_lock = Lock()
         self._prefer_direct_network = False
+        self.daily_basic_cache_lock = Lock()
         self.daily_basic_by_date_cache = {}
         self.daily_basic_by_date_failures = set()
         self.daily_basic_date_cache_max_days = 40
@@ -539,36 +540,37 @@ class TushareFetcher(BaseDataProvider):
 
     def _fetch_daily_basic_trade_date(self, trade_date):
         date_key = self._trade_date_key(trade_date)
-        if date_key in self.daily_basic_by_date_cache:
-            self.daily_basic_cache_hits += 1
-            return self.daily_basic_by_date_cache[date_key].copy()
+        with self.daily_basic_cache_lock:
+            if date_key in self.daily_basic_by_date_cache:
+                self.daily_basic_cache_hits += 1
+                return self.daily_basic_by_date_cache[date_key].copy()
 
-        last_error = None
-        for attempt in range(4):
-            try:
-                df = self._call_daily_basic(
-                    trade_date=date_key,
-                    fields="ts_code,trade_date,turnover_rate,total_mv"
-                )
-                if not isinstance(df, pd.DataFrame):
-                    df = pd.DataFrame()
-                self.daily_basic_by_date_cache[date_key] = df.copy()
-                return df
-            except Exception as e:
-                last_error = e
-                if self._is_rate_limit_error(e) and attempt < 3:
-                    wait_seconds = self.daily_basic_rate_limit_wait
-                    print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
-                    time.sleep(wait_seconds)
-                    self.daily_basic_calls.clear()
-                    continue
-                if attempt < 3:
-                    time.sleep(0.5 * (attempt + 1))
+            last_error = None
+            for attempt in range(4):
+                try:
+                    df = self._call_daily_basic(
+                        trade_date=date_key,
+                        fields="ts_code,trade_date,turnover_rate,total_mv"
+                    )
+                    if not isinstance(df, pd.DataFrame):
+                        df = pd.DataFrame()
+                    self.daily_basic_by_date_cache[date_key] = df.copy()
+                    return df
+                except Exception as e:
+                    last_error = e
+                    if self._is_rate_limit_error(e) and attempt < 3:
+                        wait_seconds = self.daily_basic_rate_limit_wait
+                        print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
+                        time.sleep(wait_seconds)
+                        self.daily_basic_calls.clear()
+                        continue
+                    if attempt < 3:
+                        time.sleep(0.5 * (attempt + 1))
 
-        self.daily_basic_by_date_failures.add(date_key)
-        if last_error is not None:
-            print(f"  获取 {date_key} daily_basic 失败: {last_error}")
-        return pd.DataFrame()
+            self.daily_basic_by_date_failures.add(date_key)
+            if last_error is not None:
+                print(f"  获取 {date_key} daily_basic 失败: {last_error}")
+            return pd.DataFrame()
 
     def _fetch_daily_basic_from_trade_date_cache(self, ts_code: str, start_date: str, end_date: str):
         start = pd.to_datetime(start_date).date()
