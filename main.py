@@ -24,6 +24,10 @@ import getpass
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+from utils.console_encoding import configure_utf8_stdio
+
+configure_utf8_stdio()
+
 # 版本信息
 __version__ = "1.0.0"
 

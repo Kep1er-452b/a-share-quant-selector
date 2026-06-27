@@ -28,6 +28,8 @@
 
 ## 🚀 快速开始
 
+> Windows 迁移/一键启动请先看：[WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md)
+
 ```bash
 # 1. 克隆项目
 git clone https://github.com/Dzy-HW-XD/a-share-quant-selector.git
@@ -70,7 +72,7 @@ python3 main.py select --strategy BowlReboundStrategy --force-select
 # 12. 启动Web界面（默认 http://127.0.0.1:5080）
 python3 main.py web
 
-# 13. 导出单只股票 CSV 到 ~/Downloads
+# 13. 导出单只股票 CSV 到当前用户的 Downloads
 python3 main.py export 300888
 python3 main.py export tqly --update-first
 python3 main.py export 天齐锂业 --force-export
@@ -104,7 +106,7 @@ python3 main.py export 300888 --force-export
 - 若数据不是最新，交互式终端会让你选择“先更新后导出”或“直接导出”。
 - `--update-first` 会先用默认 Tushare Token 单独补齐该股票，再导出。
 - `--force-export` 会忽略新鲜度，直接导出当前本地 CSV。
-- 导出文件固定放在 `/Users/chenxingyu/Downloads`，文件名格式为 `股票代码_股票名称.csv`。
+- 导出文件固定放在当前用户的 `Downloads` 目录，文件名格式为 `股票代码_股票名称.csv`。
 
 Web 端可在 F3 股票列表搜索代码、名称或拼音首字母，回车打开 K 线详情。K 线详情里有 `EXPORT CSV` 按钮，数据过期时会弹出“先更新后导出 / 直接导出”的选择。F6 是自选股票页，可添加、删除、查看 K 线并导出 CSV，自选列表保存在 `data/watchlist.json`。
 
@@ -564,4 +566,3 @@ B1和B2可以共存，用户可以根据需要选择使用哪种完美图形进�
 MIT License
 
 ---
-

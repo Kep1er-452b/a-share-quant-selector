@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-macOS desktop launcher for the A-share quant selector web UI.
+Cross-platform desktop launcher for the A-share quant selector web UI.
 
 This file intentionally reuses the existing Flask web app and project venv.
 It is a convenience shell around the current system, not a replacement for it.
@@ -12,6 +12,7 @@ import html
 import json
 import logging
 import os
+import platform
 import sys
 import threading
 import time
@@ -25,6 +26,10 @@ try:
 except Exception:  # pragma: no cover - surfaced in runtime validation
     yaml = None
 
+from utils.console_encoding import configure_utf8_stdio
+
+configure_utf8_stdio()
+
 
 APP_NAME = "A股量化选股系统"
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -36,6 +41,12 @@ LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "desktop_app_launcher.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 LOCAL_PROXY_BYPASS = "127.0.0.1,localhost,::1"
+
+
+def project_venv_python() -> Path:
+    if platform.system() == "Windows":
+        return PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    return PROJECT_ROOT / ".venv" / "bin" / "python"
 
 
 def configure_local_proxy_bypass() -> None:
@@ -117,10 +128,8 @@ def validate_environment(require_webview: bool = False) -> list[str]:
     errors = []
     checks = [
         (PROJECT_ROOT, "项目目录不存在"),
-        (PROJECT_ROOT / ".venv" / "bin" / "python", "项目 .venv/bin/python 不存在"),
         (PROJECT_ROOT / "web_server.py", "web_server.py 不存在"),
         (PROJECT_ROOT / "web" / "templates" / "index.html", "Web 首页模板不存在"),
-        (APP_ICON, "App 图标不存在"),
         (DEFAULT_CONFIG, "config/config.yaml 不存在"),
     ]
     for path, message in checks:
@@ -263,7 +272,8 @@ def run_check(require_webview: bool = False) -> int:
 
     host, port, url = resolve_web_url()
     print(f"OK project_root={PROJECT_ROOT}")
-    print(f"OK python={PROJECT_ROOT / '.venv' / 'bin' / 'python'}")
+    print(f"OK python={sys.executable}")
+    print(f"OK project_venv_python={project_venv_python()}")
     print(f"OK config={DEFAULT_CONFIG}")
     print(f"OK resolved_host={host}")
     print(f"OK resolved_port={port}")

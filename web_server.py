@@ -11,6 +11,7 @@ import secrets
 import signal
 import shutil
 import subprocess
+import platform
 import time
 import uuid
 from threading import Event, Lock, Thread, Timer
@@ -24,6 +25,10 @@ import pandas as pd
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+
+from utils.console_encoding import configure_utf8_stdio
+
+configure_utf8_stdio()
 
 from utils.csv_manager import CSVManager
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
@@ -891,8 +896,8 @@ def _get_web_selection_settings():
     mode = raw_mode if raw_mode in {'parallel', 'sequential'} else 'parallel'
 
     # Web 端默认优先线程池，避免请求内频繁拉起进程导致额外开销。
-    raw_backend = str(selection_config.get('backend', 'thread')).strip().lower()
-    backend = raw_backend if raw_backend in {'process', 'thread', 'sequential'} else 'thread'
+    raw_backend = str(selection_config.get('backend', 'process')).strip().lower()
+    backend = raw_backend if raw_backend in {'process', 'thread', 'sequential'} else 'process'
 
     default_workers = min(max(os.cpu_count() or 4, 1), 12)
     try:
@@ -1096,7 +1101,7 @@ def _create_selection_job(requested_boards, requested_strategies, formula_spec=N
         'boards': requested_boards,
         'strategies': requested_strategies,
         'formula': formula_spec,
-        'backend': 'thread',
+        'backend': 'pending',
         'progress_pct': 0,
         'total_candidates': 0,
         'completed_candidates': 0,
@@ -1172,7 +1177,6 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
 
         data_dir = str(manager.data_dir)
         settings = _get_web_selection_settings()
-        settings['backend'] = 'thread'
         backend = _resolve_selection_backend(len(candidates), settings)
         candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
         effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
@@ -1238,7 +1242,24 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                     f"已处理 {completed_candidates}/{len(candidates)}，当前至 {current_stock['name']}({current_stock['code']})。"
                 )
 
-        if backend == 'thread':
+        if backend == 'process':
+            with ProcessPoolExecutor(
+                max_workers=effective_workers,
+                initializer=initialize_selection_worker,
+                initargs=(data_dir, requested_strategies, str(registry.params_file), runtime_strategy_params),
+            ) as executor:
+                futures = [
+                    executor.submit(process_selection_chunk, chunk, "all", False)
+                    for chunk in candidate_chunks
+                ]
+                for future in as_completed(futures):
+                    if _is_halted():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        _update_job(job_id, status='halted', error='系统已急停')
+                        _append_job_log_by_id(job_id, '任务因系统急停而终止。')
+                        return
+                    consume_chunk(future.result())
+        elif backend == 'thread':
             worker_context = build_worker_context(
                 data_dir,
                 requested_strategies,
@@ -2443,7 +2464,13 @@ def reveal_wyckoff_file():
         if not target.exists():
             return jsonify({'success': False, 'error': f'文件不存在: {target}'}), 404
 
-        subprocess.run(['open', '-R', str(target)], check=False)
+        if platform.system() == 'Windows':
+            subprocess.run(['explorer', '/select,', str(target)], check=False)
+        elif platform.system() == 'Darwin':
+            subprocess.run(['open', '-R', str(target)], check=False)
+        else:
+            reveal_target = target.parent if target.is_file() else target
+            subprocess.run(['xdg-open', str(reveal_target)], check=False)
         return jsonify({'success': True, 'path': str(target)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

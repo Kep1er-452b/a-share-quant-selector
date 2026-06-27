@@ -62,5 +62,5 @@ update:
 selection:
   mode: parallel      # parallel / sequential
   backend: process    # process / thread / sequential
-  max_workers: 12     # 激进提速模式默认优先进程并行
+  max_workers: 14     # Windows 8C/16T machines usually work well at 12-14
   chunk_size: 50      # 每个工作单元处理的股票数
