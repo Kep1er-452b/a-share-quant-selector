@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import web_server
-from utils.runtime_paths import OUTPUT_ROOT_ENV, selection_results_dir, wyckoff_results_dir
+from utils.runtime_paths import OUTPUT_ROOT_ENV, runtime_logs_dir, selection_results_dir, wyckoff_results_dir
 from wyckoff_ai.pipeline import WyckoffPipeline
 
 
@@ -14,6 +14,7 @@ def test_runtime_output_paths_can_be_kept_outside_repository(tmp_path, monkeypat
 
     assert selection_results_dir() == output_root / "选股结果"
     assert wyckoff_results_dir() == output_root / "威科夫分析结果"
+    assert runtime_logs_dir() == output_root / "运行日志"
     assert web_server._wyckoff_outputs_root() == output_root / "威科夫分析结果"
 
     pipeline = WyckoffPipeline(config={}, data_dir=str(tmp_path / "data"))

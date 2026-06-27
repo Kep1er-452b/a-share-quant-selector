@@ -56,7 +56,7 @@ from utils.provider_router import (
     provider_data_dir,
     warehouse_summary,
 )
-from utils.runtime_paths import selection_results_dir, wyckoff_results_dir
+from utils.runtime_paths import runtime_logs_dir, selection_results_dir, wyckoff_results_dir
 from utils.selection_worker import (
     build_worker_context,
     initialize_selection_worker,
@@ -108,7 +108,7 @@ INDEX_KLINE_TARGETS = {
     'sh000688': {'symbol': 'sh000688', 'name': '科创50'},
 }
 INDEX_KLINE_CACHE_TTL_SECONDS = 15 * 60
-LOG_DIR = project_root / "logs"
+LOG_DIR = runtime_logs_dir()
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 EMERGENCY_EXIT_DELAY_SECONDS = 1.2

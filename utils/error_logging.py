@@ -8,9 +8,11 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from utils.runtime_paths import runtime_logs_dir
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = PROJECT_ROOT / "logs"
+LOG_DIR = runtime_logs_dir()
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 ERROR_DIR = LOG_DIR / "errors"
 

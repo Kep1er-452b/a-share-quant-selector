@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - surfaced in runtime validation
     yaml = None
 
 from utils.console_encoding import configure_utf8_stdio
+from utils.runtime_paths import runtime_logs_dir
 
 configure_utf8_stdio()
 
@@ -37,7 +38,7 @@ APP_ICON = PROJECT_ROOT / "assets" / "app_icon.icns"
 APP_BUNDLE_ENV = "A_SHARE_QUANT_APP_BUNDLE"
 RUNTIME_ICON_NAME = "runtime_icon.png"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
-LOG_DIR = PROJECT_ROOT / "logs"
+LOG_DIR = runtime_logs_dir()
 LOG_FILE = LOG_DIR / "desktop_app_launcher.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 LOCAL_PROXY_BYPASS = "127.0.0.1,localhost,::1"

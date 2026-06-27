@@ -23,3 +23,7 @@ def selection_results_dir() -> Path:
 
 def wyckoff_results_dir() -> Path:
     return runtime_output_root() / "威科夫分析结果"
+
+
+def runtime_logs_dir() -> Path:
+    return runtime_output_root() / "运行日志"
