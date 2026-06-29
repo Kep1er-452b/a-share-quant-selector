@@ -61,3 +61,7 @@ def test_pipeline_mock_api_writes_outputs(tmp_path, monkeypatch):
     assert result["success"] is True
     assert Path(result["paths"]["analysis_path"]).exists()
     assert Path(result["paths"]["chart_path"]).exists()
+    assert result["analysis"]["book_judgment"]["invalidation"]
+    assert "当前判断：" in result["analysis_text"]
+    assert "失效条件：" in result["analysis_text"]
+    assert "限制：" in result["analysis_text"]

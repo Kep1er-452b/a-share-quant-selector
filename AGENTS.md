@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `08fa2a1460821ad54938e10dd7a67af194dde5ee`
-  (`Update AGENTS and harden Tushare daily_basic caching`, 2026-06-18).
+  `807fdad9a61acb2f2b076686a71b448ae45a405b`
+  (`Refine provider routing and update handling`, 2026-06-29).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -282,7 +282,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `08fa2a1` on local `main`; `origin/main` is also `08fa2a1`.
+Baseline commit: `807fdad` on local `main`; `origin/main` is also `807fdad`.
 
 State at handoff:
 
@@ -407,7 +407,7 @@ State at handoff:
   completed with zero failures, confirming the migration is one-time.
 - Focused provider/Web tests pass: `26 passed`. Python syntax checks,
   `git diff --check`, and the full suite pass: `90 passed`.
-- The current uncommitted provider-availability repair restores AkShare and
+- The committed provider-availability repair restores AkShare and
   Tencent as production update, activation, and selection providers instead of
   treating them as read-only archives. The provider router again lists all three
   providers as updateable/activatable, Web update options expose all three, and
@@ -445,6 +445,20 @@ State at handoff:
   Web `/api/update/start` with `max_stocks=1` completed for both providers,
   with `current_step="更新完成"` and `error=null`, without modifying the formal
   repository `data/` warehouse.
+- The current uncommitted Wyckoff upgrade aligns the Web/DeepSeek prompt and
+  output contract with the newer "威科夫二世" skill: prompt reading order is
+  background-first, `book_judgment` is validated and backfilled, formatted
+  analysis text now surfaces current bias, next scenarios, invalidation, and
+  limitations, the bundled chart script adds `book_judgment` plus denser
+  Phase-label collision avoidance, and the repository-local `wyckoff-second/`
+  skill docs were synchronized with the current built-in skill. Focused
+  Wyckoff/runtime tests pass
+  (`13 passed`), Python syntax checks pass, the provided
+  `/Users/chenxingyu/Downloads/600150_中国船舶.csv` generates local script output
+  under `/tmp/wyckoff-600150-local.*`, and a real DeepSeek run on the same CSV
+  validated JSON plus rendered `/tmp/wyckoff-600150-deepseek-rerender2.png`.
+  No known blocker remains; the full suite was not rerun because the change is
+  scoped to the Wyckoff module and its runtime-path integration tests.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
