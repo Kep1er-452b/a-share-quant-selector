@@ -21,6 +21,7 @@ from utils.price_adjustment import detect_adjustment_gaps
 from utils.provider_router import (
     VALID_PROVIDERS,
     provider_data_dir,
+    provider_state_path,
     write_provider_state,
 )
 from utils.progress import ProgressTracker
@@ -1006,14 +1007,68 @@ class BaseDataProvider:
         halt_checker=None,
     ):
         with self._sync_lock:
-            return self._sync_target_data_unlocked(
-                target_universe,
-                board=board,
-                max_stocks=max_stocks,
-                purpose=purpose,
-                progress_callback=progress_callback,
-                halt_checker=halt_checker,
-            )
+            try:
+                return self._sync_target_data_unlocked(
+                    target_universe,
+                    board=board,
+                    max_stocks=max_stocks,
+                    purpose=purpose,
+                    progress_callback=progress_callback,
+                    halt_checker=halt_checker,
+                )
+            except DataProviderError as exc:
+                try:
+                    self._persist_interrupted_provider_state(board, max_stocks, target_universe, exc)
+                except Exception as state_error:
+                    diagnostics = self.get_runtime_diagnostics()
+                    if isinstance(diagnostics, dict):
+                        diagnostics["interrupted_state_error"] = str(state_error)[:1000]
+                raise
+
+    def _persist_interrupted_provider_state(self, board, max_stocks, target_universe, error):
+        """Persist actual progress only after a sync has entered its assessed write phase."""
+        if not self._active_sync_context:
+            return None
+        progress = dict(self._active_sync_progress or {})
+        target_count = len(target_universe)
+        stock_count = self.csv_manager.get_stock_count()
+        payload = {
+            "status": "failed",
+            "board": board,
+            "board_label": BOARD_LABELS.get(board, board),
+            "max_stocks": max_stocks,
+            "latest_trade_date": self._active_sync_context.get("latest_trade_date"),
+            "target_count": target_count,
+            "stock_count": stock_count,
+            "success_count": int(progress.get("success") or 0),
+            "failed_count": int(progress.get("failed") or 0),
+            "warning_count": int(progress.get("warning") or 0),
+            "coverage_ratio": round(min(stock_count, target_count) / max(target_count, 1), 6),
+            "is_complete": False,
+            "status_summary": {"interrupted": 1},
+            "interrupted_progress": progress,
+            "interrupted_error": {
+                "code": getattr(error, "code", "UNKNOWN"),
+                "type": type(error).__name__,
+                "message": str(error)[:1000],
+            },
+            "runtime_stats": self.get_runtime_stats(),
+            "runtime_diagnostics": self.get_runtime_diagnostics(),
+        }
+        write_provider_state(self.storage_root_dir, self.provider_name, payload)
+        return payload
+
+    def persist_error_report_path(self, error_report_path):
+        if not self._active_sync_context:
+            return None
+        state_path = provider_state_path(self.storage_root_dir, self.provider_name)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+        except Exception:
+            state = {}
+        state.pop("updated_at", None)
+        state["last_error_report_path"] = str(error_report_path)
+        return write_provider_state(self.storage_root_dir, self.provider_name, state)
 
     def _sync_target_data_unlocked(
         self,
@@ -1327,7 +1382,7 @@ def get_config_value(config: Optional[dict], *keys, default=None):
 
 def create_data_provider(provider_name: str, data_dir: str = "data", config: Optional[dict] = None, token: Optional[str] = None):
     """根据名称创建数据源实例"""
-    normalized = (provider_name or "akshare").strip().lower()
+    normalized = (provider_name or "tushare").strip().lower()
     if normalized not in {"akshare", "tushare", "tencent"}:
         raise DataProviderError(f"不支持的数据源: {provider_name}")
     storage_root = Path(data_dir)
@@ -1346,6 +1401,7 @@ def create_data_provider(provider_name: str, data_dir: str = "data", config: Opt
     if normalized == "tushare":
         from utils.tushare_fetcher import TushareFetcher
 
+        token_source = "temporary" if token else ("environment" if os.getenv("TUSHARE_TOKEN") else "config")
         resolved_token = (
             token
             or os.getenv("TUSHARE_TOKEN")
@@ -1354,6 +1410,9 @@ def create_data_provider(provider_name: str, data_dir: str = "data", config: Opt
         if not resolved_token:
             local_config = load_config_file()
             resolved_token = get_config_value(local_config, "data_source", "tushare", "token")
-        return TushareFetcher(data_dir=str(storage_dir), token=resolved_token).configure_storage(storage_root, normalized)
+            token_source = "local_config" if resolved_token else "missing"
+        provider = TushareFetcher(data_dir=str(storage_dir), token=resolved_token, config=config).configure_storage(storage_root, normalized)
+        provider.token_source = token_source
+        return provider
 
     raise DataProviderError(f"不支持的数据源: {provider_name}")

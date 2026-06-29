@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import traceback
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -28,12 +29,13 @@ def json_default(value):
 
 def sanitize_for_log(value):
     sensitive_markers = ("token", "secret", "password", "passwd", "api_key", "apikey", "key")
+    safe_sensitive_metadata = {"token_present", "token_source", "has_tushare_token"}
     if isinstance(value, dict):
         sanitized = {}
         for key, item in value.items():
             key_text = str(key)
             lowered = key_text.lower()
-            if any(marker in lowered for marker in sensitive_markers):
+            if lowered not in safe_sensitive_metadata and any(marker in lowered for marker in sensitive_markers):
                 sanitized[key_text] = "***REDACTED***"
             else:
                 sanitized[key_text] = sanitize_for_log(item)
@@ -81,9 +83,23 @@ def write_error_report(
         "error_message": str(error),
         "traceback": traceback.format_exc(),
         "context": sanitize_for_log(context or {}),
+        "diagnostics": {
+            "schema_version": 1,
+            "auto_snapshot": {},
+            "runs": [],
+        },
     }
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(sanitize_for_log(payload), file, ensure_ascii=False, indent=2, default=json_default)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(ERROR_DIR))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(sanitize_for_log(payload), file, ensure_ascii=False, indent=2, default=json_default)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
     append_system_log(
         f"{module}_error_report",
         f"错误日志已写入: {path}",

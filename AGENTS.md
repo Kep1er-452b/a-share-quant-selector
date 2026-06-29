@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `8875a11d1c0310e9b4445eac8b7c9aa681645173`
-  (`Harden selection and Tushare sync integrity`, 2026-06-14).
+  `08fa2a1460821ad54938e10dd7a67af194dde5ee`
+  (`Update AGENTS and harden Tushare daily_basic caching`, 2026-06-18).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -104,6 +104,11 @@ init, select, run, web, calendar, doctor, export
 - Provider data lives under `data/providers/<provider>/`.
 - The selected warehouse is recorded in `data/active_provider.json`.
 - `utils/provider_router.py` is the routing authority.
+- Production update, activation, and selection routing supports Tushare,
+  AkShare, and Tencent through separate provider warehouses. Tushare remains
+  the most thoroughly validated full-market path, while AkShare/Tencent require
+  conservative concurrency and bounded smoke tests when network conditions
+  change.
 - Do not merge provider CSVs into one shared mutable warehouse.
 - Provider switching must continue to reject empty warehouses and must not occur
   while update or selection jobs are running.
@@ -277,7 +282,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `8875a11` on local `main`; `origin/main` is also `8875a11`.
+Baseline commit: `08fa2a1` on local `main`; `origin/main` is also `08fa2a1`.
 
 State at handoff:
 
@@ -370,7 +375,7 @@ State at handoff:
   validation, App launch, Computer Use EXIT verification, and the full suite
   pass: `78 passed`. After EXIT, the process and port 5080 remained stopped and
   no relaunch job appeared.
-- The current uncommitted data-integrity fix makes update and selection starts
+- The committed data-integrity hardening makes update and selection starts
   mutually exclusive under one admission lock, and selection jobs now persist
   bounded strategy error counts/details with a `completed_with_warnings`
   terminal state instead of presenting calculation failures as clean zero-hit
@@ -379,7 +384,7 @@ State at handoff:
   fallback, atomically persists stock names/metadata plus a refresh timestamp,
   and exposes `list_date` to the sync pipeline.
 - Tushare qfq responses retain optional `adj_factor`. For legacy CSVs without
-  the factor, the current uncommitted fix compares overlapping OHLC rows: a
+  the factor, the migration logic compares overlapping OHLC rows: a
   matching overlap migrates incrementally, while a mismatch or missing overlap
   still forces a full refresh. Files whose stored latest factor anchor changed
   also continue to require a full refresh.
@@ -402,12 +407,52 @@ State at handoff:
   completed with zero failures, confirming the migration is one-time.
 - Focused provider/Web tests pass: `26 passed`. Python syntax checks,
   `git diff --check`, and the full suite pass: `90 passed`.
+- The current uncommitted provider-availability repair restores AkShare and
+  Tencent as production update, activation, and selection providers instead of
+  treating them as read-only archives. The provider router again lists all three
+  providers as updateable/activatable, Web update options expose all three, and
+  CLI `--provider akshare/tencent` no longer exits with `PROVIDER_DEPRECATED`.
+- Tencent limited updates now avoid the slow full-market code-space scan when
+  `max_stocks` is provided, using local/shared/default stock-name bootstrap
+  before falling back to full discovery. AkShare small-batch market-cap lookup
+  tries Tencent quote batches before full-market AkShare spot data, so one-stock
+  update probes no longer spend about a minute on market-cap pagination.
+- Tushare update now performs a reusable preflight before provider CSV writes:
+  runtime/token source, `stock_basic`, `trade_cal`, the latest non-empty
+  `daily_basic` within three open days, and qfq `pro_bar` with `adj_factor`.
+  Authentication/permission/schema failures abort immediately. Network failures
+  open a shared run circuit after eight consecutive failures or an 80% failure
+  rate in twenty outcomes; legal empty stock responses do not count as network
+  failures.
+- Failed updates receive a zero-network automatic snapshot in the same atomic
+  error JSON. Standard and extended diagnostics append reproducible runs under
+  `diagnostics.runs` through Web APIs or `main.py doctor --update-report ...`.
+  Diagnostic tasks are mutually exclusive with updates and selections, and a
+  temporary Token remains in task memory because `tushare.set_token()` is no
+  longer called.
+- A real bounded standard diagnostic passed in 4.58 seconds with 7 logical API
+  calls: all four core interfaces passed, three board samples overlapped local
+  dates, and 200 deterministic CSV samples passed. A one-stock incremental
+  fetch/write smoke test used `/tmp`, returned 24 rows through 2026-06-18, and
+  did not modify the formal provider warehouse. No full-market update ran.
+- Focused provider/Web/diagnostic tests, Python/JavaScript syntax checks, and the
+  full suite pass: `111 passed`. The local Web server starts successfully.
+- On 2026-06-29, AkShare and Tencent bounded one-stock update probes wrote CSVs
+  successfully in temporary data directories: AkShare completed in 7.18s via
+  Tencent history fallback after the local Eastmoney proxy route failed, and
+  Tencent completed in 0.45s through its native path. Browser-plugin and
+  Computer Use validation against a temporary same-origin smoke page confirmed
+  Web `/api/update/start` with `max_stocks=1` completed for both providers,
+  with `current_step="更新完成"` and `error=null`, without modifying the formal
+  repository `data/` warehouse.
 
 Always run `git status` again. This section is a handoff snapshot, not proof of
 the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `08fa2a1` (2026-06-18): serialized Tushare `daily_basic` cache misses and
+  reconciled the post-migration update handoff.
 - `8875a11` (2026-06-14): made update/selection admission mutually exclusive
   and hardened Tushare metadata, adjustment, timeout, and state integrity.
 - `1b350aa` (2026-06-14): made AkShare route selection run-scoped and added

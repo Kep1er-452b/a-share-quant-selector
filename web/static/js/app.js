@@ -49,6 +49,8 @@ const state = {
     selectionPollTimer: null,
     currentSelectionJobId: null,
     updatePollTimer: null,
+    updateDiagnosticPollTimer: null,
+    currentUpdateDiagnosticId: null,
     currentUpdateJobId: null,
     currentUpdateJob: null,
     indexKlineChart: null,
@@ -65,13 +67,14 @@ const state = {
     heatmapPayloadCache: new Map(),
     heatmapHealth: null,
     heatmapFocusActive: false,
-    updateModalStep: 'provider',
-    updateProvider: null,
+    updateModalStep: 'token',
+    updateProvider: 'tushare',
     updateHasTushareToken: false,
-    updateDefaultProvider: 'akshare',
+    updateDefaultProvider: 'tushare',
     updateActiveProvider: null,
     updateProviderStatuses: [],
     updateLegacyProvider: null,
+    updateMigrationWarning: null,
     activeProviderState: null,
     providerStatuses: [],
     providerSwitching: false,
@@ -374,6 +377,13 @@ function stopUpdatePolling() {
     if (state.updatePollTimer) {
         window.clearInterval(state.updatePollTimer);
         state.updatePollTimer = null;
+    }
+}
+
+function stopUpdateDiagnosticPolling() {
+    if (state.updateDiagnosticPollTimer) {
+        window.clearInterval(state.updateDiagnosticPollTimer);
+        state.updateDiagnosticPollTimer = null;
     }
 }
 
@@ -1035,13 +1045,14 @@ async function switchActiveProvider(provider) {
 function renderProviderHealthCard(status, activeProvider) {
     const provider = status?.provider || '--';
     const isActive = provider === activeProvider;
-    const label = isActive ? `${providerDisplayName(provider)} ACTIVE` : providerDisplayName(provider);
-    const state = isActive ? 'ACTIVE' : String(status?.status || 'EMPTY').toUpperCase();
-    const disabled = Number(status?.stock_count || 0) <= 0 || provider === '--';
+    const archived = Boolean(status?.archived);
+    const label = archived ? `${providerDisplayName(provider)} ARCHIVE` : (isActive ? `${providerDisplayName(provider)} ACTIVE` : providerDisplayName(provider));
+    const state = archived ? 'ARCHIVED' : (isActive ? 'ACTIVE' : String(status?.status || 'EMPTY').toUpperCase());
+    const disabled = archived || Number(status?.stock_count || 0) <= 0 || provider === '--';
     return `
         <button class="health-card provider-health-card provider-switch-card ${isActive ? 'active' : ''}" type="button"
             data-provider-switch="${escapeHtml(provider)}" ${disabled ? 'disabled' : ''}
-            title="${escapeHtml(disabled ? '本地数据仓为空' : `切换到 ${providerDisplayName(provider)}`)}">
+            title="${escapeHtml(archived ? '历史仓库只读归档，不可切换' : (disabled ? '本地数据仓为空' : `切换到 ${providerDisplayName(provider)}`))}">
             <div class="pulse-label">${escapeHtml(label)}</div>
             <div class="pulse-value ${providerStatusClass(status?.status)}">${escapeHtml(state)}</div>
             <div class="pulse-sub">${escapeHtml(providerSubText(status || {}))}</div>
@@ -3169,11 +3180,8 @@ function setUpdateModalStep(step) {
     if (!title) {
         return;
     }
-    if (step === 'provider') {
-        title.textContent = '选择更新数据源';
-        renderUpdateStopAction(null);
-    } else if (step === 'token') {
-        title.textContent = '选择 Tushare Token';
+    if (step === 'token') {
+        title.textContent = '选择数据源';
         renderUpdateStopAction(null);
     } else {
         title.textContent = '更新任务执行中';
@@ -3207,6 +3215,11 @@ function renderUpdateStopAction(job, forceVisible = false) {
     } else {
         note.textContent = '仅停止本次更新；已写入的数据和任务日志都会保留。';
     }
+
+    const diagnosticActions = document.getElementById('update-diagnostic-actions');
+    if (diagnosticActions) {
+        diagnosticActions.classList.toggle('active', ['error', 'failed'].includes(status) && Boolean(job?.error_report_path));
+    }
 }
 
 function renderUpdateTokenPrompt() {
@@ -3218,17 +3231,41 @@ function renderUpdateTokenPrompt() {
         return;
     }
 
+    const provider = state.updateProvider || 'tushare';
+    const isTushare = provider === 'tushare';
+    document.querySelectorAll('.update-provider-btn[data-provider]').forEach(button => {
+        button.classList.toggle('active', button.dataset.provider === provider);
+    });
+    input.style.display = isTushare ? '' : 'none';
+    const label = document.querySelector('label[for="update-tushare-token"]');
+    if (label) {
+        label.style.display = isTushare ? '' : 'none';
+    }
+
+    if (!isTushare) {
+        note.textContent = `${providerDisplayName(provider)} 将使用公开行情接口更新；若当前网络被风控，任务会保留错误报告。`;
+        defaultButton.style.display = 'none';
+        confirmButton.textContent = `开始 ${providerDisplayName(provider)} 更新`;
+        return;
+    }
+
     if (state.updateHasTushareToken) {
-        note.textContent = '选择了 Tushare。可直接使用本机默认 Token，也可在下方手动输入临时 Token。';
+        note.textContent = 'Tushare 可直接使用本机默认 Token，也可在下方手动输入临时 Token。';
         defaultButton.style.display = '';
         input.placeholder = 'MANUAL TOKEN OPTIONAL';
         confirmButton.textContent = '使用输入 Token 更新';
     } else {
-        note.textContent = '选择了 Tushare。当前未检测到本机默认 Token，请手动输入。';
+        note.textContent = '当前未检测到本机默认 Tushare Token，请手动输入。';
         defaultButton.style.display = 'none';
         input.placeholder = 'INPUT TUSHARE TOKEN';
         confirmButton.textContent = '开始更新';
     }
+}
+
+function selectUpdateProvider(provider) {
+    state.updateProvider = provider || 'tushare';
+    renderUpdateProviderOptions();
+    renderUpdateTokenPrompt();
 }
 
 async function loadUpdateOptions() {
@@ -3239,10 +3276,14 @@ async function loadUpdateOptions() {
         }
         const data = result.data || {};
         state.updateHasTushareToken = Boolean(data.has_tushare_token);
-        state.updateDefaultProvider = data.default_provider || 'akshare';
+        state.updateDefaultProvider = data.default_provider || 'tushare';
+        if (!state.updateProvider) {
+            state.updateProvider = state.updateDefaultProvider;
+        }
         state.updateActiveProvider = data.active_provider || null;
         state.updateProviderStatuses = Array.isArray(data.providers) ? data.providers : [];
         state.updateLegacyProvider = data.legacy_provider || null;
+        state.updateMigrationWarning = data.migration_warning || null;
         renderUpdateProviderOptions();
         renderUpdateTokenPrompt();
     } catch (error) {
@@ -3265,7 +3306,7 @@ function renderUpdateProviderOptions() {
         const provider = button.dataset.provider;
         const meta = button.querySelector('[data-provider-meta]');
         const status = statuses.get(provider) || {};
-        button.classList.toggle('active', provider === state.updateActiveProvider);
+        button.classList.toggle('active', provider === state.updateProvider);
         if (!meta) {
             return;
         }
@@ -3290,12 +3331,11 @@ function openUpdateModal() {
         pollUpdateJobStatus();
         return;
     }
-    state.updateProvider = null;
+    state.updateProvider = state.updateDefaultProvider || 'tushare';
     state.currentUpdateJob = null;
     document.getElementById('update-tushare-token').value = '';
     renderUpdateTokenPrompt();
-    renderUpdateProviderOptions();
-    setUpdateModalStep('provider');
+    setUpdateModalStep('token');
     document.getElementById('update-modal').classList.add('active');
     loadUpdateOptions();
 }
@@ -3350,6 +3390,77 @@ async function stopUpdateJobAndKeepLogs() {
     }
 }
 
+async function startUpdateDiagnostic(mode) {
+    const jobId = state.currentUpdateJobId;
+    if (!jobId || !state.currentUpdateJob || !['error', 'failed'].includes(state.currentUpdateJob.status)) {
+        toast('当前没有可自检的失败更新任务', 'error');
+        return;
+    }
+    const buttons = [
+        document.getElementById('update-diagnostic-standard-btn'),
+        document.getElementById('update-diagnostic-extended-btn'),
+    ];
+    buttons.forEach(button => { if (button) button.disabled = true; });
+    document.getElementById('update-diagnostic-note').textContent = `正在启动${mode === 'extended' ? '扩展' : '标准'}自检...`;
+    try {
+        const result = await apiFetch(`/api/update/diagnostics/start/${jobId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                mode,
+                tushare_token: document.getElementById('update-tushare-token').value.trim(),
+            }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '自检启动失败');
+        }
+        state.currentUpdateDiagnosticId = result.diagnostic_id;
+        stopUpdateDiagnosticPolling();
+        state.updateDiagnosticPollTimer = window.setInterval(pollUpdateDiagnosticStatus, 1000);
+        await pollUpdateDiagnosticStatus();
+    } catch (error) {
+        buttons.forEach(button => { if (button) button.disabled = false; });
+        document.getElementById('update-diagnostic-note').textContent = `自检启动失败: ${error.message}`;
+        toast(`自检启动失败: ${error.message}`, 'error');
+    }
+}
+
+async function pollUpdateDiagnosticStatus() {
+    if (!state.currentUpdateDiagnosticId) {
+        return;
+    }
+    try {
+        const result = await apiFetch(`/api/update/diagnostics/status/${state.currentUpdateDiagnosticId}`);
+        if (!result.success) {
+            throw new Error(result.error || '自检状态同步失败');
+        }
+        const diagnostic = result.data || {};
+        const progress = diagnostic.total_count
+            ? ` ${formatNumber(diagnostic.processed_count || 0)}/${formatNumber(diagnostic.total_count)}`
+            : '';
+        document.getElementById('update-diagnostic-note').textContent = `${diagnostic.current_step || '自检执行中'}${progress}`;
+        if (diagnostic.status === 'completed') {
+            stopUpdateDiagnosticPolling();
+            const diagnosis = diagnostic.summary || {};
+            document.getElementById('update-diagnostic-note').textContent =
+                `根因: ${diagnosis.summary || diagnosis.code || diagnostic.result_status || '自检完成'}；建议: ${diagnosis.remediation || '查看错误报告中的 diagnostics.runs'}；日志: ${diagnostic.error_report_path}`;
+            state.currentUpdateDiagnosticId = null;
+            document.getElementById('update-diagnostic-standard-btn').disabled = false;
+            document.getElementById('update-diagnostic-extended-btn').disabled = false;
+            toast('自检完成，结果已追加到原错误报告', diagnostic.result_status === 'failed' ? 'error' : 'success', 5200);
+        } else if (diagnostic.status === 'error') {
+            throw new Error(diagnostic.error || '自检失败');
+        }
+    } catch (error) {
+        stopUpdateDiagnosticPolling();
+        state.currentUpdateDiagnosticId = null;
+        document.getElementById('update-diagnostic-standard-btn').disabled = false;
+        document.getElementById('update-diagnostic-extended-btn').disabled = false;
+        document.getElementById('update-diagnostic-note').textContent = `自检失败: ${error.message}`;
+        toast(`自检失败: ${error.message}`, 'error');
+    }
+}
+
 async function startUpdateJob(provider, token = '') {
     state.currentUpdateJob = null;
     setUpdateModalStep('progress');
@@ -3377,7 +3488,7 @@ async function startUpdateJob(provider, token = '') {
         state.updatePollTimer = window.setInterval(pollUpdateJobStatus, 1000);
         await pollUpdateJobStatus();
     } catch (error) {
-        setUpdateModalStep('provider');
+        setUpdateModalStep('token');
         toast(`更新失败: ${error.message}`, 'error');
     }
 }
@@ -5002,24 +5113,26 @@ function bindEvents() {
         loadHeatmap();
     });
 
-    document.querySelectorAll('.update-provider-btn').forEach(button => {
-        button.addEventListener('click', async () => {
-            state.updateProvider = button.dataset.provider;
-            if (state.updateProvider === 'tushare') {
-                setUpdateModalStep('token');
-                return;
-            }
-            await startUpdateJob(state.updateProvider);
-        });
-    });
-    document.getElementById('update-token-back-btn').addEventListener('click', () => setUpdateModalStep('provider'));
     document.getElementById('update-token-default-btn').addEventListener('click', async () => {
         await startUpdateJob('tushare', '');
     });
     document.getElementById('update-token-confirm-btn').addEventListener('click', async () => {
-        await startUpdateJob('tushare', document.getElementById('update-tushare-token').value.trim());
+        const provider = state.updateProvider || 'tushare';
+        const token = provider === 'tushare'
+            ? document.getElementById('update-tushare-token').value.trim()
+            : '';
+        await startUpdateJob(provider, token);
+    });
+    document.getElementById('update-provider-grid').addEventListener('click', event => {
+        const button = event.target.closest('.update-provider-btn[data-provider]');
+        if (!button || button.disabled) {
+            return;
+        }
+        selectUpdateProvider(button.dataset.provider);
     });
     document.getElementById('update-stop-btn').addEventListener('click', stopUpdateJobAndKeepLogs);
+    document.getElementById('update-diagnostic-standard-btn').addEventListener('click', () => startUpdateDiagnostic('standard'));
+    document.getElementById('update-diagnostic-extended-btn').addEventListener('click', () => startUpdateDiagnostic('extended'));
     document.getElementById('update-modal-close-btn').addEventListener('click', closeUpdateModal);
     document.getElementById('update-modal').addEventListener('click', event => {
         if (event.target.id === 'update-modal') {

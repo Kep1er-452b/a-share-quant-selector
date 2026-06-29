@@ -28,6 +28,7 @@ sys.path.insert(0, str(project_root))
 from utils.csv_manager import CSVManager
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.error_logging import append_system_log as shared_append_system_log, write_error_report
+from utils.update_diagnostics import attach_auto_snapshot, resolve_update_error_report, run_update_diagnostics
 from utils.config_schema import atomic_write_yaml, validate_strategy_params
 from utils.local_config import load_config_file
 from utils.market_overview import (
@@ -90,6 +91,8 @@ selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
 update_cancel_events = {}
+diagnostic_jobs = {}
+diagnostic_jobs_lock = Lock()
 job_admission_lock = Lock()
 sync_selection_active = False
 wyckoff_jobs = {}
@@ -107,8 +110,8 @@ LOG_DIR = project_root / "logs"
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 EMERGENCY_EXIT_DELAY_SECONDS = 1.2
-UPDATE_FAILURE_MIN_COVERAGE = 0.20
-UPDATE_CACHE_REFRESH_MIN_COVERAGE = 0.90
+UPDATE_FAILURE_MIN_COVERAGE = 0.98
+UPDATE_CACHE_REFRESH_MIN_COVERAGE = 0.98
 UPDATE_COVERAGE_GUARD_MIN_TARGETS = 100
 
 
@@ -1026,7 +1029,25 @@ def _find_running_update_job():
     return None
 
 
+def _find_running_diagnostic_job(report_path=None):
+    with diagnostic_jobs_lock:
+        for job in diagnostic_jobs.values():
+            if job.get('status') not in {'queued', 'running'}:
+                continue
+            if report_path is None or job.get('error_report_path') == str(report_path):
+                return _serialize_job(job)
+    return None
+
+
 def _selection_conflict_response():
+    running_diagnostic = _find_running_diagnostic_job()
+    if running_diagnostic:
+        return jsonify({
+            'success': False,
+            'error': '当前有数据更新自检正在执行，请等待完成后再选股',
+            'diagnostic': running_diagnostic,
+        }), 409
+
     running_update = _find_running_update_job()
     if running_update:
         return jsonify({
@@ -1050,13 +1071,14 @@ def _update_cancel_event(job_id):
         return update_cancel_events.get(job_id)
 
 
-def _create_update_job(provider):
+def _create_update_job(provider, max_stocks=None):
     job_id = uuid.uuid4().hex[:12]
     now = _job_timestamp()
     job = {
         'job_id': job_id,
         'status': 'queued',
         'provider': provider,
+        'max_stocks': max_stocks,
         'created_at': now,
         'updated_at': now,
         'started_at_monotonic': time.monotonic(),
@@ -1081,6 +1103,80 @@ def _create_update_job(provider):
         update_jobs[job_id] = job
         update_cancel_events[job_id] = Event()
     return job_id
+
+
+def _create_diagnostic_job(update_job, mode):
+    diagnostic_id = uuid.uuid4().hex[:12]
+    now = _job_timestamp()
+    job = {
+        'diagnostic_id': diagnostic_id,
+        'update_job_id': update_job.get('job_id'),
+        'status': 'queued',
+        'mode': mode,
+        'created_at': now,
+        'updated_at': now,
+        'started_at_monotonic': time.monotonic(),
+        'elapsed_seconds': 0,
+        'current_step': '等待执行',
+        'processed_count': 0,
+        'total_count': 0,
+        'summary': None,
+        'error': None,
+        'error_report_path': update_job.get('error_report_path'),
+    }
+    with diagnostic_jobs_lock:
+        diagnostic_jobs[diagnostic_id] = job
+    return diagnostic_id
+
+
+def _update_diagnostic_job(diagnostic_id, **updates):
+    with diagnostic_jobs_lock:
+        job = diagnostic_jobs.get(diagnostic_id)
+        if not job:
+            return None
+        job.update(updates)
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        return job
+
+
+def _run_update_diagnostic_job(diagnostic_id, report_path, mode, temporary_token):
+    def progress(payload):
+        _update_diagnostic_job(diagnostic_id, **payload)
+
+    _update_diagnostic_job(
+        diagnostic_id,
+        status='running',
+        current_step='启动数据更新自检',
+        started_at=_job_timestamp(),
+    )
+    try:
+        result = run_update_diagnostics(
+            report_path,
+            mode=mode,
+            token=temporary_token or None,
+            project_root=project_root,
+            progress_callback=progress,
+            trigger='web',
+        )
+        _update_diagnostic_job(
+            diagnostic_id,
+            status='completed',
+            current_step='自检完成',
+            summary=result.get('primary_diagnosis'),
+            result_status=result.get('status'),
+            finished_at=_job_timestamp(),
+        )
+    except Exception as exc:
+        _update_diagnostic_job(
+            diagnostic_id,
+            status='error',
+            current_step='自检失败',
+            error=str(exc),
+            finished_at=_job_timestamp(),
+        )
+    finally:
+        temporary_token = None
 
 
 def _create_selection_job(requested_boards, requested_strategies, formula_spec=None):
@@ -1134,6 +1230,7 @@ def block_requests_after_halt():
         'system_shutdown',
         'get_selection_job_status',
         'get_update_job_status',
+        'get_update_diagnostic_status',
     }
     if request.endpoint in allowed_endpoints:
         return None
@@ -1473,7 +1570,7 @@ def _provider_switch_warnings(data_root, provider, provider_state=None):
     return warnings
 
 
-def _run_update_job(job_id, provider_name, provider_token):
+def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
     config = _load_config()
     data_dir = str(_config_value(config, 'data_dir', default='data'))
     provider = None
@@ -1500,6 +1597,26 @@ def _run_update_job(job_id, provider_name, provider_token):
                     context['provider_context'] = provider_context
         return context
 
+    def enrich_error_report(report_path):
+        if provider is not None:
+            try:
+                provider.persist_error_report_path(report_path)
+            except Exception as state_error:
+                _append_system_log(
+                    'update_provider_state_error',
+                    f'更新失败状态写入错误报告路径失败: {state_error}',
+                    {'job_id': job_id},
+                )
+        try:
+            attach_auto_snapshot(report_path, config=config, project_root=project_root)
+        except Exception as snapshot_error:
+            _append_system_log(
+                'update_auto_diagnostic_error',
+                f'自动轻量自检写入失败: {snapshot_error}',
+                {'job_id': job_id, 'error_report_path': str(report_path)},
+            )
+        return report_path
+
     try:
         ensure_update_continues()
 
@@ -1524,13 +1641,25 @@ def _run_update_job(job_id, provider_name, provider_token):
             config=config,
             token=(provider_token or '').strip() or None,
         )
+        if provider_name == 'tushare':
+            _update_update_job(
+                job_id,
+                current_step='Tushare 更新前预检',
+                progress_pct=2,
+            )
+            _append_update_job_log(job_id, '正在执行 Tushare Token、权限、交易日历、基础数据与行情预检。')
+            preflight = provider.run_preflight()
+            _append_update_job_log(
+                job_id,
+                f"Tushare 预检完成: {preflight.get('status')}，最新交易日 {preflight.get('latest_trade_date')}。",
+            )
         _update_update_job(
             job_id,
             current_step='获取股票列表',
             progress_pct=2,
         )
         _append_update_job_log(job_id, f'正在获取 {provider_name} 目标股票池。')
-        target_universe = provider.get_target_universe(board='all', max_stocks=None)
+        target_universe = provider.get_target_universe(board='all', max_stocks=max_stocks)
         ensure_update_continues()
         _update_update_job(
             job_id,
@@ -1573,7 +1702,7 @@ def _run_update_job(job_id, provider_name, provider_token):
         sync_summary = provider.sync_target_data(
             target_universe,
             board='all',
-            max_stocks=None,
+            max_stocks=max_stocks,
             purpose='run',
             progress_callback=progress_callback,
             halt_checker=lambda: _is_halted() or is_cancelled(),
@@ -1601,6 +1730,7 @@ def _run_update_job(job_id, provider_name, provider_token):
                 failure_context,
                 error_id=job_id,
             )
+            enrich_error_report(error_report_path)
             _append_update_job_log(job_id, message)
             _append_update_job_log(job_id, f'错误日志: {error_report_path}')
             _append_system_log(
@@ -1726,6 +1856,7 @@ def _run_update_job(job_id, provider_name, provider_token):
             error_context('data_provider'),
             error_id=job_id,
         )
+        enrich_error_report(error_report_path)
         _update_update_job(
             job_id,
             status='error',
@@ -1747,6 +1878,7 @@ def _run_update_job(job_id, provider_name, provider_token):
             error_context('unexpected'),
             error_id=job_id,
         )
+        enrich_error_report(error_report_path)
         _update_update_job(
             job_id,
             status='error',
@@ -2526,6 +2658,14 @@ def activate_data_provider():
                 'job': running_update,
             }), 409
 
+        running_diagnostic = _find_running_diagnostic_job()
+        if running_diagnostic:
+            return jsonify({
+                'success': False,
+                'error': '当前有数据更新自检正在执行，请等待完成后再激活数据源',
+                'diagnostic': running_diagnostic,
+            }), 409
+
         running_selection = _find_running_job()
         if running_selection or sync_selection_active:
             return jsonify({
@@ -3026,7 +3166,6 @@ def get_heatmap_meta():
             if industry_items.get(stock.get('code'))
         )
         industry_unmapped_count = max(len(visible_snapshot_stocks) - industry_mapped_count, 0)
-        default_provider = get_config_value(config, 'data_source', 'default_provider', default='akshare')
         has_tushare_token = bool(
             os.getenv('TUSHARE_TOKEN')
             or get_config_value(config, 'data_source', 'tushare', 'token')
@@ -3036,7 +3175,7 @@ def get_heatmap_meta():
             'success': True,
             'data': {
                 'latest_date': cache_bundle.get('snapshot', {}).get('latest_date'),
-                'default_provider': str(default_provider or 'akshare').lower(),
+                'default_provider': 'tushare',
                 'has_tushare_token': has_tushare_token,
                 'markets': [
                     {'key': 'all', 'label': 'A股全图', 'enabled': True},
@@ -3081,7 +3220,9 @@ def get_update_options():
     """获取 Web 更新数据功能的默认选项。"""
     try:
         config = _load_config()
-        default_provider = get_config_value(config, 'data_source', 'default_provider', default='akshare')
+        configured_provider = str(get_config_value(config, 'data_source', 'default_provider') or 'tushare').lower()
+        if configured_provider not in VALID_PROVIDERS:
+            configured_provider = 'tushare'
         has_tushare_token = bool(
             os.getenv('TUSHARE_TOKEN')
             or get_config_value(config, 'data_source', 'tushare', 'token')
@@ -3095,13 +3236,14 @@ def get_update_options():
         return jsonify({
             'success': True,
             'data': {
-                'default_provider': str(default_provider or 'akshare').lower(),
+                'default_provider': configured_provider,
                 'has_tushare_token': has_tushare_token,
                 'latest_date': latest_date,
                 'active_provider': active_state.get('active_provider'),
                 'active_provider_state': active_state,
                 'providers': list_provider_statuses(data_root),
                 'legacy_provider': legacy_summary(data_root),
+                'migration_warning': None,
             }
         })
     except Exception as e:
@@ -3120,12 +3262,29 @@ def start_update_job():
             payload = {}
         if not isinstance(payload, dict):
             return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
-        provider = _normalize_csv_value(payload.get('provider')) or 'akshare'
-        if provider not in {'akshare', 'tushare', 'tencent'}:
+        provider = _normalize_csv_value(payload.get('provider')) or 'tushare'
+        if provider not in VALID_PROVIDERS:
             return jsonify({'success': False, 'error': '不支持的数据源'}), 400
 
         tushare_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
+        max_stocks = payload.get('max_stocks')
+        if max_stocks in ('', None):
+            max_stocks = None
+        else:
+            try:
+                max_stocks = int(max_stocks)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'max_stocks 必须是正整数'}), 400
+            if max_stocks <= 0 or max_stocks > 100:
+                return jsonify({'success': False, 'error': 'max_stocks 必须在 1 到 100 之间'}), 400
         with job_admission_lock:
+            running_diagnostic = _find_running_diagnostic_job()
+            if running_diagnostic:
+                return jsonify({
+                    'success': False,
+                    'error': '当前有数据更新自检正在执行，请等待完成后再更新数据',
+                    'diagnostic': running_diagnostic,
+                }), 409
             running_job = _find_running_update_job()
             if running_job:
                 return jsonify({
@@ -3141,10 +3300,10 @@ def start_update_job():
                     'error': '当前有选股任务正在执行，请等待完成后再更新数据',
                     'job': running_selection,
                 }), 409
-            job_id = _create_update_job(provider)
+            job_id = _create_update_job(provider, max_stocks=max_stocks)
         thread = Thread(
             target=_run_update_job,
-            args=(job_id, provider, tushare_token),
+            args=(job_id, provider, tushare_token, max_stocks),
             daemon=True,
         )
         thread.start()
@@ -3177,6 +3336,68 @@ def get_update_job_status(job_id):
             'success': True,
             'data': _serialize_job(job),
         })
+
+
+@app.route('/api/update/diagnostics/start/<job_id>', methods=['POST'])
+def start_update_diagnostic(job_id):
+    """针对既有失败更新启动有界、只读的 Tushare 自检。"""
+    try:
+        job_id = _validate_job_id(job_id)
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+        mode = _normalize_csv_value(payload.get('mode')) or 'standard'
+        if mode not in {'standard', 'extended'}:
+            return jsonify({'success': False, 'error': '自检模式必须是 standard 或 extended'}), 400
+        temporary_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
+
+        with update_jobs_lock:
+            update_job = update_jobs.get(job_id)
+            if not update_job:
+                return jsonify({'success': False, 'error': '更新任务不存在'}), 404
+            update_snapshot = dict(update_job)
+        if update_snapshot.get('status') not in {'failed', 'error'}:
+            return jsonify({'success': False, 'error': '只允许针对 failed/error 更新任务运行自检'}), 409
+        report_path = update_snapshot.get('error_report_path')
+        if not report_path:
+            return jsonify({'success': False, 'error': '该失败任务没有错误报告'}), 409
+        report_path = str(resolve_update_error_report(report_path))
+        update_snapshot['error_report_path'] = report_path
+
+        with job_admission_lock:
+            if _find_running_update_job() or _find_running_job() or sync_selection_active:
+                return jsonify({'success': False, 'error': '更新或选股任务正在执行，不能启动自检'}), 409
+            existing = _find_running_diagnostic_job()
+            if existing:
+                message = '该错误报告已有自检正在执行' if existing.get('error_report_path') == report_path else '已有数据更新自检正在执行'
+                return jsonify({'success': False, 'error': message, 'diagnostic': existing}), 409
+            diagnostic_id = _create_diagnostic_job(update_snapshot, mode)
+
+        Thread(
+            target=_run_update_diagnostic_job,
+            args=(diagnostic_id, report_path, mode, temporary_token),
+            daemon=True,
+        ).start()
+        with diagnostic_jobs_lock:
+            created = diagnostic_jobs.get(diagnostic_id)
+        return jsonify({'success': True, 'diagnostic_id': diagnostic_id, 'data': _serialize_job(created)})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/update/diagnostics/status/<diagnostic_id>')
+def get_update_diagnostic_status(diagnostic_id):
+    try:
+        diagnostic_id = _validate_job_id(diagnostic_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    with diagnostic_jobs_lock:
+        job = diagnostic_jobs.get(diagnostic_id)
+        if not job:
+            return jsonify({'success': False, 'error': '自检任务不存在'}), 404
+        return jsonify({'success': True, 'data': _serialize_job(job)})
 
 
 @app.route('/api/update/cancel/<job_id>', methods=['POST'])

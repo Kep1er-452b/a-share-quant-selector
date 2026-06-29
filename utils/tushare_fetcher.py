@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 import urllib.request
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -20,13 +20,50 @@ import pandas as pd
 from utils.data_provider import BaseDataProvider, DataProviderError
 
 
+class TushareProviderError(DataProviderError):
+    """Structured provider failure that can safely abort a sync batch."""
+
+    def __init__(self, message, *, code="UNKNOWN", endpoint=None, fatal=True):
+        super().__init__(message)
+        self.code = code
+        self.endpoint = endpoint
+        self.fatal = fatal
+
+
+def classify_tushare_error(error) -> dict:
+    message = str(error or "")
+    lowered = message.lower()
+    error_name = type(error).__name__
+    rules = (
+        ("TOKEN_MISSING", "config", True, ("未找到 tushare token", "missing token")),
+        ("TOKEN_INVALID", "auth", True, ("token不对", "token 无效", "invalid token", "token error")),
+        ("PERMISSION_DENIED", "permission", True, ("没有访问该接口的权限", "没有权限", "权限不足", "积分不足", "permission denied", "not have access")),
+        ("RATE_LIMITED", "rate_limit", False, ("每分钟最多", "频率超限", "rate limit", "too many requests")),
+        ("PROXY_FAILURE", "network", False, ("proxyerror", "unable to connect to proxy", "代理")),
+        ("NETWORK_UNREACHABLE", "network", False, ("timed out", "timeout", "connection", "remote end closed", "dns", "ssl")),
+        ("EMPTY_RESPONSE", "data", False, ("返回空数据", "空响应", "empty response")),
+        ("SCHEMA_MISMATCH", "data", True, ("缺少必要字段", "字段异常", "schema")),
+        ("DATE_MISMATCH", "data", True, ("日期不一致", "交易日期", "date mismatch")),
+        ("LOCAL_REPOSITORY_CORRUPT", "local", True, ("本地仓库损坏", "本地缓存结构不完整")),
+        ("WRITE_FAILED", "local", True, ("写入失败", "permission denied writing")),
+        ("SYNC_TIMEOUT", "timeout", True, ("同步超时", "sync timeout")),
+        ("ADJUSTMENT_ERROR", "data", True, ("复权异常", "adj_factor")),
+    )
+    combined = f"{error_name} {lowered}"
+    for code, category, fatal, markers in rules:
+        if any(marker in combined for marker in markers):
+            return {"code": code, "category": category, "fatal": fatal, "message": message}
+    return {"code": "UNKNOWN", "category": "unknown", "fatal": False, "message": message}
+
+
 class TushareFetcher(BaseDataProvider):
     """Tushare 数据抓取器"""
 
     provider_name = "tushare"
 
-    def __init__(self, data_dir="data", token=None):
+    def __init__(self, data_dir="data", token=None, config=None):
         super().__init__(data_dir)
+        tushare_config = ((config or {}).get("data_source") or {}).get("tushare") or {}
         self.token = (token or "").strip()
         if not self.token:
             raise DataProviderError(
@@ -40,21 +77,20 @@ class TushareFetcher(BaseDataProvider):
             raise DataProviderError("未安装 tushare，请先执行 `pip install -r requirements.txt`。") from exc
 
         self.ts = ts
-        self.ts.set_token(self.token)
         self.pro = self.ts.pro_api(self.token)
         self.stock_meta_file = Path(data_dir) / "tushare_stock_map.json"
         self.stock_meta_refresh_file = Path(data_dir) / "tushare_stock_map_state.json"
         self.daily_basic_calls = deque()
-        self.daily_basic_limit_per_minute = 180
+        self.daily_basic_limit_per_minute = int(tushare_config.get("daily_basic_limit_per_minute", 180))
         self.daily_basic_rate_limit_wait = 62
         self.daily_basic_lock = Lock()
         self.pro_bar_calls = deque()
         # ts.pro_bar internally touches adj_factor, whose Tushare quota is
         # lower than daily. Keep a buffer below 200/min to avoid mass fallback.
-        self.pro_bar_limit_per_minute = 160
+        self.pro_bar_limit_per_minute = int(tushare_config.get("pro_bar_limit_per_minute", 160))
         self.pro_bar_rate_limit_wait = 62
         self.pro_bar_lock = Lock()
-        self._sync_max_workers = min(self._sync_max_workers, 8)
+        self._sync_max_workers = min(self._sync_max_workers, int(tushare_config.get("max_workers", 8)))
         self.proxy_fallback_lock = Lock()
         self._prefer_direct_network = False
         self.daily_basic_cache_lock = Lock()
@@ -70,7 +106,84 @@ class TushareFetcher(BaseDataProvider):
         self.trade_calendar_cache = {}
         self.trade_calendar_range_cache = {}
         self._trade_calendar_warning_emitted = False
+        self._api_stats = Counter()
+        self._diagnostic_lock = Lock()
+        self._error_samples = []
+        self._network_outcomes = deque(maxlen=max(int(tushare_config.get("network_circuit_window_size", 20)), 1))
+        self._network_consecutive_failures = 0
+        self._network_circuit_threshold = max(int(tushare_config.get("network_circuit_consecutive_failures", 8)), 1)
+        self._network_circuit_ratio = min(max(float(tushare_config.get("network_circuit_failure_ratio", 0.8)), 0.1), 1.0)
+        self._network_circuit_open = False
+        self._preflight_result = None
+        self._preflight_stock_basic_df = pd.DataFrame()
+        self._preflight_used_stock_cache = False
+        self._preflight_warnings = []
         self._load_trade_calendar_cache()
+
+    def _record_api_success(self, endpoint, result):
+        empty = result is None or (isinstance(result, pd.DataFrame) and result.empty)
+        with self._diagnostic_lock:
+            self._api_stats[f"{endpoint}.success"] += 1
+            if empty:
+                self._api_stats[f"{endpoint}.empty"] += 1
+            self._network_outcomes.append(True)
+            self._network_consecutive_failures = 0
+
+    def _record_api_error(self, endpoint, error, stock_code=None):
+        classification = classify_tushare_error(error)
+        with self._diagnostic_lock:
+            self._api_stats[f"{endpoint}.error"] += 1
+            self._api_stats[f"error.{classification['code']}"] += 1
+            if len(self._error_samples) < 12:
+                self._error_samples.append({
+                    "endpoint": endpoint,
+                    "stock_code": str(stock_code).zfill(6) if stock_code else None,
+                    "error_type": type(error).__name__,
+                    "code": classification["code"],
+                    "message": str(error)[:1000],
+                })
+            if classification["category"] == "network":
+                self._network_outcomes.append(False)
+                self._network_consecutive_failures += 1
+                failures = sum(1 for outcome in self._network_outcomes if not outcome)
+                unhealthy_window = (
+                    len(self._network_outcomes) >= self._network_outcomes.maxlen
+                    and failures / len(self._network_outcomes) >= self._network_circuit_ratio
+                )
+                if self._network_consecutive_failures >= self._network_circuit_threshold or unhealthy_window:
+                    self._network_circuit_open = True
+        return classification
+
+    def _call_tracked(self, endpoint, func, *args, retry_on_none=False, stock_code=None, **kwargs):
+        if self._network_circuit_open:
+            raise TushareProviderError(
+                "Tushare 网络连续失败，已打开本轮更新熔断器。",
+                code="NETWORK_CIRCUIT_OPEN",
+                endpoint=endpoint,
+            )
+        with self._diagnostic_lock:
+            self._api_stats[f"{endpoint}.calls"] += 1
+        try:
+            result = self._call_with_proxy_fallback(func, *args, retry_on_none=retry_on_none, **kwargs)
+        except TushareProviderError:
+            raise
+        except Exception as exc:
+            classification = self._record_api_error(endpoint, exc, stock_code=stock_code)
+            if classification["fatal"]:
+                raise TushareProviderError(
+                    str(exc),
+                    code=classification["code"],
+                    endpoint=endpoint,
+                ) from exc
+            if self._network_circuit_open:
+                raise TushareProviderError(
+                    "Tushare 网络连续失败，已打开本轮更新熔断器。",
+                    code="NETWORK_CIRCUIT_OPEN",
+                    endpoint=endpoint,
+                ) from exc
+            raise
+        self._record_api_success(endpoint, result)
+        return result
 
     def _has_proxy_configured(self) -> bool:
         try:
@@ -130,12 +243,18 @@ class TushareFetcher(BaseDataProvider):
             except Exception:
                 raise exc
             self._prefer_direct_network = True
+            if hasattr(self, "_diagnostic_lock"):
+                with self._diagnostic_lock:
+                    self._api_stats["network.proxy_fallback_success"] += 1
             return result
 
         if retry_on_none and result is None and self._has_proxy_configured():
             direct_result = self._call_without_proxy(func, *args, **kwargs)
             if direct_result is not None:
                 self._prefer_direct_network = True
+                if hasattr(self, "_diagnostic_lock"):
+                    with self._diagnostic_lock:
+                        self._api_stats["network.proxy_fallback_success"] += 1
                 return direct_result
         return result
 
@@ -167,6 +286,8 @@ class TushareFetcher(BaseDataProvider):
         try:
             with open(self.trade_calendar_cache_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+        except TushareProviderError:
+            raise
         except Exception as e:
             print(f"  保存交易日历缓存失败: {e}")
 
@@ -211,7 +332,8 @@ class TushareFetcher(BaseDataProvider):
         print("  可执行 `python3 main.py calendar --provider tushare --update --years 2026` 更新日历缓存。")
 
     def _fetch_trade_calendar_year(self, year: int):
-        df = self._call_with_proxy_fallback(
+        df = self._call_tracked(
+            "trade_cal",
             self.pro.trade_cal,
             exchange="",
             start_date=f"{year}0101",
@@ -360,6 +482,8 @@ class TushareFetcher(BaseDataProvider):
                     self._latest_trade_date_cache = trade_date
                     self._latest_trade_date_daily_basic_cache = df.copy()
                     return trade_date, df
+            except TushareProviderError:
+                raise
             except Exception:
                 continue
         return None, pd.DataFrame()
@@ -381,7 +505,8 @@ class TushareFetcher(BaseDataProvider):
             return self.trade_calendar_range_cache[cache_key]
 
         try:
-            df = self._call_with_proxy_fallback(
+            df = self._call_tracked(
+                "trade_cal",
                 self.pro.trade_cal,
                 exchange="",
                 start_date=start.strftime("%Y%m%d"),
@@ -393,6 +518,8 @@ class TushareFetcher(BaseDataProvider):
                 trade_dates = list(pd.to_datetime(open_days).dt.date)
                 self.trade_calendar_range_cache[cache_key] = trade_dates
                 return trade_dates
+        except TushareProviderError:
+            raise
         except Exception as e:
             cached_trade_dates = self._get_cached_trade_dates_between(start, end)
             if cached_trade_dates:
@@ -479,22 +606,28 @@ class TushareFetcher(BaseDataProvider):
     def _call_daily_basic(self, **kwargs):
         self._throttle_daily_basic()
         self.daily_basic_api_calls += 1
-        return self._call_with_proxy_fallback(self.pro.daily_basic, **kwargs)
+        return self._call_tracked("daily_basic", self.pro.daily_basic, **kwargs)
 
     def _call_pro_bar(self, **kwargs):
         last_error = None
         for attempt in range(4):
             try:
                 self._throttle_pro_bar()
-                return self._call_with_proxy_fallback(
+                return self._call_tracked(
+                    "pro_bar",
                     self.ts.pro_bar,
                     api=self.pro,
                     retry_on_none=True,
+                    stock_code=str(kwargs.get("ts_code") or "").split(".")[0] or None,
                     **kwargs,
                 )
+            except TushareProviderError:
+                raise
             except Exception as e:
                 last_error = e
                 if self._is_rate_limit_error(e) and attempt < 3:
+                    with self._diagnostic_lock:
+                        self._api_stats["pro_bar.retries"] += 1
                     wait_seconds = self.pro_bar_rate_limit_wait
                     print(f"  daily/adj_factor 命中限流，等待 {wait_seconds} 秒后重试...")
                     time.sleep(wait_seconds)
@@ -502,6 +635,8 @@ class TushareFetcher(BaseDataProvider):
                         self.pro_bar_calls.clear()
                     continue
                 if attempt < 3:
+                    with self._diagnostic_lock:
+                        self._api_stats["pro_bar.retries"] += 1
                     time.sleep(0.5 * (attempt + 1))
         if last_error is not None:
             raise last_error
@@ -520,15 +655,21 @@ class TushareFetcher(BaseDataProvider):
                 if isinstance(df, pd.DataFrame):
                     return df
                 return pd.DataFrame()
+            except TushareProviderError:
+                raise
             except Exception as e:
                 last_error = e
                 if self._is_rate_limit_error(e) and attempt < 3:
+                    with self._diagnostic_lock:
+                        self._api_stats["daily_basic.retries"] += 1
                     wait_seconds = self.daily_basic_rate_limit_wait
                     print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
                     time.sleep(wait_seconds)
                     self.daily_basic_calls.clear()
                     continue
                 if attempt < 3:
+                    with self._diagnostic_lock:
+                        self._api_stats["daily_basic.retries"] += 1
                     time.sleep(0.5 * (attempt + 1))
         if last_error is not None:
             print(f"  获取 daily_basic 失败: {last_error}")
@@ -556,6 +697,8 @@ class TushareFetcher(BaseDataProvider):
                         df = pd.DataFrame()
                     self.daily_basic_by_date_cache[date_key] = df.copy()
                     return df
+                except TushareProviderError:
+                    raise
                 except Exception as e:
                     last_error = e
                     if self._is_rate_limit_error(e) and attempt < 3:
@@ -634,11 +777,33 @@ class TushareFetcher(BaseDataProvider):
             self._fetch_daily_basic_trade_date(trade_date)
 
     def get_runtime_stats(self) -> dict:
-        return {
+        stats = {
             "daily_basic实际请求": self.daily_basic_api_calls,
             "daily_basic缓存命中": self.daily_basic_cache_hits,
             "daily_basic缓存交易日": len(self.daily_basic_by_date_cache),
         }
+        with self._diagnostic_lock:
+            stats.update(dict(self._api_stats))
+        return stats
+
+    def get_runtime_diagnostics(self) -> dict:
+        with self._diagnostic_lock:
+            failures = sum(1 for outcome in self._network_outcomes if not outcome)
+            return {
+                "error_samples": list(self._error_samples),
+                "network_policy": {
+                    "route": "direct" if self._prefer_direct_network else "environment",
+                    "sync_max_workers": self._sync_max_workers,
+                    "pro_bar_limit_per_minute": self.pro_bar_limit_per_minute,
+                    "daily_basic_limit_per_minute": self.daily_basic_limit_per_minute,
+                    "network_circuit_open": self._network_circuit_open,
+                    "network_consecutive_failures": self._network_consecutive_failures,
+                    "network_window_samples": len(self._network_outcomes),
+                    "network_window_failures": failures,
+                },
+                "daily_basic_failed_dates": sorted(self.daily_basic_by_date_failures),
+                "preflight": dict(self._preflight_result or {}),
+            }
 
     @staticmethod
     def _numeric_column(frame: pd.DataFrame, column_name: str, default=0):
@@ -725,55 +890,251 @@ class TushareFetcher(BaseDataProvider):
         result = result.sort_values("date", ascending=False)
         return result
 
+    @staticmethod
+    def _validate_frame(frame, required_columns, *, endpoint, minimum_rows=1):
+        if not isinstance(frame, pd.DataFrame) or len(frame) < minimum_rows:
+            raise TushareProviderError(
+                f"Tushare {endpoint} 返回空数据或记录数不足。",
+                code="EMPTY_RESPONSE",
+                endpoint=endpoint,
+            )
+        missing = sorted(set(required_columns) - set(frame.columns))
+        if missing:
+            raise TushareProviderError(
+                f"Tushare {endpoint} 缺少必要字段: {', '.join(missing)}",
+                code="SCHEMA_MISMATCH",
+                endpoint=endpoint,
+            )
+
+    def _fetch_stock_basic_frame(self):
+        return self._call_tracked(
+            "stock_basic",
+            self.pro.stock_basic,
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,area,industry,market,exchange,list_date",
+        )
+
+    @staticmethod
+    def _stock_basic_maps(frame):
+        frame = frame.copy()
+        frame["symbol"] = frame["symbol"].astype(str).str.zfill(6)
+        frame = frame[frame["exchange"].isin(["SSE", "SZSE"])]
+        frame = frame[frame["symbol"].str.match(r"^(00|30|60|68)\d{4}$")]
+        exclude_keywords = ["债", "ETF", "LOF", "基金", "理财", "信托", "B股", "指数", "转债"]
+        for keyword in exclude_keywords:
+            frame = frame[~frame["name"].astype(str).str.contains(keyword, na=False)]
+        stock_dict = dict(zip(frame["symbol"], frame["name"].astype(str)))
+        stock_map = {
+            row["symbol"]: {
+                "ts_code": row["ts_code"],
+                "name": row["name"],
+                "area": row.get("area", ""),
+                "industry": row.get("industry", ""),
+                "exchange": row["exchange"],
+                "market": row["market"],
+                "list_date": row["list_date"],
+            }
+            for _, row in frame.iterrows()
+        }
+        return stock_dict, stock_map
+
+    def _metadata_cache_is_fresh(self, max_age_hours=24):
+        if not self.stock_meta_file.exists() or not self.stock_meta_refresh_file.exists():
+            return False
+        try:
+            state = json.loads(self.stock_meta_refresh_file.read_text(encoding="utf-8"))
+            updated_at = pd.to_datetime(state.get("updated_at"), errors="coerce")
+            stock_count = int(state.get("stock_count") or 0)
+            if pd.isna(updated_at) or stock_count < 3000:
+                return False
+            age_hours = (pd.Timestamp.now() - updated_at).total_seconds() / 3600
+            return 0 <= age_hours <= max_age_hours
+        except Exception:
+            return False
+
+    def run_preflight(self) -> dict:
+        """Validate required Tushare surfaces before any provider warehouse write."""
+        started = time.monotonic()
+        checks = []
+        warnings = []
+        stock_basic_df = pd.DataFrame()
+        checks.append({
+            "id": "runtime_config",
+            "status": "passed",
+            "token_present": bool(self.token),
+            "token_source": getattr(self, "token_source", "provided"),
+            "sdk_version": getattr(self.ts, "__version__", None),
+        })
+        try:
+            stock_basic_df = self._fetch_stock_basic_frame()
+            self._validate_frame(
+                stock_basic_df,
+                {"ts_code", "symbol", "name", "market", "exchange", "list_date"},
+                endpoint="stock_basic",
+                minimum_rows=3000,
+            )
+            stock_dict, stock_map = self._stock_basic_maps(stock_basic_df)
+            if len(stock_dict) < 3000:
+                raise TushareProviderError(
+                    f"Tushare stock_basic 有效A股数量异常: {len(stock_dict)}",
+                    code="EMPTY_RESPONSE",
+                    endpoint="stock_basic",
+                )
+            checks.append({"id": "stock_basic", "status": "passed", "rows": len(stock_dict)})
+        except TushareProviderError:
+            raise
+        except Exception as exc:
+            if not self._metadata_cache_is_fresh():
+                classification = classify_tushare_error(exc)
+                raise TushareProviderError(
+                    f"Tushare stock_basic 预检失败且24小时内无可用缓存: {exc}",
+                    code=classification["code"],
+                    endpoint="stock_basic",
+                ) from exc
+            stock_map = self._load_stock_metadata()
+            stock_dict = self._load_local_stock_names()
+            if len(stock_map) < 3000 or len(stock_dict) < 3000:
+                raise TushareProviderError(
+                    "Tushare stock_basic 本地缓存结构不完整",
+                    code="LOCAL_REPOSITORY_CORRUPT",
+                    endpoint="stock_basic",
+                ) from exc
+            self._preflight_used_stock_cache = True
+            warning = "stock_basic 远程预检失败，使用24小时内本地元数据缓存"
+            warnings.append(warning)
+            checks.append({"id": "stock_basic", "status": "warning", "summary": warning, "rows": len(stock_dict)})
+
+        today = datetime.now().date()
+        calendar_df = self._call_tracked(
+            "trade_cal",
+            self.pro.trade_cal,
+            exchange="",
+            start_date=(today - timedelta(days=20)).strftime("%Y%m%d"),
+            end_date=(today + timedelta(days=2)).strftime("%Y%m%d"),
+            fields="cal_date,is_open",
+        )
+        self._validate_frame(calendar_df, {"cal_date", "is_open"}, endpoint="trade_cal")
+        open_dates = sorted(
+            str(value)
+            for value in calendar_df[calendar_df["is_open"].astype(int) == 1]["cal_date"].tolist()
+            if str(value) <= today.strftime("%Y%m%d")
+        )
+        if not open_dates:
+            raise TushareProviderError("trade_cal 未返回近期已开市日期", code="DATE_MISMATCH", endpoint="trade_cal")
+        checks.append({"id": "trade_cal", "status": "passed", "latest_open_date": open_dates[-1]})
+
+        daily_basic_df = pd.DataFrame()
+        latest_trade_date = None
+        for trade_date in reversed(open_dates[-3:]):
+            daily_basic_df = self._call_daily_basic(
+                trade_date=trade_date,
+                fields="ts_code,trade_date,turnover_rate,total_mv",
+            )
+            if isinstance(daily_basic_df, pd.DataFrame) and not daily_basic_df.empty:
+                latest_trade_date = trade_date
+                break
+        self._validate_frame(
+            daily_basic_df,
+            {"ts_code", "trade_date", "turnover_rate", "total_mv"},
+            endpoint="daily_basic",
+            minimum_rows=3000,
+        )
+        basic_dates = set(daily_basic_df["trade_date"].astype(str))
+        if basic_dates != {str(latest_trade_date)}:
+            raise TushareProviderError(
+                f"daily_basic 交易日期不一致: expected={latest_trade_date}, actual={sorted(basic_dates)[:5]}",
+                code="DATE_MISMATCH",
+                endpoint="daily_basic",
+            )
+        for column in ("turnover_rate", "total_mv"):
+            numeric = pd.to_numeric(daily_basic_df[column], errors="coerce")
+            if numeric.notna().sum() < 3000 or (numeric.dropna() < 0).any():
+                raise TushareProviderError(
+                    f"daily_basic 字段异常: {column}",
+                    code="SCHEMA_MISMATCH",
+                    endpoint="daily_basic",
+                )
+        checks.append({"id": "daily_basic", "status": "passed", "trade_date": latest_trade_date, "rows": len(daily_basic_df)})
+
+        sample_candidates = ["600000", "000001", "300750", "688981"]
+        sample_code = next((code for code in sample_candidates if code in stock_map), sorted(stock_map)[0])
+        sample_ts_code = stock_map[sample_code].get("ts_code") or self._to_ts_code(sample_code)
+        price_df = self._call_pro_bar(
+            ts_code=sample_ts_code,
+            asset="E",
+            freq="D",
+            adj="qfq",
+            adjfactor=True,
+            start_date=(today - timedelta(days=30)).strftime("%Y%m%d"),
+            end_date=today.strftime("%Y%m%d"),
+        )
+        self._validate_frame(
+            price_df,
+            {"trade_date", "open", "high", "low", "close", "vol", "amount", "adj_factor"},
+            endpoint="pro_bar",
+        )
+        price_dates = pd.to_datetime(price_df["trade_date"], errors="coerce")
+        numeric_price = price_df[["open", "high", "low", "close", "vol", "adj_factor"]].apply(pd.to_numeric, errors="coerce")
+        if price_dates.isna().any() or numeric_price.isna().any().any() or (numeric_price["adj_factor"] <= 0).any():
+            raise TushareProviderError(
+                "pro_bar 日期、OHLCV 或 adj_factor 字段异常",
+                code="ADJUSTMENT_ERROR",
+                endpoint="pro_bar",
+            )
+        invalid_ohlc = (numeric_price["high"] < numeric_price[["open", "close", "low"]].max(axis=1)) | (
+            numeric_price["low"] > numeric_price[["open", "close", "high"]].min(axis=1)
+        )
+        if invalid_ohlc.any():
+            raise TushareProviderError("pro_bar OHLC 关系异常", code="SCHEMA_MISMATCH", endpoint="pro_bar")
+        checks.append({"id": "pro_bar", "status": "passed", "stock_code": sample_code, "rows": len(price_df)})
+
+        self._latest_trade_date_cache = latest_trade_date
+        self._latest_trade_date_daily_basic_cache = daily_basic_df.copy()
+        self._preflight_stock_basic_df = stock_basic_df.copy()
+        self._preflight_warnings = list(warnings)
+        self._preflight_result = {
+            "status": "passed_with_warnings" if warnings else "passed",
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "latest_trade_date": latest_trade_date,
+            "checks": checks,
+            "warnings": warnings,
+        }
+        return dict(self._preflight_result)
+
     def get_all_stock_codes(self, max_retries=3):
         """获取所有上市 A 股股票代码"""
         print("正在通过 Tushare 获取A股股票列表...")
 
-        exclude_keywords = ["债", "ETF", "LOF", "基金", "理财", "信托", "B股", "指数", "转债"]
-        code_pattern = re.compile(r"^(00|30|60|68)\d{4}$")
+        if self._preflight_used_stock_cache:
+            local_stocks = self._load_local_stock_names()
+            if local_stocks and self._metadata_cache_is_fresh():
+                print(f"✓ 复用预检确认的24小时内本地缓存: {len(local_stocks)} 只股票")
+                return local_stocks
 
         for attempt in range(max_retries):
             try:
-                df = self._call_with_proxy_fallback(
-                    self.pro.stock_basic,
-                    exchange="",
-                    list_status="L",
-                    fields="ts_code,symbol,name,area,industry,market,exchange,list_date"
+                df = self._preflight_stock_basic_df.copy() if not self._preflight_stock_basic_df.empty else self._fetch_stock_basic_frame()
+                self._validate_frame(
+                    df,
+                    {"ts_code", "symbol", "name", "market", "exchange", "list_date"},
+                    endpoint="stock_basic",
+                    minimum_rows=3000,
                 )
-
-                if df is None or df.empty:
-                    raise DataProviderError("Tushare 返回空股票列表")
-
-                df["symbol"] = df["symbol"].astype(str).str.zfill(6)
-                df = df[df["exchange"].isin(["SSE", "SZSE"])]
-                df = df[df["symbol"].str.match(code_pattern)]
-                for keyword in exclude_keywords:
-                    df = df[~df["name"].str.contains(keyword, na=False)]
-
-                stock_dict = dict(zip(df["symbol"], df["name"]))
-                stock_map = {
-                    row["symbol"]: {
-                        "ts_code": row["ts_code"],
-                        "name": row["name"],
-                        "area": row.get("area", ""),
-                        "industry": row.get("industry", ""),
-                        "exchange": row["exchange"],
-                        "market": row["market"],
-                        "list_date": row["list_date"],
-                    }
-                    for _, row in df.iterrows()
-                }
+                stock_dict, stock_map = self._stock_basic_maps(df)
 
                 self._save_stock_names(stock_dict)
                 self._save_stock_metadata(stock_map)
                 print(f"✓ Tushare 获取成功: {len(stock_dict)} 只A股股票")
                 return stock_dict
+            except TushareProviderError:
+                raise
             except Exception as e:
                 print(f"  Tushare 获取股票列表失败 (第{attempt + 1}/{max_retries}次): {e}")
 
         local_stocks = self._load_local_stock_names()
-        if local_stocks:
-            print(f"✓ 从本地缓存加载: {len(local_stocks)} 只股票")
+        if local_stocks and self._metadata_cache_is_fresh():
+            print(f"✓ 从24小时内本地缓存加载: {len(local_stocks)} 只股票")
             return local_stocks
 
         raise DataProviderError("Tushare 无法获取股票列表，且本地缓存不存在。")
@@ -804,6 +1165,8 @@ class TushareFetcher(BaseDataProvider):
 
             basic_df = self._fetch_daily_basic_range(ts_code, start_str, end_str)
             return self._normalize_history_dataframe(price_df, basic_df)
+        except TushareProviderError:
+            raise
         except Exception as e:
             print(f"  Tushare 获取历史数据失败: {e}")
             return None
@@ -835,6 +1198,8 @@ class TushareFetcher(BaseDataProvider):
             if basic_df is None:
                 basic_df = self._fetch_daily_basic_range(ts_code, start_str, end_str)
             return self._normalize_history_dataframe(price_df, basic_df)
+        except TushareProviderError:
+            raise
         except Exception as e:
             print(f"  Tushare 获取增量数据失败: {e}")
             return None

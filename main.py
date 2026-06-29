@@ -13,6 +13,7 @@ A股量化选股系统 - 主程序
 import sys
 import os
 import argparse
+import json
 import platform
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -37,25 +38,6 @@ from utils.provider_router import activate_provider, active_data_dir, warehouse_
 from utils.selection_worker import build_worker_context, process_selection_chunk, initialize_selection_worker
 from utils.strategy_labels import CATEGORY_DISPLAY_ORDER, category_label, is_invalid_stock_name
 from utils.local_config import load_config_file
-
-
-def prompt_for_provider(default_provider="akshare"):
-    """交互式选择数据源"""
-    default_provider = (default_provider or "akshare").strip().lower()
-    choices = {"1": "akshare", "2": "tushare", "3": "tencent"}
-    reverse_choices = {value: key for key, value in choices.items()}
-    default_choice = reverse_choices.get(default_provider, "1")
-
-    print("\n请选择数据源：")
-    print("  1. akshare")
-    print("  2. tushare")
-    print("  3. tencent")
-
-    while True:
-        choice = input(f"输入 1 / 2 / 3 (默认: {default_choice}): ").strip() or default_choice
-        if choice in choices:
-            return choices[choice]
-        print("请输入 1、2 或 3。")
 
 
 def prompt_yes_no(message, default=True):
@@ -91,17 +73,15 @@ def prompt_for_strategy(available_strategies, default_strategy="all"):
 
 
 def resolve_provider_name(args, config):
-    """解析当前运行使用的数据源"""
-    configured_provider = get_config_value(config, "data_source", "default_provider", default="akshare")
-
-    if args.provider:
-        return args.provider
-
-    is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if is_interactive and args.command in {"init", "select", "run", "web", "calendar"}:
-        return prompt_for_provider(configured_provider)
-
-    return configured_provider
+    """Resolve the requested data provider from CLI args or config."""
+    configured_provider = str(
+        get_config_value(config, "data_source", "default_provider", default="tushare") or "tushare"
+    ).strip().lower()
+    requested = str(args.provider or configured_provider).strip().lower()
+    if requested not in {"tushare", "akshare", "tencent"}:
+        print(f"⚠️ 不支持的数据源 {requested}，本次自动使用 tushare。")
+        return "tushare"
+    return requested
 
 
 def _default_tushare_token(config):
@@ -150,7 +130,7 @@ def resolve_tushare_token(config, interactive_prompt=False):
 class QuantSystem:
     """量化系统主类"""
     
-    def __init__(self, config_file="config/config.yaml", provider_name="akshare", provider_token=None):
+    def __init__(self, config_file="config/config.yaml", provider_name="tushare", provider_token=None):
         self.config = load_config_file(config_file)
         self.data_dir = self.config.get('data_dir', 'data')
         self.csv_manager = CSVManager(active_data_dir(self.data_dir))
@@ -226,6 +206,12 @@ class QuantSystem:
 
     def _sync_target_universe(self, board='all', max_stocks=None, purpose='init'):
         """按目标股票池执行智能续抓"""
+        if self.provider_name == 'tushare':
+            preflight = self.fetcher.run_preflight()
+            print(
+                f"✓ Tushare 预检 {preflight.get('status')} | "
+                f"最新交易日 {preflight.get('latest_trade_date')}"
+            )
         target_universe = self._resolve_target_universe(board=board, max_stocks=max_stocks)
         if not target_universe:
             return []
@@ -1069,9 +1055,9 @@ B1完美图形匹配:
 
     parser.add_argument(
         '--provider',
-        choices=['akshare', 'tushare', 'tencent'],
+        choices=['tushare', 'akshare', 'tencent'],
         default=None,
-        help='指定数据源，不指定时交互式终端会先询问'
+        help='数据源: tushare、akshare 或 tencent；默认读取配置'
     )
 
     parser.add_argument(
@@ -1176,7 +1162,7 @@ B1完美图形匹配:
 
     parser.add_argument(
         '--provider-smoke',
-        choices=['akshare', 'tushare', 'tencent'],
+        choices=['tushare'],
         default=None,
         help='doctor 命令执行小批联网数据源验证'
     )
@@ -1195,6 +1181,19 @@ B1完美图形匹配:
         help='doctor --full-local 超时时间（秒）'
     )
 
+    parser.add_argument(
+        '--update-report',
+        default=None,
+        help='doctor 数据更新自检使用：latest、错误ID或 logs/errors 内的安全路径'
+    )
+
+    parser.add_argument(
+        '--diagnostic-mode',
+        choices=['standard', 'extended'],
+        default=None,
+        help='doctor 数据更新自检模式：standard 或 extended'
+    )
+
     args = parser.parse_args()
 
     # 处理 --version 参数
@@ -1206,7 +1205,7 @@ B1完美图形匹配:
     if not args.command:
         parser.print_help()
         sys.exit(1)
-    
+
     # 切换工作目录
     os.chdir(project_root)
 
@@ -1226,6 +1225,24 @@ B1完美图形匹配:
     # 执行命令
     try:
         if args.command == 'doctor':
+            if args.update_report:
+                from utils.update_diagnostics import run_update_diagnostics
+                try:
+                    diagnostic = run_update_diagnostics(
+                        args.update_report,
+                        mode=args.diagnostic_mode or 'standard',
+                        project_root=project_root,
+                        config_path=args.config,
+                        trigger='cli',
+                    )
+                except (ValueError, FileNotFoundError) as exc:
+                    print(f'✗ 数据更新自检无法启动: {exc}')
+                    sys.exit(1)
+                print(json.dumps(diagnostic, ensure_ascii=False, indent=2, default=str))
+                sys.exit(0 if diagnostic.get('status') in {'passed', 'warning'} else 2)
+            if args.diagnostic_mode:
+                print('✗ --diagnostic-mode 必须与 --update-report 一起使用')
+                sys.exit(1)
             from utils.doctor import run_doctor
             return_code = run_doctor(
                 project_root=project_root,

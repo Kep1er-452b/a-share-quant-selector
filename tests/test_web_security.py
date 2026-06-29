@@ -162,7 +162,7 @@ def test_provider_activate_rejects_empty_provider(monkeypatch, tmp_path):
     assert "本地数据仓为空" in response.get_json()["error"]
 
 
-def test_provider_activate_switches_and_reports_stale_warnings(monkeypatch, tmp_path):
+def test_provider_activate_allows_akshare_and_tencent_when_warehouse_exists(monkeypatch, tmp_path):
     monkeypatch.setattr(web_server, "_data_root_dir", lambda: tmp_path)
     monkeypatch.setattr(web_server, "_find_running_update_job", lambda: None)
     monkeypatch.setattr(web_server, "_find_running_job", lambda: None)
@@ -183,14 +183,19 @@ def test_provider_activate_switches_and_reports_stale_warnings(monkeypatch, tmp_
     )
     client = web_server.app.test_client()
 
+    response = client.post("/api/provider/activate", json={"provider": "akshare"}, headers=_headers())
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["success"] is True
+    assert payload["data"]["active_provider"]["active_provider"] == "akshare"
+
     response = client.post("/api/provider/activate", json={"provider": "tencent"}, headers=_headers())
 
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["success"] is True
     assert payload["data"]["active_provider"]["active_provider"] == "tencent"
-    assert any("落后于本地最新" in warning for warning in payload["data"]["warnings"])
-    assert any("覆盖率" in warning for warning in payload["data"]["warnings"])
 
 
 def test_write_endpoints_validate_payload_shape_and_lengths():

@@ -491,6 +491,13 @@ class AKShareFetcher(BaseDataProvider):
     def get_market_caps(self, stock_codes):
         """批量获取最新市值数据"""
         market_cap_map = {}
+        stock_codes = [str(code).zfill(6) for code in (stock_codes or [])]
+
+        if stock_codes and len(stock_codes) <= 50:
+            market_cap_map = self._fetch_market_cap_tencent(stock_codes)
+            if market_cap_map:
+                self._note_runtime_stat('small_batch_tencent_market_cap_success')
+                return market_cap_map
 
         try:
             spot_df = ak.stock_zh_a_spot_em()

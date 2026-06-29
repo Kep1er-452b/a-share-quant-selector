@@ -2578,6 +2578,18 @@ body.heatmap-focus-active #heatmap-chart {
     display: flex;
 }
 
+.update-diagnostic-actions {
+    display: none;
+    gap: 8px;
+    padding: 8px;
+    border: 1px solid var(--accent);
+    background: var(--bg-input);
+}
+
+.update-diagnostic-actions.active {
+    display: grid;
+}
+
 .update-stop-note {
     color: var(--dim);
     font-size: 10px;

@@ -77,6 +77,26 @@ def test_normalize_akshare_history_does_not_fetch_per_stock_market_cap(monkeypat
     assert set(frame["data_source"]) == {"akshare:stock_zh_a_hist"}
 
 
+def test_akshare_small_batch_market_caps_use_tencent_first(monkeypatch, tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    seen = []
+
+    monkeypatch.setattr(
+        akshare_fetcher.ak,
+        "stock_zh_a_spot_em",
+        lambda: pytest.fail("small batches should not fetch full-market AkShare spot data first"),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_market_cap_tencent",
+        lambda codes: seen.extend(codes) or {"000001": 123456789},
+    )
+
+    assert fetcher.get_market_caps(["1"]) == {"000001": 123456789}
+    assert seen == ["000001"]
+    assert fetcher.get_runtime_stats()["small_batch_tencent_market_cap_success"] == 1
+
+
 def test_fetch_update_falls_back_to_tencent_when_akshare_fails(monkeypatch, tmp_path):
     fetcher = AKShareFetcher(data_dir=str(tmp_path))
 
@@ -422,3 +442,22 @@ def test_sync_batch_propagates_data_provider_error(monkeypatch, tmp_path):
                 "failed": 0,
             },
         )
+
+
+def test_tencent_limited_target_universe_uses_bounded_bootstrap(monkeypatch, tmp_path):
+    fetcher = TencentFetcher(data_dir=str(tmp_path))
+
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_stock_list_http",
+        lambda: pytest.fail("limited Tencent updates should not scan the full code space"),
+    )
+
+    universe = fetcher.get_target_universe(board="main", max_stocks=1)
+
+    assert universe == [{
+        "code": "000001",
+        "name": "平安银行",
+        "board": "main",
+        "market": None,
+    }]
