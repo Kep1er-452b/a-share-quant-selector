@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `72cb7c42897c4089ac319e79a031d626ea96cc64`
-  (`Fix Tushare extension display and update defaults`, 2026-07-01).
+  `a4a4b70e43b3828dfe36bb0ef1e06df0ab7db472`
+  (`Add adjustable stock chart range controls`, 2026-07-01).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -281,7 +281,7 @@ The latest comprehensive verification on branch
 `codex/tushare-comprehensive-upgrade` passed:
 
 ```text
-142 passed
+145 passed
 ```
 
 Useful runtime checks:
@@ -320,7 +320,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `72cb7c4` on branch
+Baseline commit: `a4a4b70` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
@@ -349,6 +349,13 @@ State at handoff:
   partial extension price syncs no longer mix incomplete adjusted candles into
   the chart. A 000001 spot check showed 2026-04-24 and 2026-04-27 have the same
   `adj_factor`, so the visible gap there is not an adjustment-factor jump.
+- Stock and index detail charts support an adjustable visible range stored in
+  `localStorage` under `quantStockChartLimit`. UI options are 260, 520, 1000,
+  and all available rows up to the server cap. The stock detail API and
+  `/api/index-detail/<symbol>` accept `limit`, return `limit`, `total_bars`,
+  and `max_limit`, and clamp requests to avoid rendering runaway chart payloads.
+- The F1 compact index chart reserves a wider right grid margin so right-side
+  y-axis labels are not clipped by the chart border or adjacent layout.
 - F1 index cache warm-up runs at Web startup and should remain index-only.
   Do not add full-market stock/finance sync to the startup path.
 - The stock detail modal now uses a chart-left/info-right layout. It removes
@@ -533,6 +540,10 @@ the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `a4a4b70` (2026-07-01): added adjustable stock/index detail chart ranges
+  with `limit=260|520|1000|all`, persisted the range in `localStorage`, raised
+  the default daily preview to 260 bars, and widened the F1 index chart's right
+  grid margin to keep y-axis labels visible.
 - `72cb7c4` (2026-07-01): made Tushare extension price/financial backfills
   explicit opt-in, normalized Market Pulse money metrics to 亿元 with missing
   data shown empty, guarded adjusted-candle overlays against partial coverage,
