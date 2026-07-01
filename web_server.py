@@ -70,6 +70,14 @@ from utils.stock_exporter import (
     resolve_stock_query,
     search_stocks,
 )
+from utils.tushare_ext_store import TushareExtStore
+from utils.tushare_ext_sync import DEFAULT_INDEX_SYMBOLS, TushareExtSync
+from utils.tushare_ext_views import (
+    build_adjusted_candles,
+    build_index_kline_payload,
+    build_market_trading_summary,
+    build_stock_extension_payload,
+)
 from wyckoff_ai import WyckoffPipeline, has_deepseek_config
 from wyckoff_ai.naming import stock_output_folder_name
 from wyckoff_ai.pipeline import WyckoffPipelineError
@@ -146,6 +154,48 @@ def _active_provider_name():
 
 def _active_csv_manager():
     return CSVManager(_active_data_dir())
+
+
+def _tushare_provider_data_dir(data_root=None):
+    return provider_data_dir(Path(data_root or _data_root_dir()), 'tushare')
+
+
+def _tushare_ext_store(data_root=None):
+    return TushareExtStore(_tushare_provider_data_dir(data_root) / 'extended')
+
+
+def _ensure_tushare_index_cache(store=None, symbols=None):
+    """Best-effort startup/API index cache refresh; never crashes cached views."""
+
+    store = store or _tushare_ext_store()
+    symbols = tuple(symbols or DEFAULT_INDEX_SYMBOLS)
+    try:
+        config = _load_config()
+        provider = create_data_provider(
+            provider_name='tushare',
+            data_dir=str(_data_root_dir()),
+            config=config,
+        )
+        sync = TushareExtSync(store, provider.pro)
+        return sync.ensure_index_cache(symbols=symbols)
+    except Exception as exc:
+        warning = f'Tushare 指数缓存刷新失败: {exc}'
+        _append_system_log(
+            'tushare_index_cache_warning',
+            warning,
+            {'symbols': list(symbols)},
+        )
+        for symbol in symbols:
+            try:
+                store.set_sync_state(
+                    'index_daily',
+                    scope=symbol,
+                    status='warning',
+                    warning=warning,
+                )
+            except Exception:
+                pass
+        return {'status': 'warning', 'warning': warning}
 
 
 def _index_kline_cache_path(data_dir='data'):
@@ -1499,6 +1549,92 @@ def _refresh_market_caches_for_job(job_id, data_dir):
     _update_update_job(job_id, cache_refresh=cache_result.get('errors') or {})
 
 
+def _refresh_tushare_extension_data_for_job(
+    job_id,
+    provider,
+    target_universe,
+    latest_trade_date,
+    *,
+    financial_datasets=None,
+    trading_datasets=None,
+):
+    """Run optional Tushare extension stages after the core CSV sync succeeds."""
+
+    store = _tushare_ext_store()
+    sync = TushareExtSync(store, provider.pro, pro_bar=getattr(getattr(provider, 'ts', None), 'pro_bar', None))
+    latest_text = pd.to_datetime(latest_trade_date).strftime('%Y%m%d')
+    results = {}
+    warnings = []
+
+    def progress_callback(payload):
+        dataset = payload.get('dataset') or 'extension'
+        status = payload.get('status') or 'running'
+        _update_update_job(
+            job_id,
+            current_step=f'Tushare 扩展数据: {dataset}',
+            progress_pct=99,
+        )
+        if status == 'warning':
+            _append_update_job_log(job_id, payload.get('warning') or f'{dataset} 同步存在权限/数据警告')
+
+    def run_stage(name, func):
+        try:
+            _append_update_job_log(job_id, f'开始同步 Tushare 扩展数据: {name}。')
+            stage_result = func()
+            results[name] = stage_result
+            _append_update_job_log(job_id, f'Tushare 扩展数据 {name} 同步完成。')
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            warning = f'Tushare 扩展数据 {name} 同步失败，已保留主行情更新结果: {exc}'
+            warnings.append(warning)
+            results[name] = {'status': 'warning', 'warning': warning}
+            _append_update_job_log(job_id, warning)
+            _append_system_log(
+                'tushare_extension_stage_warning',
+                warning,
+                {'job_id': job_id, 'stage': name},
+            )
+
+    run_stage('basics', lambda: sync.sync_basics(progress_callback=progress_callback))
+    run_stage('index', lambda: sync.ensure_index_cache(progress_callback=progress_callback))
+    price_start = (pd.to_datetime(latest_text) - pd.DateOffset(years=6)).strftime('%Y%m%d')
+    run_stage(
+        'prices',
+        lambda: sync.sync_price_tracks(
+            target_universe,
+            start_date=price_start,
+            end_date=latest_text,
+            progress_callback=progress_callback,
+            halt_checker=_is_halted,
+        ),
+    )
+    run_stage('valuation', lambda: sync.sync_valuation_snapshot([latest_text], progress_callback=progress_callback))
+    run_stage(
+        'trading',
+        lambda: sync.sync_trading_snapshot(
+            [latest_text],
+            datasets=trading_datasets,
+            progress_callback=progress_callback,
+        ),
+    )
+    run_stage(
+        'financial',
+        lambda: sync.sync_financials_for_universe(
+            target_universe,
+            end_date=latest_text,
+            datasets=financial_datasets,
+            progress_callback=progress_callback,
+            halt_checker=_is_halted,
+        ),
+    )
+
+    status = 'completed_with_warnings' if warnings or store.list_warnings() else 'completed'
+    summary = {'status': status, 'datasets': results, 'warnings': warnings + store.list_warnings()}
+    _update_update_job(job_id, tushare_extension=summary)
+    return summary
+
+
 def _provider_update_coverage(summary):
     try:
         return float(summary.get('coverage_ratio') or 0)
@@ -1778,6 +1914,15 @@ def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
             _refresh_market_caches_for_job(job_id, provider_dir)
             ensure_update_continues()
             provider_state = warehouse_summary(data_dir, provider_name)
+        if provider_name == 'tushare':
+            ensure_update_continues()
+            _refresh_tushare_extension_data_for_job(
+                job_id,
+                provider,
+                target_universe,
+                provider_state.get('latest_trade_date') or datetime.now().strftime('%Y-%m-%d'),
+            )
+            ensure_update_continues()
         switch_allowed = (
             provider_state.get('stock_count', 0) > 0
             and (provider_state.get('coverage_ratio') or 0) >= 0.98
@@ -1905,6 +2050,28 @@ def _warm_market_caches_background():
         print("✓ 市场云图缓存已就绪")
     except Exception as exc:
         print(f"⚠️ 市场云图缓存预热失败: {exc}")
+
+
+def _warm_tushare_index_cache_background():
+    try:
+        store = _tushare_ext_store()
+        result = _ensure_tushare_index_cache(store=store)
+        if result.get('status') == 'warning':
+            print(f"⚠️ Tushare 指数缓存预热降级: {result.get('warning')}")
+        else:
+            print("✓ Tushare 指数缓存已就绪")
+    except Exception as exc:
+        _append_system_log(
+            'tushare_index_cache_warm_error',
+            f'Tushare 指数缓存预热失败: {exc}',
+            {},
+        )
+        print(f"⚠️ Tushare 指数缓存预热失败: {exc}")
+
+
+@app.route('/favicon.ico')
+def favicon():
+    return Response(status=204)
 
 
 @app.route('/')
@@ -2108,6 +2275,8 @@ def get_stock_detail(code):
             'period': period,
             'period_label': STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['label'],
             'data': data,
+            'adjusted_data': build_adjusted_candles(_tushare_ext_store(), code, limit=limit),
+            **build_stock_extension_payload(_tushare_ext_store(), code),
         })
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -2635,6 +2804,10 @@ def get_dashboard_pulse():
                 'industry_groups': industry_groups,
                 'header_indices': payload.get('header_indices', []),
                 'cache_health': health,
+                'market_trading': build_market_trading_summary(
+                    _tushare_ext_store(),
+                    payload.get('latest_date') or datetime.now().strftime('%Y-%m-%d'),
+                ),
                 'active_provider': load_active_provider(data_root),
                 'provider_statuses': list_provider_statuses(data_root),
             }
@@ -3050,21 +3223,34 @@ def get_stats():
 def get_index_kline():
     """获取首页指数日K线。"""
     try:
-        data_dir = str(_active_data_dir())
         symbol = _normalize_csv_value(request.args.get('symbol')) or 'sh000001'
         if symbol not in INDEX_KLINE_TARGETS:
             symbol = 'sh000001'
-        limit = int(request.args.get('limit', 30))
-        limit = min(max(limit, 10), 60)
-        try:
-            payload = _fetch_index_kline(symbol, data_dir=data_dir, limit=limit)
-        except Exception as exc:
-            cache = _load_index_kline_cache(data_dir)
-            cached_payload = cache.get(symbol)
-            if cached_payload:
-                payload = {**cached_payload, 'from_cache': True, 'stale': True, 'warning': str(exc)}
-            else:
-                raise
+        months = int(request.args.get('months', 3))
+        store = _tushare_ext_store()
+        cache_result = _ensure_tushare_index_cache(store=store)
+        payload = build_index_kline_payload(store, symbol, months=months)
+        if cache_result.get('warning'):
+            payload['warning'] = cache_result['warning']
+        if not payload.get('candles') and cache_result.get('warning'):
+            return jsonify({'success': False, 'error': cache_result['warning']}), 503
+        return jsonify({'success': True, 'data': payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/index-detail/<symbol>')
+def get_index_detail(symbol):
+    """获取指数详情图表数据。"""
+    try:
+        period = _normalize_csv_value(request.args.get('period')) or 'daily'
+        if period not in {'daily', 'weekly', 'monthly'}:
+            period = 'daily'
+        store = _tushare_ext_store()
+        cache_result = _ensure_tushare_index_cache(store=store, symbols=DEFAULT_INDEX_SYMBOLS)
+        payload = build_index_kline_payload(store, symbol, months=6, period=period)
+        if cache_result.get('warning'):
+            payload['warning'] = cache_result['warning']
         return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -3744,6 +3930,7 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"🌐 启动Web服务器: http://{display_host}:{port}")
     Thread(target=_warm_market_caches_background, daemon=True).start()
+    Thread(target=_warm_tushare_index_cache_background, daemon=True).start()
     app.run(host=host, port=port, debug=debug, threaded=True)
 
 
