@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `a4a4b70e43b3828dfe36bb0ef1e06df0ab7db472`
-  (`Add adjustable stock chart range controls`, 2026-07-01).
+  `7867558298d6a1d20c40d6d40a95a5e2c5462809`
+  (`Add stock sequence toggle and refresh industry cache gaps`, 2026-07-01).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -281,7 +281,7 @@ The latest comprehensive verification on branch
 `codex/tushare-comprehensive-upgrade` passed:
 
 ```text
-145 passed
+146 passed
 ```
 
 Useful runtime checks:
@@ -320,7 +320,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `a4a4b70` on branch
+Baseline commit: `7867558` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
@@ -354,6 +354,16 @@ State at handoff:
   and all available rows up to the server cap. The stock detail API and
   `/api/index-detail/<symbol>` accept `limit`, return `limit`, `total_bars`,
   and `max_limit`, and clamp requests to avoid rendering runaway chart payloads.
+- Stock detail charts have a compact `13` toggle stored in `localStorage` under
+  `quantShowSequenceMarkers`. It hides only the Tongdaxin-style thirteen-turn
+  sequence number scatter labels (`UP_SEQ`/`DOWN_SEQ`) and keeps violent-K
+  stars, moving averages, KDJ, and MACD visible. The toggle re-renders from the
+  in-memory chart payload instead of refetching long chart ranges.
+- Tushare industry-cache rebuilds now merge local `tushare_stock_map.json`
+  industry values before taking the high-coverage previous-cache fast path, so
+  newly listed stocks with local metadata do not remain in the `未分类` bucket.
+  The local active Tushare cache was refreshed after this change: 5,206 mapped,
+  0 unmapped, and 16 heatmap payloads regenerated.
 - The F1 compact index chart reserves a wider right grid margin so right-side
   y-axis labels are not clipped by the chart border or adjacent layout.
 - F1 index cache warm-up runs at Web startup and should remain index-only.
@@ -540,6 +550,9 @@ the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `7867558` (2026-07-01): added a stock-detail thirteen-turn marker visibility
+  toggle and fixed Tushare industry-cache reuse so recent stock metadata can
+  fill `未分类` gaps before rebuilding heatmap payloads.
 - `a4a4b70` (2026-07-01): added adjustable stock/index detail chart ranges
   with `limit=260|520|1000|all`, persisted the range in `localStorage`, raised
   the default daily preview to 260 bars, and widened the F1 index chart's right
