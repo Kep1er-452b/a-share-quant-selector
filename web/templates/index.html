@@ -129,7 +129,7 @@
                             <div class="quote-block">
                                 <div class="quote-label">A-SHARE UNIVERSE</div>
                                 <div class="quote-symbol">ALL BOARDS</div>
-                                <div class="quote-price positive" id="stat-stocks">--</div>
+                                <div class="quote-price universe-count" id="stat-stocks">--</div>
                                 <div class="quote-change" id="hero-universe">ALL BOARDS</div>
                             </div>
                             <div class="quote-chart-shell">
@@ -139,6 +139,13 @@
                                         <button class="index-switch-btn" data-symbol="sz399006" type="button">创业板</button>
                                         <button class="index-switch-btn" data-symbol="sh000688" type="button">科创</button>
                                         <button class="index-switch-btn" data-symbol="sz399001" type="button">深成指</button>
+                                    </div>
+                                    <div class="index-range-control">
+                                        <input id="dashboard-index-months" type="range" min="3" max="6" step="1" value="3" aria-label="指数显示月份">
+                                        <span id="dashboard-index-months-label">3M</span>
+                                        <button class="icon-btn" id="dashboard-index-detail-btn" type="button" aria-label="查看指数详细信息" title="查看指数详细信息">
+                                            <span aria-hidden="true">▣</span>
+                                        </button>
                                     </div>
                                     <span class="quote-chart-meta" id="dashboard-index-meta">D1 / 30T</span>
                                 </div>
@@ -765,8 +772,27 @@
                 <button class="stock-period-btn" data-period="weekly" type="button">周K</button>
                 <button class="stock-period-btn" data-period="monthly" type="button">月K</button>
             </div>
-            <div id="stock-chart"></div>
-            <div id="stock-info"></div>
+            <div class="stock-detail-layout">
+                <div class="stock-chart-column">
+                    <div class="stock-indicator-toolbar" id="stock-indicator-toolbar">
+                        <div class="indicator-editor">
+                            <span class="indicator-editor-label">MA</span>
+                            <input class="indicator-input" id="stock-ma-window" type="number" min="2" max="300" value="50" aria-label="均线周期">
+                            <input class="indicator-color" id="stock-ma-color" type="color" value="#ffd700" aria-label="均线颜色">
+                            <button class="icon-btn" id="stock-ma-add-btn" type="button" aria-label="添加均线" title="添加均线">+</button>
+                            <div class="indicator-chip-list" id="stock-ma-list"></div>
+                        </div>
+                        <div class="indicator-editor macd-editor">
+                            <span class="indicator-editor-label">MACD</span>
+                            <input class="indicator-input" id="stock-macd-fast" type="number" min="2" max="60" value="12" aria-label="MACD快线">
+                            <input class="indicator-input" id="stock-macd-slow" type="number" min="3" max="120" value="26" aria-label="MACD慢线">
+                            <input class="indicator-input" id="stock-macd-signal" type="number" min="2" max="60" value="9" aria-label="MACD信号线">
+                        </div>
+                    </div>
+                    <div id="stock-chart"></div>
+                </div>
+                <aside id="stock-info"></aside>
+            </div>
         </div>
     </div>
 </div>

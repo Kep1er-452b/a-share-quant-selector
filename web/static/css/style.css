@@ -477,6 +477,10 @@ select {
     line-height: 1.1;
 }
 
+.quote-price.universe-count {
+    color: #a855f7;
+}
+
 .quote-price.negative {
     color: var(--down);
 }
@@ -525,6 +529,42 @@ select {
     border-color: var(--accent);
     background: var(--accent);
     color: var(--bg-void);
+}
+
+.index-range-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--dim);
+    font-size: 9px;
+    white-space: nowrap;
+}
+
+.index-range-control input[type="range"] {
+    width: 72px;
+    accent-color: #a855f7;
+}
+
+.icon-btn {
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--verydim);
+    background: var(--bg-panel);
+    color: var(--neutral);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.icon-btn:hover,
+.icon-btn:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+    outline: 0;
 }
 
 .quote-chart-meta {
@@ -923,6 +963,16 @@ button.pulse-detail-card {
 .pulse-index-list {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.pulse-trading-grid {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    border-top: 1px solid var(--bg-raised);
+}
+
+.pulse-trading-card {
+    min-width: 0;
 }
 
 .pulse-coverage-date {
@@ -2488,9 +2538,148 @@ body.heatmap-focus-active #heatmap-chart {
 
 #stock-chart {
     width: 100%;
-    height: 520px;
+    height: 620px;
     background: var(--bg-input);
     border: 1px solid var(--verydim);
+}
+
+.stock-detail-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 330px;
+    gap: 8px;
+    min-height: 0;
+}
+
+.stock-chart-column {
+    min-width: 0;
+    display: grid;
+    gap: 6px;
+}
+
+.stock-indicator-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px;
+    border: 1px solid var(--verydim);
+    background: var(--bg-input);
+}
+
+.indicator-editor {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+}
+
+.indicator-editor-label {
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.indicator-input {
+    width: 48px;
+    height: 22px;
+    border: 1px solid var(--verydim);
+    background: var(--bg-panel);
+    color: var(--white);
+    font-family: inherit;
+    font-size: 10px;
+    text-align: center;
+}
+
+.indicator-color {
+    width: 24px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--verydim);
+    background: var(--bg-panel);
+}
+
+.indicator-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+}
+
+.indicator-chip {
+    min-height: 20px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 5px;
+    border: 1px solid var(--verydim);
+    color: var(--white);
+    font-size: 9px;
+}
+
+.indicator-chip-color {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.indicator-chip button {
+    width: 14px;
+    height: 14px;
+    border: 0;
+    background: transparent;
+    color: var(--dim);
+    cursor: pointer;
+}
+
+#stock-info {
+    min-width: 0;
+    max-height: 650px;
+    overflow-y: auto;
+    display: grid;
+    align-content: start;
+    gap: 8px;
+}
+
+.stock-info-panel {
+    border: 1px solid var(--verydim);
+    background: var(--bg-input);
+}
+
+.stock-info-title {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--verydim);
+    color: var(--dim);
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.stock-info-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.stock-info-item {
+    min-width: 0;
+    padding: 7px 8px;
+    border-right: 1px solid var(--bg-raised);
+    border-bottom: 1px solid var(--bg-raised);
+}
+
+.stock-info-item:nth-child(2n) {
+    border-right: 0;
+}
+
+.stock-info-label {
+    color: var(--dim);
+    font-size: 9px;
+}
+
+.stock-info-value {
+    margin-top: 3px;
+    color: var(--white);
+    font-size: 12px;
+    font-weight: 700;
+    overflow-wrap: anywhere;
 }
 
 .industry-modal-subtitle,
