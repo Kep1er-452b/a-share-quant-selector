@@ -21,6 +21,7 @@ const STOCK_PERIOD_LABELS = {
     weekly: '周K',
     monthly: '月K',
 };
+const STOCK_CHART_LIMIT_OPTIONS = ['260', '520', '1000', 'all'];
 const STOCKS_PAGE_SIZE = 6000;
 
 function loadJsonSetting(key, fallback) {
@@ -38,6 +39,11 @@ function saveJsonSetting(key, value) {
     } catch (error) {
         console.warn('localStorage write failed:', error);
     }
+}
+
+function normalizeStockChartLimit(value) {
+    const text = String(value ?? '').trim().toLowerCase();
+    return STOCK_CHART_LIMIT_OPTIONS.includes(text) ? text : '260';
 }
 
 const state = {
@@ -104,6 +110,7 @@ const state = {
     globalTickerText: '',
     currentStockDetail: null,
     currentStockPeriod: 'daily',
+    currentStockLimit: normalizeStockChartLimit(loadJsonSetting('quantStockChartLimit', '260')),
     pendingExportStock: null,
     watchlistLoaded: false,
     watchlistCache: [],
@@ -1382,7 +1389,7 @@ async function openDashboardIndexDetail(period = 'daily') {
     const symbol = state.currentIndexSymbol || 'sh000001';
     const resolvedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
     try {
-        const result = await apiFetch(`/api/index-detail/${encodeURIComponent(symbol)}?period=${encodeURIComponent(resolvedPeriod)}`);
+        const result = await apiFetch(`/api/index-detail/${encodeURIComponent(symbol)}?period=${encodeURIComponent(resolvedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}`);
         if (!result.success) {
             throw new Error(result.error || '指数详情加载失败');
         }
@@ -1394,6 +1401,7 @@ async function openDashboardIndexDetail(period = 'daily') {
             code: symbol,
             name: payload.name || symbol,
             period: resolvedPeriod,
+            limit: state.currentStockLimit,
         };
         document.getElementById('modal-title').textContent = `${payload.name || symbol} · ${STOCK_PERIOD_LABELS[resolvedPeriod] || '日K'}`;
         document.getElementById('stock-export-btn').disabled = true;
@@ -1488,7 +1496,7 @@ function renderDashboardIndexKline(payload) {
         },
         grid: {
             left: 44,
-            right: 12,
+            right: 48,
             top: 28,
             bottom: 26,
         },
@@ -2084,6 +2092,9 @@ function renderStockPeriodControls() {
     document.querySelectorAll('.stock-period-btn[data-period]').forEach(button => {
         button.classList.toggle('active', button.dataset.period === state.currentStockPeriod);
     });
+    document.querySelectorAll('.stock-range-btn[data-limit]').forEach(button => {
+        button.classList.toggle('active', button.dataset.limit === state.currentStockLimit);
+    });
 }
 
 function normalizeMaSettings(settings) {
@@ -2132,6 +2143,10 @@ function syncIndicatorControls() {
 function refreshCurrentStockChart() {
     const detail = state.currentStockDetail;
     if (detail && detail.code) {
+        if (detail.type === 'index') {
+            openDashboardIndexDetail(detail.period || state.currentStockPeriod);
+            return;
+        }
         viewStockDetail(detail.code, detail.name, detail.period || state.currentStockPeriod);
     }
 }
@@ -2220,7 +2235,8 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
 
     const normalizedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
     state.currentStockPeriod = normalizedPeriod;
-    state.currentStockDetail = { code, name: name || '', period: normalizedPeriod };
+    state.currentStockLimit = normalizeStockChartLimit(state.currentStockLimit);
+    state.currentStockDetail = { code, name: name || '', period: normalizedPeriod, limit: state.currentStockLimit };
     document.getElementById('modal-title').textContent = `${formatStockTitle(code, name)} · ${STOCK_PERIOD_LABELS[normalizedPeriod]}`;
     document.getElementById('stock-export-btn').disabled = false;
     setStockExportStatus('');
@@ -2230,14 +2246,14 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
     document.getElementById('stock-modal').classList.add('active');
 
     try {
-        const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}`);
+        const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}`);
         if (!result.success) {
             throw new Error(result.error || '个股详情加载失败');
         }
         const resolvedName = result.name || name || findCachedStock(code)?.name || '';
         const resolvedPeriod = result.period || normalizedPeriod;
         state.currentStockPeriod = resolvedPeriod;
-        state.currentStockDetail = { code: result.code || code, name: resolvedName, period: resolvedPeriod };
+        state.currentStockDetail = { code: result.code || code, name: resolvedName, period: resolvedPeriod, limit: state.currentStockLimit };
         document.getElementById('modal-title').textContent = `${formatStockTitle(result.code || code, resolvedName)} · ${result.period_label || STOCK_PERIOD_LABELS[resolvedPeriod] || '日K'}`;
         renderStockPeriodControls();
         syncIndicatorControls();
@@ -5563,6 +5579,14 @@ function bindEvents() {
     });
     document.getElementById('modal-close-btn').addEventListener('click', closeModal);
     document.getElementById('stock-period-toolbar').addEventListener('click', event => {
+        const rangeButton = event.target.closest('[data-limit]');
+        if (rangeButton && state.currentStockDetail) {
+            state.currentStockLimit = normalizeStockChartLimit(rangeButton.dataset.limit);
+            saveJsonSetting('quantStockChartLimit', state.currentStockLimit);
+            renderStockPeriodControls();
+            refreshCurrentStockChart();
+            return;
+        }
         const button = event.target.closest('[data-period]');
         if (!button || !state.currentStockDetail) {
             return;

@@ -12,6 +12,8 @@ def test_dashboard_index_controls_and_stock_layout_markup_exist():
     assert 'aria-label="查看指数详细信息"' in html
     assert 'class="stock-detail-layout"' in html
     assert 'id="stock-indicator-toolbar"' in html
+    assert 'id="stock-range-toolbar"' in html
+    assert 'data-limit="all"' in html
 
 
 def test_frontend_uses_adjusted_data_indicator_settings_and_chinese_tooltips():
@@ -29,6 +31,9 @@ def test_frontend_uses_adjusted_data_indicator_settings_and_chinese_tooltips():
     assert "MACD" in js
     assert "涨跌幅" in js
     assert "formatTooltipChangePct" in js
+    assert "quantStockChartLimit" in js
+    assert "limit=${encodeURIComponent(state.currentStockLimit)}" in js
+    assert "right: 48" in js
 
 
 def test_stock_info_panels_keep_empty_extension_sections_visible():

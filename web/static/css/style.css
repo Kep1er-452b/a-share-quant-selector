@@ -2477,14 +2477,17 @@ body.heatmap-focus-active #heatmap-chart {
 
 .stock-period-toolbar {
     display: flex;
+    align-items: center;
     gap: 1px;
-    width: max-content;
+    width: fit-content;
+    max-width: 100%;
     margin: 8px 0;
     border: 1px solid var(--grid-line);
     background: var(--grid-line);
 }
 
-.stock-period-btn {
+.stock-period-btn,
+.stock-range-btn {
     min-width: 44px;
     min-height: 26px;
     padding: 0 10px;
@@ -2495,8 +2498,34 @@ body.heatmap-focus-active #heatmap-chart {
     font-weight: 800;
 }
 
+.stock-range-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    margin-left: 7px;
+}
+
+.stock-range-label {
+    min-height: 26px;
+    padding: 7px 7px 0;
+    background: var(--bg-raised);
+    color: var(--text-dim);
+    font-size: 10px;
+    font-weight: 800;
+}
+
+.stock-range-btn {
+    min-width: 40px;
+}
+
+.stock-range-btn[data-limit="1000"] {
+    min-width: 50px;
+}
+
 .stock-period-btn:hover,
-.stock-period-btn.active {
+.stock-period-btn.active,
+.stock-range-btn:hover,
+.stock-range-btn.active {
     background: var(--accent);
     color: var(--bg-void);
 }

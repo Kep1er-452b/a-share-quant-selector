@@ -2239,10 +2239,24 @@ def search_stock_api():
 
 
 STOCK_PERIODS = {
-    'daily': {'label': '日K', 'freq': None, 'limit': 160},
-    'weekly': {'label': '周K', 'freq': 'W-FRI', 'limit': 160},
-    'monthly': {'label': '月K', 'freq': 'ME', 'limit': 120},
+    'daily': {'label': '日K', 'freq': None, 'limit': 260},
+    'weekly': {'label': '周K', 'freq': 'W-FRI', 'limit': 260},
+    'monthly': {'label': '月K', 'freq': 'ME', 'limit': 260},
 }
+STOCK_DETAIL_MAX_LIMIT = 2500
+
+
+def _parse_chart_limit(value, *, default=260, total_bars=None, max_limit=STOCK_DETAIL_MAX_LIMIT):
+    text = str(value or '').strip().lower()
+    if text == 'all':
+        if total_bars is None:
+            return int(max_limit)
+        return min(max(int(total_bars), 1), int(max_limit))
+    try:
+        parsed = int(text) if text else int(default)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return min(max(parsed, 1), int(max_limit))
 
 
 def _resample_stock_period(df, period):
@@ -2310,7 +2324,13 @@ def get_stock_detail(code):
         
         # 转换为列表格式
         data = []
-        limit = STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['limit']
+        total_bars = len(df)
+        default_limit = STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['limit']
+        limit = _parse_chart_limit(
+            request.args.get('limit'),
+            default=default_limit,
+            total_bars=total_bars,
+        )
         for i, (_, row) in enumerate(df.head(limit).iterrows()):
             data.append({
                 'date': row['date'].strftime('%Y-%m-%d'),
@@ -2342,6 +2362,9 @@ def get_stock_detail(code):
             'name': stock_name,
             'period': period,
             'period_label': STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['label'],
+            'limit': limit,
+            'total_bars': total_bars,
+            'max_limit': STOCK_DETAIL_MAX_LIMIT,
             'data': data,
             'adjusted_data': build_adjusted_candles(
                 _tushare_ext_store(),
@@ -3326,9 +3349,17 @@ def get_index_detail(symbol):
         period = _normalize_csv_value(request.args.get('period')) or 'daily'
         if period not in {'daily', 'weekly', 'monthly'}:
             period = 'daily'
+        limit_arg = _normalize_csv_value(request.args.get('limit')) or '260'
         store = _tushare_ext_store()
         cache_result = _ensure_tushare_index_cache(store=store, symbols=DEFAULT_INDEX_SYMBOLS)
-        payload = build_index_kline_payload(store, symbol, months=6, period=period)
+        payload = build_index_kline_payload(
+            store,
+            symbol,
+            months=6,
+            period=period,
+            limit=limit_arg,
+            max_limit=STOCK_DETAIL_MAX_LIMIT,
+        )
         if cache_result.get('warning'):
             payload['warning'] = cache_result['warning']
         return jsonify({'success': True, 'data': payload})

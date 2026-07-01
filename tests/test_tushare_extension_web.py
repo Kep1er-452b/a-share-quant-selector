@@ -9,7 +9,7 @@ from utils.tushare_ext_store import TushareExtStore
 def _index_store(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     rows = []
-    for offset, trade_date in enumerate(pd.bdate_range("2025-08-01", "2026-06-30")):
+    for offset, trade_date in enumerate(pd.bdate_range("2024-01-01", "2026-06-30")):
         rows.append(
             {
                 "ts_code": "000001.SH",
@@ -135,6 +135,62 @@ class PartialAdjustedStockManager(StockManager):
                 }
             )
         return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True)
+
+
+class LongStockManager(StockManager):
+    def read_stock_for_analysis(self, code):
+        rows = []
+        for offset, trade_date in enumerate(pd.bdate_range("2023-01-02", "2026-06-30")):
+            rows.append(
+                {
+                    "date": trade_date,
+                    "open": 10 + offset / 100,
+                    "high": 10.2 + offset / 100,
+                    "low": 9.8 + offset / 100,
+                    "close": 10.1 + offset / 100,
+                    "volume": 100000 + offset,
+                    "amount": 2000000 + offset,
+                    "turnover": 1.0,
+                    "market_cap": 10000000000,
+                }
+            )
+        return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def test_stock_detail_api_accepts_chart_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_server, "_active_csv_manager", lambda: LongStockManager())
+    monkeypatch.setattr(web_server, "_load_stock_names", lambda: {"000001": "平安银行"})
+    monkeypatch.setattr(web_server, "_tushare_ext_store", lambda: TushareExtStore(tmp_path / "extended"), raising=False)
+
+    default_response = web_server.app.test_client().get("/api/stock/000001?period=daily")
+    limited_response = web_server.app.test_client().get("/api/stock/000001?period=daily&limit=520")
+    all_response = web_server.app.test_client().get("/api/stock/000001?period=daily&limit=all")
+
+    default_payload = default_response.get_json()
+    limited_payload = limited_response.get_json()
+    all_payload = all_response.get_json()
+
+    assert default_payload["success"] is True
+    assert default_payload["limit"] == 260
+    assert len(default_payload["data"]) == 260
+    assert limited_payload["limit"] == 520
+    assert len(limited_payload["data"]) == 520
+    assert all_payload["limit"] == all_payload["total_bars"]
+    assert len(all_payload["data"]) == all_payload["total_bars"]
+    assert len(all_payload["data"]) > 520
+
+
+def test_index_detail_api_accepts_chart_limit(monkeypatch, tmp_path):
+    store = _index_store(tmp_path)
+    monkeypatch.setattr(web_server, "_tushare_ext_store", lambda: store, raising=False)
+    monkeypatch.setattr(web_server, "_ensure_tushare_index_cache", lambda *args, **kwargs: {"status": "skipped"}, raising=False)
+
+    response = web_server.app.test_client().get("/api/index-detail/sh000001?period=daily&limit=520")
+    payload = response.get_json()
+
+    assert payload["success"] is True
+    assert payload["data"]["limit"] == 520
+    assert len(payload["data"]["candles"]) == 520
 
 
 def test_stock_detail_api_drops_partial_adjusted_overlay(monkeypatch, tmp_path):

@@ -54,6 +54,31 @@ def test_index_payload_clamps_month_range_and_adds_ma_lines(tmp_path):
     assert payload["candles"][-1]["MA200"] is not None
 
 
+def test_index_payload_accepts_detail_limit_over_month_window(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    rows = []
+    for offset, trade_date in enumerate(pd.bdate_range("2024-01-01", "2026-06-30")):
+        rows.append(
+            {
+                "ts_code": "000001.SH",
+                "trade_date": trade_date.strftime("%Y%m%d"),
+                "open": 3000 + offset,
+                "high": 3010 + offset,
+                "low": 2990 + offset,
+                "close": 3005 + offset,
+                "vol": 1000 + offset,
+                "amount": 2000 + offset,
+            }
+        )
+    store.upsert_rows("index_daily", rows, key_fields=("ts_code", "trade_date"))
+
+    payload = build_index_kline_payload(store, "sh000001", months=3, today=date(2026, 7, 1), limit=520)
+
+    assert payload["limit"] == 520
+    assert len(payload["candles"]) == 520
+    assert payload["candles"][0]["date"] < "2026-01-01"
+
+
 def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     store.upsert_rows(

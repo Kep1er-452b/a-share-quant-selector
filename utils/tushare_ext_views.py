@@ -155,6 +155,8 @@ def build_index_kline_payload(
     months: int = 3,
     today: date | None = None,
     period: str = "daily",
+    limit: int | str | None = None,
+    max_limit: int = 2500,
 ) -> dict:
     months = min(max(int(months or 3), 3), 6)
     today = today or datetime.now().date()
@@ -170,12 +172,10 @@ def build_index_kline_payload(
     ma50 = calculate_moving_average(closes, 50)
     ma200 = calculate_moving_average(closes, 200)
 
-    candles = []
+    all_candles = []
     for row, ma50_value, ma200_value in zip(all_rows, ma50, ma200):
         trade_date = _date_text(row.get("trade_date"))
-        if trade_date < start_date:
-            continue
-        candles.append(
+        all_candles.append(
             {
                 "date": _display_date(trade_date),
                 "trade_date": trade_date,
@@ -189,6 +189,19 @@ def build_index_kline_payload(
                 "MA200": ma200_value,
             }
         )
+    if limit is None:
+        candles = [item for item in all_candles if item.get("trade_date", "") >= start_date]
+        resolved_limit = None
+    else:
+        if isinstance(limit, str) and limit.strip().lower() == "all":
+            resolved_limit = min(len(all_candles), int(max_limit))
+        else:
+            try:
+                resolved_limit = int(limit)
+            except (TypeError, ValueError):
+                resolved_limit = 260
+            resolved_limit = min(max(resolved_limit, 1), int(max_limit))
+        candles = all_candles[-resolved_limit:]
 
     return {
         "symbol": symbol,
@@ -196,6 +209,9 @@ def build_index_kline_payload(
         "name": index_info["name"],
         "period": period,
         "months": months,
+        "limit": resolved_limit,
+        "total_bars": len(all_candles),
+        "max_limit": int(max_limit),
         "source": f"tushare:{dataset}",
         "cache_status": "ready" if candles else "empty",
         "candles": candles,
