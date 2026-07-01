@@ -84,6 +84,7 @@ const state = {
         { window: 200, color: '#a855f7' },
     ]),
     macdSettings: loadJsonSetting('quantMacdSettings', { fast: 12, slow: 26, signal: 9 }),
+    showSequenceMarkers: loadJsonSetting('quantShowSequenceMarkers', true) !== false,
     localProgressTimer: null,
     jobStartTime: null,
     serverElapsedBase: 0,
@@ -111,6 +112,9 @@ const state = {
     currentStockDetail: null,
     currentStockPeriod: 'daily',
     currentStockLimit: normalizeStockChartLimit(loadJsonSetting('quantStockChartLimit', '260')),
+    currentStockChartData: [],
+    currentStockChartPeriod: 'daily',
+    currentStockChartDetail: {},
     pendingExportStock: null,
     watchlistLoaded: false,
     watchlistCache: [],
@@ -2135,9 +2139,15 @@ function syncIndicatorControls() {
     const fast = document.getElementById('stock-macd-fast');
     const slow = document.getElementById('stock-macd-slow');
     const signal = document.getElementById('stock-macd-signal');
+    const sequenceToggle = document.getElementById('stock-sequence-toggle');
     if (fast) fast.value = state.macdSettings.fast || 12;
     if (slow) slow.value = state.macdSettings.slow || 26;
     if (signal) signal.value = state.macdSettings.signal || 9;
+    if (sequenceToggle) {
+        const active = state.showSequenceMarkers !== false;
+        sequenceToggle.classList.toggle('active', active);
+        sequenceToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
 }
 
 function refreshCurrentStockChart() {
@@ -2149,6 +2159,25 @@ function refreshCurrentStockChart() {
         }
         viewStockDetail(detail.code, detail.name, detail.period || state.currentStockPeriod);
     }
+}
+
+function rerenderCurrentStockChart() {
+    if (Array.isArray(state.currentStockChartData) && state.currentStockChartData.length) {
+        renderStockChart(
+            state.currentStockChartData,
+            state.currentStockChartPeriod || state.currentStockPeriod || 'daily',
+            state.currentStockChartDetail || {},
+        );
+        return;
+    }
+    refreshCurrentStockChart();
+}
+
+function toggleSequenceMarkers() {
+    state.showSequenceMarkers = state.showSequenceMarkers === false;
+    saveJsonSetting('quantShowSequenceMarkers', state.showSequenceMarkers);
+    syncIndicatorControls();
+    rerenderCurrentStockChart();
 }
 
 function addMovingAverageFromControls() {
@@ -2280,6 +2309,10 @@ function renderStockChart(data, period = 'daily', detail = {}) {
         return;
     }
 
+    state.currentStockChartData = data;
+    state.currentStockChartPeriod = period;
+    state.currentStockChartDetail = detail;
+
     const reversed = [...data].reverse();
     const labelInterval = period === 'monthly' ? 2 : (period === 'weekly' ? 6 : 12);
     const dates = reversed.map(item => item.date);
@@ -2328,10 +2361,11 @@ function renderStockChart(data, period = 'daily', detail = {}) {
             item.value <= maxValue &&
             Number.isFinite(item.data[1])
         );
-    const upSeqEarlyMarks = buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 1, 8);
-    const upSeqLateMarks = buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 9, 13);
-    const downSeqEarlyMarks = buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 1, 8);
-    const downSeqLateMarks = buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 9, 13);
+    const showSequenceMarkers = state.showSequenceMarkers !== false;
+    const upSeqEarlyMarks = showSequenceMarkers ? buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 1, 8) : [];
+    const upSeqLateMarks = showSequenceMarkers ? buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 9, 13) : [];
+    const downSeqEarlyMarks = showSequenceMarkers ? buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 1, 8) : [];
+    const downSeqLateMarks = showSequenceMarkers ? buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 9, 13) : [];
     const violentKMarks = reversed
         .map((item, index) => ({
             value: item.VIOLENT_K ? 1 : 0,
@@ -2779,6 +2813,8 @@ function closeModal() {
     document.getElementById('stock-modal').classList.remove('active');
     setStockExportStatus('');
     closeExportConfirm();
+    state.currentStockChartData = [];
+    state.currentStockChartDetail = {};
     if (state.chartInstance) {
         if (typeof state.chartInstance.dispose === 'function') {
             state.chartInstance.dispose();
@@ -5418,6 +5454,7 @@ function bindEvents() {
     });
     document.getElementById('dashboard-index-detail-btn').addEventListener('click', openDashboardIndexDetail);
     document.getElementById('stock-ma-add-btn').addEventListener('click', addMovingAverageFromControls);
+    document.getElementById('stock-sequence-toggle').addEventListener('click', toggleSequenceMarkers);
     document.getElementById('stock-ma-list').addEventListener('click', event => {
         const button = event.target.closest('[data-ma-remove]');
         if (!button) {

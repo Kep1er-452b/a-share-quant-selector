@@ -85,6 +85,41 @@ def test_provider_industry_cache_reuses_sibling_provider(monkeypatch, tmp_path):
     assert payload["items"] == {"000001": "银行", "000002": "房地产"}
 
 
+def test_tushare_industry_cache_fills_recent_codes_from_stock_map(monkeypatch, tmp_path):
+    tushare_dir = tmp_path / "data" / "providers" / "tushare"
+    stock_dir = tushare_dir / "00"
+    stock_dir.mkdir(parents=True)
+    codes = [f"000{index:03d}" for index in range(1, 22)]
+    for code in codes:
+        (stock_dir / f"{code}.csv").write_text(
+            "date,open,high,low,close,volume,amount,turnover,market_cap\n",
+            encoding="utf-8",
+        )
+
+    previous_items = {code: "旧行业" for code in codes[:-1]}
+    (tushare_dir / "industry_map.json").write_text(
+        json.dumps({"items": previous_items}),
+        encoding="utf-8",
+    )
+    (tushare_dir / "tushare_stock_map.json").write_text(
+        json.dumps({codes[-1]: {"industry": "新行业"}}),
+        encoding="utf-8",
+    )
+
+    fake_akshare = types.SimpleNamespace(
+        stock_individual_info_em=lambda symbol: (_ for _ in ()).throw(AssertionError("network should not run")),
+        stock_industry_change_cninfo=lambda **kwargs: (_ for _ in ()).throw(AssertionError("network should not run")),
+    )
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+
+    payload = build_industry_cache(data_dir=str(tushare_dir))
+
+    assert payload["mapped_count"] == 21
+    assert payload["unmapped_count"] == 0
+    assert payload["items"][codes[-1]] == "新行业"
+    assert payload["item_sources"][codes[-1]] == "tushare_stock_map"
+
+
 def test_snapshot_cache_stocks_are_sorted_by_code(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()

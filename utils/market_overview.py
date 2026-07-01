@@ -242,7 +242,11 @@ def _load_tushare_token() -> str:
     return ""
 
 
-def _load_tushare_metadata_industries(data_path: Path, csv_codes: set[str]) -> tuple[Dict[str, str], Dict[str, str], str]:
+def _load_tushare_metadata_industries(
+    data_path: Path,
+    csv_codes: set[str],
+    fetch_if_empty: bool = True,
+) -> tuple[Dict[str, str], Dict[str, str], str]:
     meta_path = data_path / "tushare_stock_map.json"
     mapping: Dict[str, str] = {}
     source_map: Dict[str, str] = {}
@@ -257,7 +261,7 @@ def _load_tushare_metadata_industries(data_path: Path, csv_codes: set[str]) -> t
                 mapping[code] = industry
                 source_map[code] = "tushare_stock_map"
 
-    if mapping or not _is_tushare_provider_dir(data_path):
+    if mapping or not _is_tushare_provider_dir(data_path) or not fetch_if_empty:
         return mapping, source_map, ""
 
     token = _load_tushare_token()
@@ -509,6 +513,15 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         if code not in previous_mapping:
             previous_mapping[code] = label
             previous_source_map[code] = related_sources.get(code, "related_industry_cache")
+    metadata_items, metadata_sources, metadata_error = _load_tushare_metadata_industries(
+        data_path,
+        csv_codes,
+        fetch_if_empty=False,
+    )
+    for code, label in metadata_items.items():
+        if code not in previous_mapping:
+            previous_mapping[code] = label
+            previous_source_map[code] = metadata_sources.get(code, "tushare_stock_map")
     previous_ratio = len(previous_mapping) / max(len(csv_codes), 1)
 
     if previous_mapping and previous_ratio >= INDUSTRY_CACHE_REUSE_MIN_RATIO:
@@ -525,11 +538,22 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
             "eastmoney_count": 0,
             "cninfo_count": 0,
             "reused_count": len(previous_mapping),
-            "related_reused_count": sum(1 for source in previous_source_map.values() if source != "previous_cache"),
+            "related_reused_count": sum(
+                1
+                for source in previous_source_map.values()
+                if source not in {"previous_cache", "tushare_stock_map", "tushare_stock_basic"}
+            ),
+            "tushare_metadata_count": sum(
+                1
+                for source in previous_source_map.values()
+                if source in {"tushare_stock_map", "tushare_stock_basic"}
+            ),
             "unmapped_count": len(csv_codes - set(previous_mapping)),
             "items": previous_mapping,
             "item_sources": previous_source_map,
         }
+        if metadata_error:
+            payload["provider_error"] = metadata_error
         _write_json(industry_cache_path(data_dir), payload)
         return payload
 
