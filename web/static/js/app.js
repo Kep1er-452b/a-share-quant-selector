@@ -204,6 +204,38 @@ function formatNumber(value) {
     return numeric.toLocaleString('zh-CN');
 }
 
+function formatTradingValue(value, unit = '') {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    const digits = unit === '家' ? 0 : 2;
+    const rendered = Math.abs(numeric).toLocaleString('zh-CN', {
+        maximumFractionDigits: digits,
+        minimumFractionDigits: unit === '家' ? 0 : Math.min(digits, 2),
+    });
+    const sign = numeric < 0 ? '-' : '';
+    return `${sign}${rendered}${unit ? ` ${unit}` : ''}`;
+}
+
+function formatWanYuanMarketValue(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    const yi = numeric / 10000;
+    if (Math.abs(yi) >= 10000) {
+        return `${(yi / 10000).toLocaleString('zh-CN', {
+            maximumFractionDigits: 2,
+            minimumFractionDigits: 2,
+        })}万亿`;
+    }
+    return `${yi.toLocaleString('zh-CN', {
+        maximumFractionDigits: 2,
+        minimumFractionDigits: 2,
+    })}亿`;
+}
+
 function formatDateTime(value) {
     if (!value) {
         return '--';
@@ -872,7 +904,7 @@ function formatTradingDelta(value, unit = '') {
     if (!Number.isFinite(numeric)) {
         return '较昨日 --';
     }
-    return `较昨日 ${numeric >= 0 ? '+' : ''}${formatNumber(numeric)} ${unit}`;
+    return `较昨日 ${numeric >= 0 ? '+' : ''}${formatTradingValue(numeric, unit)}`;
 }
 
 function renderMarketTradingCards(summary) {
@@ -893,7 +925,7 @@ function renderMarketTradingCards(summary) {
                 return `
                     <div class="pulse-card pulse-trading-card">
                         <div class="pulse-label">${escapeHtml(item.label || key)}</div>
-                        <div class="pulse-value ${signedClass(item.delta)}">${formatNumber(item.value ?? 0)}</div>
+                        <div class="pulse-value ${signedClass(item.value)}">${formatTradingValue(item.value, item.unit || '')}</div>
                         <div class="pulse-sub">${escapeHtml(formatTradingDelta(item.delta, item.unit || ''))}</div>
                     </div>
                 `;
@@ -1319,6 +1351,16 @@ function formatCompactAmount(value) {
     return numeric.toFixed(0);
 }
 
+function formatTooltipChangePct(items, index) {
+    const current = Number(items?.[index]?.close);
+    const previous = Number(items?.[index - 1]?.close);
+    if (!Number.isFinite(current) || !Number.isFinite(previous) || previous === 0) {
+        return '涨跌幅 --';
+    }
+    const changePct = ((current / previous) - 1) * 100;
+    return `涨跌幅 <span class="${signedClass(changePct)}">${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+}
+
 function setDashboardIndexButtons(symbol) {
     document.querySelectorAll('#dashboard-index-selector .index-switch-btn').forEach(button => {
         button.classList.toggle('active', button.dataset.symbol === symbol);
@@ -1471,6 +1513,7 @@ function renderDashboardIndexKline(payload) {
                     `${payload.name || ''} ${item.date}`,
                     `开盘 ${item.open}  最高 ${item.high}`,
                     `最低 ${item.low}  收盘 ${item.close}`,
+                    formatTooltipChangePct(candles, point.dataIndex),
                     `成交量 ${formatCompactAmount(item.volume)}`,
                     `MA50 ${item.MA50 ?? '--'}  MA200 ${item.MA200 ?? '--'}`,
                 ].join('<br>');
@@ -2148,8 +2191,8 @@ function renderStockSideInfo(detail, latest) {
             { label: '股息TTM', value: valuation.dv_ttm },
             { label: '换手率', value: valuation.turnover_rate },
             { label: '量比', value: valuation.volume_ratio },
-            { label: '总市值', value: valuation.total_mv },
-            { label: '流通市值', value: valuation.circ_mv },
+            { label: '总市值', value: formatWanYuanMarketValue(valuation.total_mv) },
+            { label: '流通市值', value: formatWanYuanMarketValue(valuation.circ_mv) },
         ]),
         renderStockInfoPanel('财务与公司信息', [
             { label: 'ROE', value: financial.roe },
@@ -2342,6 +2385,7 @@ function renderStockChart(data, period = 'daily', detail = {}) {
                     `${item.date}`,
                     `开盘 ${item.open}  最高 ${item.high}`,
                     `最低 ${item.low}  收盘 ${item.close}`,
+                    formatTooltipChangePct(reversed, point.dataIndex),
                     `知行短期 ${item.ZX_SHORT ?? '--'}  多空 ${item.ZX_LONG ?? '--'}`,
                     `成交量 ${formatCompactAmount(item.volume)}  成交额 ${formatCompactAmount(item.amount)}`,
                     `K ${item.K ?? '--'}  D ${item.D ?? '--'}  J ${item.J ?? '--'}`,

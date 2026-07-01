@@ -216,6 +216,40 @@ def _sum_field(rows: Iterable[dict], field: str) -> float:
     return round(total, 4)
 
 
+def _sum_field_or_none(rows: Iterable[dict], field: str) -> float | None:
+    total = 0.0
+    found = False
+    for row in rows:
+        value = _to_number(row.get(field))
+        if isinstance(value, (int, float)):
+            total += float(value)
+            found = True
+    return round(total, 4) if found else None
+
+
+def _scaled_value(value: float | None, divisor: float) -> float | None:
+    if value is None:
+        return None
+    return round(float(value) / divisor, 4)
+
+
+def _scaled_sum(rows: Iterable[dict], field: str, divisor: float) -> float | None:
+    return _scaled_value(_sum_field_or_none(rows, field), divisor)
+
+
+def _margin_balance_yi(rows: Iterable[dict]) -> float | None:
+    rows = list(rows)
+    total = _sum_field_or_none(rows, "rzrqye")
+    if total is None:
+        rzye = _sum_field_or_none(rows, "rzye")
+        rqye = _sum_field_or_none(rows, "rqye")
+        if rzye is None and rqye is None:
+            return None
+        total = float(rzye or 0) + float(rqye or 0)
+    # Tushare margin balance fields are yuan-denominated.
+    return _scaled_value(total, 100_000_000)
+
+
 def _previous_trade_date(store: TushareExtStore, latest_date: str, datasets: Iterable[str]) -> str | None:
     candidates: set[str] = set()
     for dataset in datasets:
@@ -227,21 +261,29 @@ def _previous_trade_date(store: TushareExtStore, latest_date: str, datasets: Ite
     return max(candidates) if candidates else None
 
 
-def _metric(label: str, value: float, previous: float | None, unit: str = "") -> dict:
+def _metric(label: str, value: float | None, previous: float | None, unit: str = "") -> dict:
     return {
         "label": label,
         "value": value,
         "previous_value": previous,
-        "delta": None if previous is None else round(value - previous, 4),
+        "delta": None if value is None or previous is None else round(value - previous, 4),
         "unit": unit,
     }
 
 
-def build_market_trading_summary(store: TushareExtStore, latest_date: str) -> dict:
+def build_market_trading_summary(
+    store: TushareExtStore,
+    latest_date: str,
+    *,
+    market_amount_yi: float | None = None,
+    previous_market_amount_yi: float | None = None,
+) -> dict:
     latest = _date_text(latest_date)
-    datasets = ("daily_basic", "moneyflow", "top_list", "block_trade", "margin", "moneyflow_hsgt")
+    datasets = ("daily", "daily_basic", "moneyflow", "top_list", "block_trade", "margin", "moneyflow_hsgt")
     previous = _previous_trade_date(store, latest, datasets)
 
+    current_daily = _rows_for_date(store, "daily", latest)
+    previous_daily = _rows_for_date(store, "daily", previous) if previous else []
     current_top = _rows_for_date(store, "top_list", latest)
     previous_top = _rows_for_date(store, "top_list", previous) if previous else []
     current_blocks = _rows_for_date(store, "block_trade", latest)
@@ -253,24 +295,32 @@ def build_market_trading_summary(store: TushareExtStore, latest_date: str) -> di
     current_margin = _rows_for_date(store, "margin", latest)
     previous_margin = _rows_for_date(store, "margin", previous) if previous else []
 
-    dragon_tiger_net = _sum_field(current_top, "net_amount")
-    previous_dragon_tiger_net = _sum_field(previous_top, "net_amount") if previous else None
-    block_trade_amount = _sum_field(current_blocks, "amount")
-    previous_block_trade_amount = _sum_field(previous_blocks, "amount") if previous else None
-    northbound_money = _sum_field(current_hsgt, "north_money")
-    previous_northbound_money = _sum_field(previous_hsgt, "north_money") if previous else None
-    main_money_flow = _sum_field(current_moneyflow, "net_mf_amount")
-    previous_main_money_flow = _sum_field(previous_moneyflow, "net_mf_amount") if previous else None
-    margin_balance = _sum_field(current_margin, "rzrqye")
-    previous_margin_balance = _sum_field(previous_margin, "rzrqye") if previous else None
+    # Tushare daily amount is thousand yuan; top_list amount/net_amount are yuan;
+    # moneyflow and block_trade amount fields are ten-thousand yuan.
+    market_amount = market_amount_yi
+    if market_amount is None:
+        market_amount = _scaled_sum(current_daily, "amount", 100_000)
+    previous_market_amount = previous_market_amount_yi
+    if previous_market_amount is None and previous:
+        previous_market_amount = _scaled_sum(previous_daily, "amount", 100_000)
+    dragon_tiger_net = _scaled_sum(current_top, "net_amount", 100_000_000)
+    previous_dragon_tiger_net = _scaled_sum(previous_top, "net_amount", 100_000_000) if previous else None
+    block_trade_amount = _scaled_sum(current_blocks, "amount", 10_000)
+    previous_block_trade_amount = _scaled_sum(previous_blocks, "amount", 10_000) if previous else None
+    northbound_money = _sum_field_or_none(current_hsgt, "north_money")
+    previous_northbound_money = _sum_field_or_none(previous_hsgt, "north_money") if previous else None
+    main_money_flow = _scaled_sum(current_moneyflow, "net_mf_amount", 10_000)
+    previous_main_money_flow = _scaled_sum(previous_moneyflow, "net_mf_amount", 10_000) if previous else None
+    margin_balance = _margin_balance_yi(current_margin)
+    previous_margin_balance = _margin_balance_yi(previous_margin) if previous else None
 
     metrics = {
-        "market_amount": _metric("市场成交额", 0.0, None, "亿元"),
-        "main_money_flow": _metric("主力资金流", main_money_flow, previous_main_money_flow, "万元"),
-        "dragon_tiger_net": _metric("龙虎榜净额", dragon_tiger_net, previous_dragon_tiger_net, "万元"),
+        "market_amount": _metric("市场成交额", market_amount, previous_market_amount, "亿元"),
+        "main_money_flow": _metric("主力资金流", main_money_flow, previous_main_money_flow, "亿元"),
+        "dragon_tiger_net": _metric("龙虎榜净额", dragon_tiger_net, previous_dragon_tiger_net, "亿元"),
         "dragon_tiger_count": _metric("龙虎榜数量", float(len(current_top)), float(len(previous_top)) if previous else None, "家"),
-        "block_trade_amount": _metric("大宗交易金额", block_trade_amount, previous_block_trade_amount, "万元"),
-        "margin_balance": _metric("两融余额", margin_balance, previous_margin_balance, "万元"),
+        "block_trade_amount": _metric("大宗交易金额", block_trade_amount, previous_block_trade_amount, "亿元"),
+        "margin_balance": _metric("两融余额", margin_balance, previous_margin_balance, "亿元"),
         "northbound_money": _metric("北向资金", northbound_money, previous_northbound_money, "亿元"),
     }
     return {
@@ -358,7 +408,13 @@ def build_stock_extension_payload(store: TushareExtStore, code: str) -> dict:
     }
 
 
-def build_adjusted_candles(store: TushareExtStore, code: str, *, limit: int | None = None) -> list[dict]:
+def build_adjusted_candles(
+    store: TushareExtStore,
+    code: str,
+    *,
+    limit: int | None = None,
+    required_trade_dates: Iterable[str] | None = None,
+) -> list[dict]:
     """Build qfq chart candles from raw daily prices plus Tushare adj_factor."""
 
     ts_code = _normalize_stock_code(code)
@@ -398,4 +454,10 @@ def build_adjusted_candles(store: TushareExtStore, code: str, *, limit: int | No
                 "adjustment": "qfq",
             }
         )
+    if required_trade_dates:
+        required = {_date_text(value) for value in required_trade_dates if _date_text(value)}
+        available = {item.get("trade_date") for item in candles}
+        if not required.issubset(available):
+            return []
+
     return candles

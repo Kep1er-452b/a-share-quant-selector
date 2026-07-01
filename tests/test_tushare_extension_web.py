@@ -51,7 +51,7 @@ class StockManager:
 
     def read_stock_for_analysis(self, code):
         rows = []
-        for offset, trade_date in enumerate(pd.bdate_range("2026-01-01", "2026-06-30")):
+        for offset, trade_date in enumerate(pd.bdate_range("2026-06-29", "2026-06-30")):
             rows.append(
                 {
                     "date": trade_date,
@@ -117,13 +117,70 @@ def test_stock_detail_api_adds_extension_payload(monkeypatch, tmp_path):
     assert isinstance(payload["data"], list)
 
 
+class PartialAdjustedStockManager(StockManager):
+    def read_stock_for_analysis(self, code):
+        rows = []
+        for offset, trade_date in enumerate(pd.bdate_range("2026-06-26", "2026-06-30")):
+            rows.append(
+                {
+                    "date": trade_date,
+                    "open": 10 + offset / 100,
+                    "high": 10.2 + offset / 100,
+                    "low": 9.8 + offset / 100,
+                    "close": 10.1 + offset / 100,
+                    "volume": 100000 + offset,
+                    "amount": 2000000 + offset,
+                    "turnover": 1.0,
+                    "market_cap": 10000000000,
+                }
+            )
+        return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def test_stock_detail_api_drops_partial_adjusted_overlay(monkeypatch, tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "daily",
+        [
+            {"ts_code": "000001.SZ", "trade_date": "20260630", "open": 20, "high": 22, "low": 19, "close": 21},
+            {"ts_code": "000001.SZ", "trade_date": "20260629", "open": 10, "high": 11, "low": 9, "close": 10.5},
+        ],
+        key_fields=("ts_code", "trade_date"),
+    )
+    store.upsert_rows(
+        "adj_factor",
+        [
+            {"ts_code": "000001.SZ", "trade_date": "20260630", "adj_factor": 2.0},
+            {"ts_code": "000001.SZ", "trade_date": "20260629", "adj_factor": 1.0},
+        ],
+        key_fields=("ts_code", "trade_date"),
+    )
+    monkeypatch.setattr(web_server, "_active_csv_manager", lambda: PartialAdjustedStockManager())
+    monkeypatch.setattr(web_server, "_load_stock_names", lambda: {"000001": "平安银行"})
+    monkeypatch.setattr(web_server, "_tushare_ext_store", lambda: store, raising=False)
+
+    response = web_server.app.test_client().get("/api/stock/000001?period=daily")
+    payload = response.get_json()
+
+    assert payload["success"] is True
+    assert payload["adjusted_data"] == []
+
+
 def test_dashboard_pulse_api_adds_market_trading_summary(monkeypatch, tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     store.upsert_rows(
+        "daily",
+        [
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "amount": 1_000_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "amount": 600_000},
+        ],
+        key_fields=("trade_date", "ts_code"),
+    )
+    store.upsert_rows(
         "top_list",
         [
-            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_amount": 300},
-            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_amount": 100},
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_amount": 300_000_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_amount": 100_000_000},
         ],
         key_fields=("trade_date", "ts_code"),
     )
@@ -149,8 +206,10 @@ def test_dashboard_pulse_api_adds_market_trading_summary(monkeypatch, tmp_path):
 
     assert payload["success"] is True
     trading = payload["data"]["market_trading"]
-    assert trading["metrics"]["dragon_tiger_net"]["value"] == 300
-    assert trading["metrics"]["dragon_tiger_net"]["delta"] == 200
+    assert trading["metrics"]["market_amount"]["value"] == 10.0
+    assert trading["metrics"]["market_amount"]["delta"] == 4.0
+    assert trading["metrics"]["dragon_tiger_net"]["value"] == 3.0
+    assert trading["metrics"]["dragon_tiger_net"]["delta"] == 2.0
 
 
 class ExtensionPro:
@@ -210,6 +269,7 @@ def test_refresh_tushare_extension_data_runs_update_stages(monkeypatch, tmp_path
         ExtensionProvider(),
         [{"code": "000001", "ts_code": "000001.SZ"}],
         "2026-06-30",
+        full_backfill=True,
         financial_datasets=["fina_indicator"],
         trading_datasets=["top_list", "top_inst"],
     )
@@ -221,6 +281,29 @@ def test_refresh_tushare_extension_data_runs_update_stages(monkeypatch, tmp_path
     assert store.latest_trade_date("daily_basic", ts_code="000001.SZ") == "20260630"
     assert store.query_rows("fina_indicator", ts_code="000001.SZ")[0]["roe"] == 12.3
     assert store.query_rows("top_list", ts_code="000001.SZ")[0]["net_amount"] == 300
+
+
+def test_refresh_tushare_extension_data_skips_heavy_stages_by_default(monkeypatch, tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    monkeypatch.setattr(web_server, "_tushare_ext_store", lambda: store, raising=False)
+    monkeypatch.setattr(web_server, "_append_update_job_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_server, "_append_system_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_server, "_update_update_job", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_server, "_load_config", lambda: {"data_source": {"tushare": {}}})
+
+    result = web_server._refresh_tushare_extension_data_for_job(
+        "job-test",
+        ExtensionProvider(),
+        [{"code": "000001", "ts_code": "000001.SZ"}],
+        "2026-06-30",
+        trading_datasets=["top_list"],
+    )
+
+    assert result["datasets"]["prices"]["status"] == "skipped"
+    assert result["datasets"]["financial"]["status"] == "skipped"
+    assert store.latest_trade_date("daily", ts_code="000001.SZ") is None
+    assert store.query_rows("fina_indicator", ts_code="000001.SZ") == []
+    assert store.query_rows("top_list", ts_code="000001.SZ")
 
 
 def test_warm_tushare_index_cache_background_is_best_effort(monkeypatch, tmp_path):

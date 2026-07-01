@@ -27,12 +27,16 @@ def test_frontend_uses_adjusted_data_indicator_settings_and_chinese_tooltips():
     assert "收盘" in js
     assert "成交量" in js
     assert "MACD" in js
+    assert "涨跌幅" in js
+    assert "formatTooltipChangePct" in js
 
 
 def test_stock_info_panels_keep_empty_extension_sections_visible():
     js = (ROOT / "web/static/js/app.js").read_text(encoding="utf-8")
     assert "displayValue" in js
     assert "? '--' : item.value" in js
+    assert "formatWanYuanMarketValue" in js
+    assert "formatTradingValue" in js
 
 
 def test_universe_count_has_purple_style_hook():

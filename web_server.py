@@ -1549,12 +1549,63 @@ def _refresh_market_caches_for_job(job_id, data_dir):
     _update_update_job(job_id, cache_refresh=cache_result.get('errors') or {})
 
 
+def _truthy(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on', 'full'}
+
+
+def _tushare_extension_full_backfill_enabled(config=None):
+    env_value = os.getenv('AQS_TUSHARE_EXTENSION_FULL_BACKFILL') or os.getenv('TUSHARE_EXTENSION_FULL_BACKFILL')
+    if env_value is not None:
+        return _truthy(env_value)
+    config = config or _load_config()
+    return _truthy(
+        get_config_value(config, 'data_source', 'tushare', 'extension_full_backfill')
+        or get_config_value(config, 'tushare_extension', 'full_backfill')
+    )
+
+
+def _recent_tushare_extension_trade_dates(store, latest_text, count=2):
+    dates = []
+    try:
+        for row in store.query_rows('trade_cal', end_date=latest_text, descending=True):
+            cal_date = str(row.get('cal_date') or row.get('trade_date') or '').strip()
+            if not cal_date or cal_date > latest_text:
+                continue
+            if str(row.get('is_open')).strip() not in {'1', '1.0', 'True', 'true'}:
+                continue
+            if cal_date not in dates:
+                dates.append(cal_date)
+            if len(dates) >= count:
+                break
+    except Exception:
+        dates = []
+
+    current = pd.to_datetime(latest_text)
+    while len(dates) < count:
+        fallback = (current - pd.offsets.BDay(len(dates))).strftime('%Y%m%d')
+        if fallback not in dates:
+            dates.append(fallback)
+        if len(dates) >= count:
+            break
+    return dates[:count]
+
+
+def _skipped_extension_stage(reason):
+    return {'status': 'skipped', 'reason': reason}
+
+
 def _refresh_tushare_extension_data_for_job(
     job_id,
     provider,
     target_universe,
     latest_trade_date,
     *,
+    full_backfill=None,
+    price_datasets=None,
     financial_datasets=None,
     trading_datasets=None,
 ):
@@ -1563,6 +1614,11 @@ def _refresh_tushare_extension_data_for_job(
     store = _tushare_ext_store()
     sync = TushareExtSync(store, provider.pro, pro_bar=getattr(getattr(provider, 'ts', None), 'pro_bar', None))
     latest_text = pd.to_datetime(latest_trade_date).strftime('%Y%m%d')
+    full_backfill_enabled = (
+        _truthy(full_backfill)
+        if full_backfill is not None
+        else _tushare_extension_full_backfill_enabled()
+    )
     results = {}
     warnings = []
 
@@ -1598,36 +1654,48 @@ def _refresh_tushare_extension_data_for_job(
 
     run_stage('basics', lambda: sync.sync_basics(progress_callback=progress_callback))
     run_stage('index', lambda: sync.ensure_index_cache(progress_callback=progress_callback))
-    price_start = (pd.to_datetime(latest_text) - pd.DateOffset(years=6)).strftime('%Y%m%d')
-    run_stage(
-        'prices',
-        lambda: sync.sync_price_tracks(
-            target_universe,
-            start_date=price_start,
-            end_date=latest_text,
-            progress_callback=progress_callback,
-            halt_checker=_is_halted,
-        ),
-    )
+    if full_backfill_enabled or price_datasets is not None:
+        price_start = (pd.to_datetime(latest_text) - pd.DateOffset(years=6)).strftime('%Y%m%d')
+        run_stage(
+            'prices',
+            lambda: sync.sync_price_tracks(
+                target_universe,
+                start_date=price_start,
+                end_date=latest_text,
+                datasets=price_datasets,
+                progress_callback=progress_callback,
+                halt_checker=_is_halted,
+            ),
+        )
+    else:
+        reason = '默认更新跳过全市场价格扩展回填；设置 AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1 后手动运行完整回填'
+        results['prices'] = _skipped_extension_stage(reason)
+        _append_update_job_log(job_id, f'Tushare 扩展数据 prices 已跳过: {reason}。')
     run_stage('valuation', lambda: sync.sync_valuation_snapshot([latest_text], progress_callback=progress_callback))
+    trading_dates = _recent_tushare_extension_trade_dates(store, latest_text, count=2)
     run_stage(
         'trading',
         lambda: sync.sync_trading_snapshot(
-            [latest_text],
+            trading_dates,
             datasets=trading_datasets,
             progress_callback=progress_callback,
         ),
     )
-    run_stage(
-        'financial',
-        lambda: sync.sync_financials_for_universe(
-            target_universe,
-            end_date=latest_text,
-            datasets=financial_datasets,
-            progress_callback=progress_callback,
-            halt_checker=_is_halted,
-        ),
-    )
+    if full_backfill_enabled or financial_datasets is not None:
+        run_stage(
+            'financial',
+            lambda: sync.sync_financials_for_universe(
+                target_universe,
+                end_date=latest_text,
+                datasets=financial_datasets,
+                progress_callback=progress_callback,
+                halt_checker=_is_halted,
+            ),
+        )
+    else:
+        reason = '默认更新跳过全市场财务历史回填；设置 AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1 后手动运行完整回填'
+        results['financial'] = _skipped_extension_stage(reason)
+        _append_update_job_log(job_id, f'Tushare 扩展数据 financial 已跳过: {reason}。')
 
     status = 'completed_with_warnings' if warnings or store.list_warnings() else 'completed'
     summary = {'status': status, 'datasets': results, 'warnings': warnings + store.list_warnings()}
@@ -2275,7 +2343,12 @@ def get_stock_detail(code):
             'period': period,
             'period_label': STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['label'],
             'data': data,
-            'adjusted_data': build_adjusted_candles(_tushare_ext_store(), code, limit=limit),
+            'adjusted_data': build_adjusted_candles(
+                _tushare_ext_store(),
+                code,
+                limit=limit,
+                required_trade_dates=[item.get('date') for item in data],
+            ),
             **build_stock_extension_payload(_tushare_ext_store(), code),
         })
     except ValueError as e:
@@ -2773,7 +2846,12 @@ def get_dashboard_pulse():
     try:
         data_dir = str(_active_data_dir())
         data_root = str(_data_root_dir())
-        payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily', refresh=False)
+        payload = build_heatmap_payload(
+            data_dir=data_dir,
+            scope='all',
+            metric='daily',
+            refresh=market_cache_needs_refresh(data_dir),
+        )
         health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
         industry_groups = [{
@@ -2807,6 +2885,8 @@ def get_dashboard_pulse():
                 'market_trading': build_market_trading_summary(
                     _tushare_ext_store(),
                     payload.get('latest_date') or datetime.now().strftime('%Y-%m-%d'),
+                    market_amount_yi=(payload.get('ticker_stats') or {}).get('market_amount_yi'),
+                    previous_market_amount_yi=(payload.get('ticker_stats') or {}).get('previous_market_amount_yi'),
                 ),
                 'active_provider': load_active_provider(data_root),
                 'provider_statuses': list_provider_statuses(data_root),

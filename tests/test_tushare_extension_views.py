@@ -57,10 +57,18 @@ def test_index_payload_clamps_month_range_and_adds_ma_lines(tmp_path):
 def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     store.upsert_rows(
+        "daily",
+        [
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "amount": 1_000_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "amount": 600_000},
+        ],
+        key_fields=("trade_date", "ts_code"),
+    )
+    store.upsert_rows(
         "top_list",
         [
-            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_amount": 300},
-            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_amount": 100},
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_amount": 300_000_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_amount": 100_000_000},
         ],
         key_fields=("trade_date", "ts_code"),
     )
@@ -73,6 +81,22 @@ def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
         key_fields=("trade_date", "ts_code"),
     )
     store.upsert_rows(
+        "moneyflow",
+        [
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_mf_amount": 30_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_mf_amount": 10_000},
+        ],
+        key_fields=("trade_date", "ts_code"),
+    )
+    store.upsert_rows(
+        "margin",
+        [
+            {"trade_date": "20260630", "exchange_id": "SSE", "rzrqye": 50_000_000_000},
+            {"trade_date": "20260629", "exchange_id": "SSE", "rzrqye": 45_000_000_000},
+        ],
+        key_fields=("trade_date", "exchange_id"),
+    )
+    store.upsert_rows(
         "moneyflow_hsgt",
         [
             {"trade_date": "20260630", "north_money": 12.5},
@@ -83,10 +107,26 @@ def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
 
     summary = build_market_trading_summary(store, "2026-06-30")
 
-    assert summary["metrics"]["dragon_tiger_net"]["value"] == 300
-    assert summary["metrics"]["dragon_tiger_net"]["delta"] == 200
-    assert summary["metrics"]["block_trade_amount"]["delta"] == 400
+    assert summary["metrics"]["market_amount"]["value"] == 10.0
+    assert summary["metrics"]["market_amount"]["delta"] == 4.0
+    assert summary["metrics"]["main_money_flow"]["value"] == 3.0
+    assert summary["metrics"]["dragon_tiger_net"]["value"] == 3.0
+    assert summary["metrics"]["dragon_tiger_net"]["delta"] == 2.0
+    assert summary["metrics"]["block_trade_amount"]["delta"] == 0.04
+    assert summary["metrics"]["margin_balance"]["value"] == 500.0
     assert summary["metrics"]["northbound_money"]["delta"] == 15.0
+    assert summary["metrics"]["market_amount"]["unit"] == "亿元"
+
+
+def test_market_trading_summary_keeps_missing_money_data_empty(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+
+    summary = build_market_trading_summary(store, "2026-06-30")
+
+    assert summary["metrics"]["market_amount"]["value"] is None
+    assert summary["metrics"]["market_amount"]["delta"] is None
+    assert summary["metrics"]["margin_balance"]["value"] is None
+    assert summary["metrics"]["northbound_money"]["value"] is None
 
 
 def test_stock_extension_payload_combines_meta_valuation_and_financials(tmp_path):
@@ -159,3 +199,31 @@ def test_build_adjusted_candles_uses_adj_factor_for_qfq_prices(tmp_path):
     assert candles[0]["date"] == "2026-06-30"
     assert candles[0]["close"] == 21.0
     assert candles[1]["close"] == 5.25
+
+
+def test_build_adjusted_candles_requires_full_visible_coverage(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "daily",
+        [
+            {"ts_code": "000001.SZ", "trade_date": "20260630", "open": 20, "high": 22, "low": 19, "close": 21},
+            {"ts_code": "000001.SZ", "trade_date": "20260629", "open": 10, "high": 11, "low": 9, "close": 10.5},
+        ],
+        key_fields=("ts_code", "trade_date"),
+    )
+    store.upsert_rows(
+        "adj_factor",
+        [
+            {"ts_code": "000001.SZ", "trade_date": "20260630", "adj_factor": 2.0},
+            {"ts_code": "000001.SZ", "trade_date": "20260629", "adj_factor": 1.0},
+        ],
+        key_fields=("ts_code", "trade_date"),
+    )
+
+    candles = build_adjusted_candles(
+        store,
+        "000001",
+        required_trade_dates=["20260630", "20260629", "20260626"],
+    )
+
+    assert candles == []
