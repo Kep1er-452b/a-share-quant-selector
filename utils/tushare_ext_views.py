@@ -1,0 +1,401 @@
+"""Read-model helpers for the local Tushare extension warehouse."""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Iterable
+
+import pandas as pd
+
+from utils.tushare_ext_store import TushareExtStore
+
+
+INDEX_SYMBOLS = {
+    "sh000001": {"ts_code": "000001.SH", "name": "上证指数"},
+    "sz399001": {"ts_code": "399001.SZ", "name": "深证成指"},
+    "sz399006": {"ts_code": "399006.SZ", "name": "创业板指"},
+    "sh000688": {"ts_code": "000688.SH", "name": "科创50"},
+    "sh000300": {"ts_code": "000300.SH", "name": "沪深300"},
+}
+
+PERIOD_DATASETS = {
+    "daily": "index_daily",
+    "weekly": "index_weekly",
+    "monthly": "index_monthly",
+}
+
+
+def _date_text(value) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return text
+    return pd.to_datetime(value).strftime("%Y%m%d")
+
+
+def _display_date(value) -> str:
+    text = _date_text(value)
+    if len(text) == 8:
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
+
+
+def _to_number(value):
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return value
+    if pd.isna(numeric):
+        return None
+    return numeric
+
+
+def _round_or_none(value, digits: int = 4):
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_stock_code(code: str) -> str:
+    code = str(code or "").strip().upper()
+    if "." in code:
+        return code
+    suffix = "SH" if code.startswith(("5", "6", "9")) else "SZ"
+    return f"{code}.{suffix}"
+
+
+def _normalize_index_symbol(symbol: str) -> dict:
+    key = str(symbol or "").strip().lower()
+    if key in INDEX_SYMBOLS:
+        return INDEX_SYMBOLS[key]
+    compact = key.replace(".", "")
+    for item in INDEX_SYMBOLS.values():
+        if compact in {item["ts_code"].lower().replace(".", ""), item["ts_code"].split(".")[0]}:
+            return item
+    return {"ts_code": str(symbol or "").upper(), "name": str(symbol or "").upper()}
+
+
+def calculate_moving_average(values: Iterable[float | int | None], window: int) -> list[float | None]:
+    """Return a same-length simple moving average for ascending price values."""
+
+    window = int(window or 0)
+    series = [_to_number(value) for value in values]
+    if window <= 0:
+        return [None for _ in series]
+
+    result: list[float | None] = []
+    rolling: list[float] = []
+    for value in series:
+        if value is None:
+            rolling.append(float("nan"))
+        else:
+            rolling.append(float(value))
+        if len(rolling) > window:
+            rolling.pop(0)
+        if len(rolling) < window or any(pd.isna(item) for item in rolling):
+            result.append(None)
+        else:
+            result.append(round(sum(rolling) / window, 4))
+    return result
+
+
+def _ema(values: list[float], span: int) -> list[float]:
+    alpha = 2 / (int(span) + 1)
+    output: list[float] = []
+    current: float | None = None
+    for value in values:
+        current = value if current is None else (value * alpha + current * (1 - alpha))
+        output.append(current)
+    return output
+
+
+def calculate_macd(
+    values: Iterable[float | int | None],
+    *,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> dict[str, list[float | None]]:
+    """Return MACD lines over ascending prices with standard 12/26/9 defaults."""
+
+    prices = [_to_number(value) for value in values]
+    numeric = [float(value) if value is not None else None for value in prices]
+    if not numeric:
+        return {"dif": [], "dea": [], "macd": []}
+
+    filled: list[float] = []
+    last = next((value for value in numeric if value is not None), 0.0)
+    for value in numeric:
+        if value is not None:
+            last = value
+        filled.append(float(last))
+
+    ema_fast = _ema(filled, fast)
+    ema_slow = _ema(filled, slow)
+    dif = [fast_value - slow_value for fast_value, slow_value in zip(ema_fast, ema_slow)]
+    dea = _ema(dif, signal)
+    macd = [(dif_value - dea_value) * 2 for dif_value, dea_value in zip(dif, dea)]
+    return {
+        "dif": [round(value, 4) for value in dif],
+        "dea": [round(value, 4) for value in dea],
+        "macd": [round(value, 4) for value in macd],
+    }
+
+
+def build_index_kline_payload(
+    store: TushareExtStore,
+    symbol: str,
+    *,
+    months: int = 3,
+    today: date | None = None,
+    period: str = "daily",
+) -> dict:
+    months = min(max(int(months or 3), 3), 6)
+    today = today or datetime.now().date()
+    period = period if period in PERIOD_DATASETS else "daily"
+    dataset = PERIOD_DATASETS[period]
+    index_info = _normalize_index_symbol(symbol)
+    ts_code = index_info["ts_code"]
+    start_date = (pd.Timestamp(today) - pd.DateOffset(months=months)).strftime("%Y%m%d")
+    end_date = _date_text(today)
+
+    all_rows = store.query_rows(dataset, ts_code=ts_code, end_date=end_date, descending=False)
+    closes = [_to_number(row.get("close")) for row in all_rows]
+    ma50 = calculate_moving_average(closes, 50)
+    ma200 = calculate_moving_average(closes, 200)
+
+    candles = []
+    for row, ma50_value, ma200_value in zip(all_rows, ma50, ma200):
+        trade_date = _date_text(row.get("trade_date"))
+        if trade_date < start_date:
+            continue
+        candles.append(
+            {
+                "date": _display_date(trade_date),
+                "trade_date": trade_date,
+                "open": _round_or_none(row.get("open")),
+                "high": _round_or_none(row.get("high")),
+                "low": _round_or_none(row.get("low")),
+                "close": _round_or_none(row.get("close")),
+                "volume": _round_or_none(row.get("vol") if row.get("vol") is not None else row.get("volume")),
+                "amount": _round_or_none(row.get("amount")),
+                "MA50": ma50_value,
+                "MA200": ma200_value,
+            }
+        )
+
+    return {
+        "symbol": symbol,
+        "ts_code": ts_code,
+        "name": index_info["name"],
+        "period": period,
+        "months": months,
+        "source": f"tushare:{dataset}",
+        "cache_status": "ready" if candles else "empty",
+        "candles": candles,
+        "sync_warnings": store.list_warnings(),
+    }
+
+
+def _rows_for_date(store: TushareExtStore, dataset: str, trade_date: str) -> list[dict]:
+    return store.query_rows(dataset, start_date=trade_date, end_date=trade_date, descending=False)
+
+
+def _sum_field(rows: Iterable[dict], field: str) -> float:
+    total = 0.0
+    for row in rows:
+        value = _to_number(row.get(field))
+        if isinstance(value, (int, float)):
+            total += float(value)
+    return round(total, 4)
+
+
+def _previous_trade_date(store: TushareExtStore, latest_date: str, datasets: Iterable[str]) -> str | None:
+    candidates: set[str] = set()
+    for dataset in datasets:
+        for row in store.query_rows(dataset, end_date=latest_date, descending=True):
+            trade_date = _date_text(row.get("trade_date"))
+            if trade_date and trade_date < latest_date:
+                candidates.add(trade_date)
+                break
+    return max(candidates) if candidates else None
+
+
+def _metric(label: str, value: float, previous: float | None, unit: str = "") -> dict:
+    return {
+        "label": label,
+        "value": value,
+        "previous_value": previous,
+        "delta": None if previous is None else round(value - previous, 4),
+        "unit": unit,
+    }
+
+
+def build_market_trading_summary(store: TushareExtStore, latest_date: str) -> dict:
+    latest = _date_text(latest_date)
+    datasets = ("daily_basic", "moneyflow", "top_list", "block_trade", "margin", "moneyflow_hsgt")
+    previous = _previous_trade_date(store, latest, datasets)
+
+    current_top = _rows_for_date(store, "top_list", latest)
+    previous_top = _rows_for_date(store, "top_list", previous) if previous else []
+    current_blocks = _rows_for_date(store, "block_trade", latest)
+    previous_blocks = _rows_for_date(store, "block_trade", previous) if previous else []
+    current_hsgt = _rows_for_date(store, "moneyflow_hsgt", latest)
+    previous_hsgt = _rows_for_date(store, "moneyflow_hsgt", previous) if previous else []
+    current_moneyflow = _rows_for_date(store, "moneyflow", latest)
+    previous_moneyflow = _rows_for_date(store, "moneyflow", previous) if previous else []
+    current_margin = _rows_for_date(store, "margin", latest)
+    previous_margin = _rows_for_date(store, "margin", previous) if previous else []
+
+    dragon_tiger_net = _sum_field(current_top, "net_amount")
+    previous_dragon_tiger_net = _sum_field(previous_top, "net_amount") if previous else None
+    block_trade_amount = _sum_field(current_blocks, "amount")
+    previous_block_trade_amount = _sum_field(previous_blocks, "amount") if previous else None
+    northbound_money = _sum_field(current_hsgt, "north_money")
+    previous_northbound_money = _sum_field(previous_hsgt, "north_money") if previous else None
+    main_money_flow = _sum_field(current_moneyflow, "net_mf_amount")
+    previous_main_money_flow = _sum_field(previous_moneyflow, "net_mf_amount") if previous else None
+    margin_balance = _sum_field(current_margin, "rzrqye")
+    previous_margin_balance = _sum_field(previous_margin, "rzrqye") if previous else None
+
+    metrics = {
+        "market_amount": _metric("市场成交额", 0.0, None, "亿元"),
+        "main_money_flow": _metric("主力资金流", main_money_flow, previous_main_money_flow, "万元"),
+        "dragon_tiger_net": _metric("龙虎榜净额", dragon_tiger_net, previous_dragon_tiger_net, "万元"),
+        "dragon_tiger_count": _metric("龙虎榜数量", float(len(current_top)), float(len(previous_top)) if previous else None, "家"),
+        "block_trade_amount": _metric("大宗交易金额", block_trade_amount, previous_block_trade_amount, "万元"),
+        "margin_balance": _metric("两融余额", margin_balance, previous_margin_balance, "万元"),
+        "northbound_money": _metric("北向资金", northbound_money, previous_northbound_money, "亿元"),
+    }
+    return {
+        "trade_date": _display_date(latest),
+        "previous_trade_date": _display_date(previous) if previous else None,
+        "metrics": metrics,
+        "sync_warnings": store.list_warnings(),
+    }
+
+
+def _latest_row(store: TushareExtStore, dataset: str, ts_code: str) -> dict:
+    rows = store.query_rows(dataset, ts_code=ts_code, limit=1, descending=True)
+    return rows[0] if rows else {}
+
+
+def _pick(row: dict, fields: Iterable[str]) -> dict:
+    output = {}
+    for field in fields:
+        if field in row and row.get(field) not in (None, ""):
+            output[field] = _to_number(row.get(field))
+    return output
+
+
+def build_stock_extension_payload(store: TushareExtStore, code: str) -> dict:
+    ts_code = _normalize_stock_code(code)
+    meta = _latest_row(store, "stock_basic", ts_code)
+    valuation_row = _latest_row(store, "daily_basic", ts_code)
+    financial_row = _latest_row(store, "fina_indicator", ts_code)
+
+    valuation = _pick(
+        valuation_row,
+        (
+            "trade_date",
+            "pe",
+            "pe_ttm",
+            "pb",
+            "ps",
+            "ps_ttm",
+            "dv_ratio",
+            "dv_ttm",
+            "turnover_rate",
+            "turnover_rate_f",
+            "volume_ratio",
+            "total_mv",
+            "circ_mv",
+        ),
+    )
+    financial = _pick(
+        financial_row,
+        (
+            "end_date",
+            "roe",
+            "roa",
+            "grossprofit_margin",
+            "netprofit_margin",
+            "eps",
+            "or_yoy",
+            "netprofit_yoy",
+            "dt_netprofit_yoy",
+            "debt_to_assets",
+            "assets_yoy",
+            "bps",
+        ),
+    )
+    company = {
+        "name": meta.get("name"),
+        "industry": meta.get("industry"),
+        "area": meta.get("area"),
+        "market": meta.get("market"),
+        "exchange": meta.get("exchange"),
+        "list_date": meta.get("list_date"),
+    }
+    return {
+        "meta": {key: value for key, value in meta.items() if value not in (None, "")},
+        "valuation": valuation,
+        "financial": financial,
+        "company": {key: value for key, value in company.items() if value not in (None, "")},
+        "trading": {
+            "top_list": _latest_row(store, "top_list", ts_code),
+            "moneyflow": _latest_row(store, "moneyflow", ts_code),
+            "margin_detail": _latest_row(store, "margin_detail", ts_code),
+            "block_trade": _latest_row(store, "block_trade", ts_code),
+        },
+        "sync_warnings": store.list_warnings(),
+    }
+
+
+def build_adjusted_candles(store: TushareExtStore, code: str, *, limit: int | None = None) -> list[dict]:
+    """Build qfq chart candles from raw daily prices plus Tushare adj_factor."""
+
+    ts_code = _normalize_stock_code(code)
+    price_rows = store.query_rows("daily", ts_code=ts_code, limit=limit, descending=True)
+    factor_rows = store.query_rows("adj_factor", ts_code=ts_code, descending=True)
+    factors = {
+        _date_text(row.get("trade_date")): _to_number(row.get("adj_factor"))
+        for row in factor_rows
+        if _to_number(row.get("adj_factor")) not in (None, 0)
+    }
+    if not price_rows or not factors:
+        return []
+
+    latest_factor_date = max(factors)
+    latest_factor = factors.get(latest_factor_date)
+    if not isinstance(latest_factor, (int, float)) or latest_factor == 0:
+        return []
+
+    candles = []
+    for row in price_rows:
+        trade_date = _date_text(row.get("trade_date"))
+        factor = factors.get(trade_date)
+        if not isinstance(factor, (int, float)) or factor <= 0:
+            continue
+        ratio = factor / latest_factor
+        candles.append(
+            {
+                "date": _display_date(trade_date),
+                "trade_date": trade_date,
+                "open": _round_or_none((_to_number(row.get("open")) or 0) * ratio, 4),
+                "high": _round_or_none((_to_number(row.get("high")) or 0) * ratio, 4),
+                "low": _round_or_none((_to_number(row.get("low")) or 0) * ratio, 4),
+                "close": _round_or_none((_to_number(row.get("close")) or 0) * ratio, 4),
+                "volume": _round_or_none(row.get("vol") if row.get("vol") is not None else row.get("volume")),
+                "amount": _round_or_none(row.get("amount")),
+                "adj_factor": _round_or_none(factor, 8),
+                "adjustment": "qfq",
+            }
+        )
+    return candles
