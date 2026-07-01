@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `807fdad9a61acb2f2b076686a71b448ae45a405b`
-  (`Refine provider routing and update handling`, 2026-06-29).
+  `3b3ac3bdbeb7057f88b3e3b62ec1f6743c20c918`
+  (`Upgrade dashboard and stock detail UI`, 2026-07-01).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -87,6 +87,13 @@ environment variables or ignored local config files, never in committed docs.
 - `utils/runtime_paths.py`: repository-external selection and Wyckoff output paths.
 - `utils/technical.py`: Tongdaxin-style indicators and shared feature preparation.
 - `utils/market_overview.py`: snapshots, heatmap data, cache health and rebuilds.
+- `utils/tushare_ext_store.py`: SQLite repository for the Tushare extension
+  warehouse under `data/providers/tushare/extended/`.
+- `utils/tushare_ext_sync.py`: Tushare extension dataset sync stages for
+  basics, prices, valuations, finance, trading, and index caches.
+- `utils/tushare_ext_views.py`: read-model helpers for index K-lines,
+  stock-side valuation/finance payloads, adjusted candles, and Market Pulse
+  trading summaries.
 - `web/templates/index.html`: application shell.
 - `web/static/js/app.js`: frontend state and all page interactions.
 - `web/static/css/style.css`: frontend styling.
@@ -147,6 +154,28 @@ Critical rules:
 - Web update progress around `82%` is the transition from target-stock sync to
   market-cache refresh. Inspect `_refresh_market_caches_for_job()` and the update
   status API before blaming the frontend.
+
+### Tushare Extension Warehouse
+
+- Tushare now has a separate SQLite extension warehouse at
+  `data/providers/tushare/extended/tushare_ext.sqlite`.
+- The extension warehouse does not replace provider CSVs. CSVs remain the
+  compatibility layer for selection, existing stock charts, and Wyckoff.
+- Extension rows are stored by dataset and row key in `ext_dataset_rows`.
+  Sync state and graceful permission warnings are stored in `ext_sync_state`.
+- Permission/VIP failures in optional extension endpoints should become warning
+  sync states and visible UI warnings, not hard crashes of the main price sync.
+- Startup should only call the lightweight index cache path. Heavy stock,
+  finance, valuation, and trading extension sync belongs to the existing update
+  job after the main provider CSV sync succeeds.
+- Price extension datasets include raw `daily`, `weekly`, `monthly`,
+  `adj_factor`, and optional `daily_qfq` through Tushare `pro_bar` when the
+  provider exposes it. Frontend qfq display can derive adjusted candles from
+  raw daily plus `adj_factor` when extension data is present, falling back to
+  the current CSV `data` payload otherwise.
+- Market trading extension datasets currently include `top_list`, `top_inst`,
+  `block_trade`, `moneyflow`, `margin`, `margin_detail`, `moneyflow_hsgt`, and
+  historical/limited `hk_hold`.
 
 ## 7. Strategy Architecture
 
@@ -240,10 +269,11 @@ At commit `b038324`, the full suite result was:
 54 passed
 ```
 
-The current uncommitted selection/Tushare integrity fix passed:
+The latest comprehensive verification on branch
+`codex/tushare-comprehensive-upgrade` passed:
 
 ```text
-87 passed
+137 passed
 ```
 
 Useful runtime checks:
@@ -282,10 +312,25 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `807fdad` on local `main`; `origin/main` is also `807fdad`.
+Baseline commit: `3b3ac3b` on branch
+`codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
 
+- The Tushare comprehensive upgrade branch adds a SQLite extension
+  warehouse, extension sync/read-model modules, Tushare-backed F1 index K-lines,
+  `/api/index-detail/<symbol>`, stock extension payloads, Market Pulse trading
+  summaries, qfq adjusted candles from `adj_factor`, configurable MA overlays,
+  and a MACD panel. Focused extension tests currently pass:
+  `25 passed`.
+- The update job now runs Tushare extension stages after main CSV sync and
+  market-cache refresh: basics, index, prices, valuation, trading, and finance.
+  Stage failures are warning-style and preserve the main price-sync result.
+- F1 index cache warm-up runs at Web startup and should remain index-only.
+  Do not add full-market stock/finance sync to the startup path.
+- The stock detail modal now uses a chart-left/info-right layout. It removes
+  the old bottom KV strip and uses right-side panels for crosshair snapshot,
+  valuation, financial, and company information.
 - B1 V2.42.61 is implemented as `B1V24261Strategy`.
 - `B1MinJSimpleStrategy` retains its independent legacy Zhixing conditions.
 - `B1MinJ61ComplexStrategy` is added as a separate full V2.42.61 + dynamic
@@ -445,7 +490,7 @@ State at handoff:
   Web `/api/update/start` with `max_stocks=1` completed for both providers,
   with `current_step="更新完成"` and `error=null`, without modifying the formal
   repository `data/` warehouse.
-- The current uncommitted Wyckoff upgrade aligns the Web/DeepSeek prompt and
+- The committed Wyckoff upgrade aligns the Web/DeepSeek prompt and
   output contract with the newer "威科夫二世" skill: prompt reading order is
   background-first, `book_judgment` is validated and backfilled, formatted
   analysis text now surfaces current bias, next scenarios, invalidation, and
@@ -465,6 +510,15 @@ the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `3b3ac3b` (2026-07-01): upgraded F1 index controls and stock detail UI with
+  Tushare MA50/MA200 index overlays, MA/MACD chart controls, market trading
+  cards, and a chart-left/info-right detail modal.
+- `18587ef` (2026-07-01): wired the Tushare extension warehouse into Web APIs,
+  startup index cache warm-up, stock detail extension payloads, Market Pulse
+  trading summaries, and post-price-sync update stages.
+- `39b1f07` (2026-07-01): added the Tushare SQLite extension warehouse,
+  resumable sync-state storage, optional permission warnings, price/finance/
+  trading/index sync services, adjusted-candle derivation, and read models.
 - `08fa2a1` (2026-06-18): serialized Tushare `daily_basic` cache misses and
   reconciled the post-migration update handoff.
 - `8875a11` (2026-06-14): made update/selection admission mutually exclusive
