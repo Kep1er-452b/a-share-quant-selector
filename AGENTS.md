@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `3b3ac3bdbeb7057f88b3e3b62ec1f6743c20c918`
-  (`Upgrade dashboard and stock detail UI`, 2026-07-01).
+  `72cb7c42897c4089ac319e79a031d626ea96cc64`
+  (`Fix Tushare extension display and update defaults`, 2026-07-01).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -146,8 +146,10 @@ Critical rules:
 ### Market Caches
 
 - Snapshot and heatmap caches are derived data, not primary stock history.
-- Snapshot schema version 2 stores `previous_close` so daily price-limit counts
-  can use exchange tick rounding instead of a percentage-only approximation.
+- Snapshot schema version 3 stores `previous_close`, latest `amount`, and
+  previous-row `amount`. Daily price-limit counts use `previous_close`, while
+  Market Pulse uses the amount fields for latest-trading-day market turnover
+  and previous-day deltas.
 - Daily limit counts use 10% for ordinary main-board stocks, 5% for main-board
   ST stocks, and 20% for ChiNext/STAR stocks. The first five stored trading
   days are excluded from limit counts.
@@ -165,14 +167,20 @@ Critical rules:
   Sync state and graceful permission warnings are stored in `ext_sync_state`.
 - Permission/VIP failures in optional extension endpoints should become warning
   sync states and visible UI warnings, not hard crashes of the main price sync.
-- Startup should only call the lightweight index cache path. Heavy stock,
-  finance, valuation, and trading extension sync belongs to the existing update
-  job after the main provider CSV sync succeeds.
+- Startup should only call the lightweight index cache path.
+- Default Tushare update jobs run lightweight extension stages only after the
+  main provider CSV sync succeeds: basics, index cache, latest valuation, and
+  recent trading snapshots. Full-market six-year price extension backfill and
+  all-history financial backfill are skipped by default. Run them explicitly by
+  setting `AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1` or
+  `TUSHARE_EXTENSION_FULL_BACKFILL=1`, or by setting
+  `data_source.tushare.extension_full_backfill` / `tushare_extension.full_backfill`
+  in local config.
 - Price extension datasets include raw `daily`, `weekly`, `monthly`,
   `adj_factor`, and optional `daily_qfq` through Tushare `pro_bar` when the
   provider exposes it. Frontend qfq display can derive adjusted candles from
-  raw daily plus `adj_factor` when extension data is present, falling back to
-  the current CSV `data` payload otherwise.
+  raw daily plus `adj_factor` only when the derived candles cover every visible
+  chart date, falling back to the current CSV `data` payload otherwise.
 - Market trading extension datasets currently include `top_list`, `top_inst`,
   `block_trade`, `moneyflow`, `margin`, `margin_detail`, `moneyflow_hsgt`, and
   historical/limited `hk_hold`.
@@ -273,7 +281,7 @@ The latest comprehensive verification on branch
 `codex/tushare-comprehensive-upgrade` passed:
 
 ```text
-137 passed
+142 passed
 ```
 
 Useful runtime checks:
@@ -312,7 +320,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `3b3ac3b` on branch
+Baseline commit: `72cb7c4` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
@@ -321,11 +329,26 @@ State at handoff:
   warehouse, extension sync/read-model modules, Tushare-backed F1 index K-lines,
   `/api/index-detail/<symbol>`, stock extension payloads, Market Pulse trading
   summaries, qfq adjusted candles from `adj_factor`, configurable MA overlays,
-  and a MACD panel. Focused extension tests currently pass:
-  `25 passed`.
-- The update job now runs Tushare extension stages after main CSV sync and
-  market-cache refresh: basics, index, prices, valuation, trading, and finance.
-  Stage failures are warning-style and preserve the main price-sync result.
+  and a MACD panel. Focused extension/market tests currently pass:
+  `36 passed`.
+- The default update job now runs lightweight Tushare extension stages after
+  main CSV sync and market-cache refresh: basics, index, latest valuation, and
+  recent trading snapshots for current/previous comparisons. Heavy price and
+  financial backfills are explicit opt-in via the full-backfill flags described
+  above. Stage failures remain warning-style and preserve the main price-sync
+  result.
+- Market Pulse trading money metrics are normalized to 亿元. Missing extension
+  rows return empty UI values instead of misleading zeroes. The local market
+  turnover metric comes from latest-trading-day CSV amounts and ignores stale
+  suspended-stock latest rows.
+- Stock detail market-value fields from Tushare `daily_basic.total_mv/circ_mv`
+  are frontend-formatted from 万元 into 亿/万亿. K-line tooltips include daily
+  change percentage with red-up/green-down styling.
+- Stock detail adjusted candles use locally derived qfq from Tushare raw
+  `daily` plus `adj_factor` only when coverage matches the visible CSV dates;
+  partial extension price syncs no longer mix incomplete adjusted candles into
+  the chart. A 000001 spot check showed 2026-04-24 and 2026-04-27 have the same
+  `adj_factor`, so the visible gap there is not an adjustment-factor jump.
 - F1 index cache warm-up runs at Web startup and should remain index-only.
   Do not add full-market stock/finance sync to the startup path.
 - The stock detail modal now uses a chart-left/info-right layout. It removes
@@ -510,6 +533,10 @@ the current worktree state.
 
 ## 14. Decision Index By Commit
 
+- `72cb7c4` (2026-07-01): made Tushare extension price/financial backfills
+  explicit opt-in, normalized Market Pulse money metrics to 亿元 with missing
+  data shown empty, guarded adjusted-candle overlays against partial coverage,
+  and added tooltip涨跌幅 plus market-value 亿/万亿 formatting.
 - `3b3ac3b` (2026-07-01): upgraded F1 index controls and stock detail UI with
   Tushare MA50/MA200 index overlays, MA/MACD chart controls, market trading
   cards, and a chart-left/info-right detail modal.
