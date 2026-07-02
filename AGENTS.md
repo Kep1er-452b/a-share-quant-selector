@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `a8675caa81a0fec2c6fce61d86a999d7174178f3`
-  (`Align sequence toggle with indicator controls`, 2026-07-02).
+  `380a77f18e7b588f6cb5b245b614c18c83584da9`
+  (`Harden review fixes for selection and Tushare sync`, 2026-07-02).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -91,6 +91,9 @@ environment variables or ignored local config files, never in committed docs.
   warehouse under `data/providers/tushare/extended/`.
 - `utils/tushare_ext_sync.py`: Tushare extension dataset sync stages for
   basics, prices, valuations, finance, trading, and index caches.
+- `utils/tushare_ext_workflow.py`: shared CLI/Web orchestration for lightweight
+  Tushare extension stages, full-backfill flags, trading-date fallback, and
+  warning-style stage failures.
 - `utils/tushare_ext_views.py`: read-model helpers for index K-lines,
   stock-side valuation/finance payloads, adjusted candles, and Market Pulse
   trading summaries.
@@ -168,11 +171,11 @@ Critical rules:
 - Permission/VIP failures in optional extension endpoints should become warning
   sync states and visible UI warnings, not hard crashes of the main price sync.
 - Startup should only call the lightweight index cache path.
-- Default Tushare update jobs run lightweight extension stages only after the
-  main provider CSV sync succeeds: basics, index cache, latest valuation, and
-  recent trading snapshots. Full-market six-year price extension backfill and
-  all-history financial backfill are skipped by default. Run them explicitly by
-  setting `AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1` or
+- Default Tushare CLI and Web update paths run the shared lightweight extension
+  workflow only after the main provider CSV sync succeeds: basics, index cache,
+  latest valuation, and recent trading snapshots. Full-market six-year price
+  extension backfill and all-history financial backfill are skipped by default.
+  Run them explicitly by setting `AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1` or
   `TUSHARE_EXTENSION_FULL_BACKFILL=1`, or by setting
   `data_source.tushare.extension_full_backfill` / `tushare_extension.full_backfill`
   in local config.
@@ -247,6 +250,9 @@ Do not hardcode a second independent grouping table in the frontend.
   names, and file paths at API boundaries.
 - Keep long update/selection/Wyckoff work outside request handlers using the
   existing job state and polling patterns.
+- In-memory Web job maps retain active jobs and the newest terminal jobs only.
+  Do not remove this pruning without adding another bounded job-lifecycle
+  mechanism; update-job pruning must also remove matching cancel events.
 - After significant frontend changes, start the local Web app and verify the
   actual interaction in a browser, not only JavaScript syntax.
 
@@ -286,11 +292,11 @@ At commit `b038324`, the full suite result was:
 ```
 
 The latest comprehensive verification on branch
-`codex/tushare-comprehensive-upgrade`, including uncommitted review fixes atop
-`a8675ca`, passed:
+`codex/tushare-comprehensive-upgrade`, including uncommitted closure/job
+lifecycle/extension-workflow/technical-performance fixes atop `380a77f`, passed:
 
 ```text
-166 passed
+171 passed
 ```
 
 Useful runtime checks:
@@ -329,28 +335,25 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `a8675ca` on branch
+Baseline commit: `380a77f` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
 
-- Uncommitted review fixes on top of `a8675ca` add local weekly/monthly index
-  resampling from `index_daily`, SQLite `dataset+trade_date` lookup helpers and
-  a source-signature cache for Market Pulse trading summaries, removal of the
-  accidental global `tushare.set_token()` call in industry metadata refresh,
-  and per-update cancellation propagation through all Tushare extension stages.
-  Additional uncommitted fixes from the user's artificial review report handle
-  Bowl Rebound missing-`market_cap` output, `Downloads` path portability,
-  B1V242B's configurable `FD15_VOL_RATIO`, DeepSeek/Wyckoff JSON and empty
-  `choices` handling, sanitized error-report IDs, Tushare rate-limit sleeps
-  outside shared locks, AkShare per-request session closing, fast K-line key
-  candle markers, standard K-line key-date normalization, Wyckoff HALT
-  cancellation, frontend watchlist/board-badge/Wyckoff polling hardening,
-  `main.py`'s import-only fallback, and C-core SMA NaN fallback semantics.
-  Verification passed: focused review tests `74 passed`, previous
-  extension/cache/Web focused tests, Python compile, `node --check`,
-  `git diff --check`, and full suite `166 passed`. These changes are
-  intentionally not committed yet for user review.
+- Uncommitted fixes on top of `380a77f` cover the current small closure and
+  cleanup batch: `utils/tushare_ext_workflow.py` now owns the shared CLI/Web
+  Tushare extension stage sequence, skip policy, trading-date fallback, and
+  warning-style failure handling; `main.py` calls that workflow after successful
+  Tushare CLI provider syncs; Web update jobs wrap the same workflow for job
+  logs/progress. In-memory Web job maps now prune old terminal jobs while
+  preserving active jobs and update cancel events for retained jobs. K-line key
+  candle date normalization is shared by standard and fast chart renderers.
+  Technical helper loops for bars-last, backset, and variable-period REF are
+  vectorized while preserving existing semantics. Verification passed:
+  `py_compile` changed Python files, `node --check web/static/js/app.js`,
+  focused related tests `62 passed`, technical/strategy equivalence tests
+  `23 passed`, `git diff --check`, and full suite `171 passed`. These changes
+  are intentionally not committed yet for user review.
 - The Tushare comprehensive upgrade branch adds a SQLite extension
   warehouse, extension sync/read-model modules, Tushare-backed F1 index K-lines,
   `/api/index-detail/<symbol>`, stock extension payloads, Market Pulse trading

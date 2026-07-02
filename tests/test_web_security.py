@@ -78,6 +78,80 @@ def test_status_accepts_existing_short_job_ids():
             web_server.update_cancel_events.pop(update_job_id, None)
 
 
+def test_terminal_web_jobs_are_pruned_without_dropping_active_jobs(monkeypatch):
+    monkeypatch.setattr(web_server, "MAX_RETAINED_TERMINAL_JOBS", 2)
+    active_update_id = "active-update"
+    stale_update_ids = [f"stale-update-{index}" for index in range(4)]
+    active_selection_id = "active-selection"
+    stale_selection_ids = [f"stale-selection-{index}" for index in range(4)]
+
+    try:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.clear()
+            web_server.update_cancel_events.clear()
+            web_server.update_jobs[active_update_id] = {
+                "job_id": active_update_id,
+                "status": "running",
+                "created_at": "2026-07-02T09:00:00",
+                "updated_at": "2026-07-02T09:00:00",
+            }
+            web_server.update_cancel_events[active_update_id] = web_server.Event()
+            for index, job_id in enumerate(stale_update_ids):
+                web_server.update_jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "created_at": f"2026-07-02T08:0{index}:00",
+                    "updated_at": f"2026-07-02T08:0{index}:00",
+                }
+                web_server.update_cancel_events[job_id] = web_server.Event()
+
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.clear()
+            web_server.selection_jobs[active_selection_id] = {
+                "job_id": active_selection_id,
+                "status": "queued",
+                "created_at": "2026-07-02T09:00:00",
+                "updated_at": "2026-07-02T09:00:00",
+            }
+            for index, job_id in enumerate(stale_selection_ids):
+                web_server.selection_jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "error",
+                    "created_at": f"2026-07-02T08:0{index}:00",
+                    "updated_at": f"2026-07-02T08:0{index}:00",
+                }
+
+        new_update_id = web_server._create_update_job("tushare")
+        new_selection_id = web_server._create_selection_job(["main"], ["B1V242BStrategy"])
+
+        with web_server.update_jobs_lock:
+            assert active_update_id in web_server.update_jobs
+            assert new_update_id in web_server.update_jobs
+            terminal_updates = [
+                job_id
+                for job_id, job in web_server.update_jobs.items()
+                if job.get("status") not in {"queued", "running"}
+            ]
+            assert terminal_updates == stale_update_ids[-2:]
+            assert set(web_server.update_cancel_events) == {active_update_id, new_update_id, *terminal_updates}
+
+        with web_server.selection_jobs_lock:
+            assert active_selection_id in web_server.selection_jobs
+            assert new_selection_id in web_server.selection_jobs
+            terminal_selections = [
+                job_id
+                for job_id, job in web_server.selection_jobs.items()
+                if job.get("status") not in {"queued", "running"}
+            ]
+            assert terminal_selections == stale_selection_ids[-2:]
+    finally:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.clear()
+            web_server.update_cancel_events.clear()
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.clear()
+
+
 def test_stock_snapshot_rows_are_sorted_by_code_before_pagination(monkeypatch):
     client = web_server.app.test_client()
     snapshot = {

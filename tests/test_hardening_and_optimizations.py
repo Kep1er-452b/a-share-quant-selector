@@ -15,7 +15,15 @@ from strategy.b1_v242p import calculate_b1_v242p_indicators
 from strategy.pattern_library import B1PatternLibrary
 import utils.stock_exporter as stock_exporter
 from utils.csv_manager import CSVManager
-from utils.technical import KDJ, normalize_price_frame, prepare_selection_features
+from utils.technical import (
+    KDJ,
+    _backset,
+    _bars_last,
+    _bars_last_count,
+    _ref_by_variable_period,
+    normalize_price_frame,
+    prepare_selection_features,
+)
 
 
 def _price_frame(rows=180):
@@ -42,6 +50,23 @@ def test_price_frame_normalization_sorts_newest_first():
     prepared = prepare_selection_features(frame)
     assert prepared["date"].is_monotonic_decreasing
     assert {"K", "D", "J", "short_term_trend", "bull_bear_line"}.issubset(prepared.columns)
+
+
+def test_technical_sequence_helpers_match_reference_loops():
+    cond = pd.Series([False, True, True, None, False, True, False, True, True], index=list("abcdefghi"))
+    counts = pd.Series([0, 1, 3, 2, -1, 1, np.nan, 2, 1], index=cond.index)
+    series = pd.Series([10, 11, 12, 13, 14, 15, 16, 17, 18], index=cond.index, dtype=float)
+    periods = pd.Series([0, 1, 2, 9, -1, np.nan, 3, 4, 8], index=cond.index)
+
+    expected_count = pd.Series([0, 1, 2, 0, 0, 1, 0, 1, 2], index=cond.index, dtype=int)
+    expected_bars_last = pd.Series([-1, 0, 0, 1, 2, 0, 1, 0, 0], index=cond.index, dtype=int)
+    expected_backset = pd.Series([True, True, True, False, False, True, True, True, True], index=cond.index, dtype=bool)
+    expected_ref = pd.Series([10.0, 10.0, 10.0, np.nan, 15.0, 15.0, 13.0, 13.0, 10.0], index=cond.index)
+
+    pd.testing.assert_series_equal(_bars_last_count(cond), expected_count)
+    pd.testing.assert_series_equal(_bars_last(cond), expected_bars_last)
+    pd.testing.assert_series_equal(_backset(cond, counts), expected_backset)
+    pd.testing.assert_series_equal(_ref_by_variable_period(series, periods), expected_ref)
 
 
 def test_kdj_matches_sorted_descending_for_shuffled_input():

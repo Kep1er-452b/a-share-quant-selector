@@ -499,54 +499,55 @@ def prepare_strategy_shared_features(df: pd.DataFrame, strategy_names=None) -> p
 
 def _bars_last_count(cond: pd.Series) -> pd.Series:
     """正序布尔序列的连续成立计数；调用前必须先把行情转为旧到新。"""
-    values = cond.fillna(False).astype(bool).tolist()
-    counts = []
-    current = 0
-    for value in values:
-        current = current + 1 if value else 0
-        counts.append(current)
+    values = cond.fillna(False).astype(bool).to_numpy(dtype=bool, copy=False)
+    if len(values) == 0:
+        return pd.Series(index=cond.index, dtype=int)
+    positions = np.arange(len(values), dtype=np.int64)
+    last_false = np.maximum.accumulate(np.where(values, -1, positions))
+    counts = np.where(values, positions - last_false, 0)
     return pd.Series(counts, index=cond.index, dtype=int)
 
 
 def _bars_last(cond: pd.Series) -> pd.Series:
     """正序布尔序列距离上一次成立的周期数；调用前必须先把行情转为旧到新。"""
-    values = cond.fillna(False).astype(bool).tolist()
-    result = []
-    last_index = None
-    for index, value in enumerate(values):
-        if value:
-            last_index = index
-            result.append(0)
-        elif last_index is None:
-            result.append(-1)
-        else:
-            result.append(index - last_index)
+    values = cond.fillna(False).astype(bool).to_numpy(dtype=bool, copy=False)
+    if len(values) == 0:
+        return pd.Series(index=cond.index, dtype=int)
+    positions = np.arange(len(values), dtype=np.int64)
+    last_true = np.maximum.accumulate(np.where(values, positions, -1))
+    result = np.where(last_true >= 0, positions - last_true, -1)
     return pd.Series(result, index=cond.index, dtype=int)
 
 
 def _backset(cond: pd.Series, counts: pd.Series) -> pd.Series:
     """通达信 BACKSET 的正序近似实现；调用前必须先把行情转为旧到新。"""
-    flags = [False] * len(cond)
-    cond_values = cond.fillna(False).astype(bool).tolist()
-    count_values = pd.to_numeric(counts, errors='coerce').fillna(0).astype(int).tolist()
-    for index, value in enumerate(cond_values):
-        if not value:
-            continue
-        count = max(count_values[index], 0)
-        start = max(0, index - count + 1)
-        for mark_index in range(start, index + 1):
-            flags[mark_index] = True
-    return pd.Series(flags, index=cond.index, dtype=bool)
+    length = len(cond)
+    if length == 0:
+        return pd.Series(index=cond.index, dtype=bool)
+    cond_values = cond.fillna(False).astype(bool).to_numpy(dtype=bool, copy=False)
+    count_values = pd.to_numeric(counts, errors='coerce').fillna(0).astype(int).to_numpy(copy=False)
+    positions = np.arange(length, dtype=np.int64)
+    active = cond_values & (count_values > 0)
+    diff = np.zeros(length + 1, dtype=np.int64)
+    starts = np.maximum(0, positions[active] - count_values[active] + 1)
+    ends = positions[active] + 1
+    np.add.at(diff, starts, 1)
+    np.add.at(diff, ends, -1)
+    return pd.Series(np.cumsum(diff[:-1]) > 0, index=cond.index, dtype=bool)
 
 
 def _ref_by_variable_period(series: pd.Series, periods: pd.Series) -> pd.Series:
     """正序序列按每行不同 REF 周期取值。"""
-    values = series.reset_index(drop=True)
-    period_values = pd.to_numeric(periods, errors='coerce').fillna(0).astype(int).tolist()
-    result = []
-    for index, period in enumerate(period_values):
-        source_index = index - period
-        result.append(values.iloc[source_index] if 0 <= source_index < len(values) else np.nan)
+    length = len(series)
+    if length == 0:
+        return pd.Series(index=series.index, dtype=float)
+    values = series.reset_index(drop=True).to_numpy(copy=False)
+    period_values = pd.to_numeric(periods, errors='coerce').fillna(0).astype(int).to_numpy(copy=False)
+    positions = np.arange(length, dtype=np.int64)
+    source_indexes = positions - period_values
+    valid = (source_indexes >= 0) & (source_indexes < length)
+    result = np.full(length, np.nan, dtype=float)
+    result[valid] = values[source_indexes[valid]]
     return pd.Series(result, index=series.index, dtype=float)
 
 

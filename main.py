@@ -37,6 +37,7 @@ from utils.progress import ProgressTracker
 from utils.provider_router import activate_provider, active_data_dir, warehouse_summary
 from utils.selection_worker import build_worker_context, process_selection_chunk, initialize_selection_worker
 from utils.strategy_labels import CATEGORY_DISPLAY_ORDER, category_label, is_invalid_stock_name
+from utils.tushare_ext_workflow import refresh_tushare_extension_data
 from utils.local_config import load_config_file
 
 
@@ -144,6 +145,7 @@ class QuantSystem:
         self.notifier = self._init_notifier()
         self.registry = get_registry("config/strategy_params.yaml")
         self._strategies_loaded = False
+        self._last_sync_summary = None
 
     def _refresh_active_csv_manager(self):
         self.csv_manager = CSVManager(active_data_dir(self.data_dir))
@@ -215,14 +217,49 @@ class QuantSystem:
         target_universe = self._resolve_target_universe(board=board, max_stocks=max_stocks)
         if not target_universe:
             return []
-        self.fetcher.sync_target_data(
+        sync_summary = self.fetcher.sync_target_data(
             target_universe,
             board=board,
             max_stocks=max_stocks,
             purpose=purpose,
         )
+        self._last_sync_summary = sync_summary or getattr(self.fetcher, "last_sync_summary", None) or {}
         self._activate_fetcher_provider()
+        self._refresh_tushare_extension_after_sync(target_universe)
         return target_universe
+
+    def _refresh_tushare_extension_after_sync(self, target_universe):
+        """Run the lightweight Tushare extension workflow after a successful CLI provider sync."""
+        if self.provider_name != "tushare" or not target_universe:
+            return None
+        summary = self._last_sync_summary or getattr(self.fetcher, "last_sync_summary", None) or {}
+        latest_trade_date = summary.get("latest_trade_date")
+        if not latest_trade_date or str(latest_trade_date).strip() in {"未知", "--"}:
+            print("⚠️ 跳过 Tushare 扩展数据同步：未能确认最新交易日。")
+            return None
+
+        print("\n🧩 同步 Tushare 扩展数据（轻量阶段）")
+        try:
+            result = refresh_tushare_extension_data(
+                self.fetcher,
+                target_universe,
+                latest_trade_date,
+                data_root=self.data_dir,
+                config=self.config,
+                log_callback=lambda message: print(f"  {message}"),
+            )
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            print(f"⚠️ Tushare 扩展数据同步失败，已保留主行情更新结果: {exc}")
+            return {"status": "warning", "warning": str(exc)}
+
+        warning_count = len(result.get("warnings") or [])
+        if warning_count:
+            print(f"⚠️ Tushare 扩展数据同步完成，但有 {warning_count} 条权限/数据警告。")
+        else:
+            print("✓ Tushare 扩展数据同步完成")
+        return result
     
     def _load_stock_names(self, stock_data):
         """加载股票名称（优先从CSV文件）"""

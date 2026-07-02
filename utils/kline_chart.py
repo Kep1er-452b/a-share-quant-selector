@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import os
+from utils.kline_chart_utils import normalize_key_candle_dates as _normalize_key_candle_dates
 from utils.strategy_labels import category_label
 
 # 设置中文字体
@@ -19,25 +20,6 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # 最大文件大小限制 (10KB)
 MAX_FILE_SIZE = 10 * 1024
-
-
-def _normalize_key_candle_dates(key_candle_dates: list | None) -> set[str]:
-    result = set()
-    for value in key_candle_dates or []:
-        if isinstance(value, pd.Timestamp):
-            result.add(value.strftime('%Y-%m-%d'))
-            continue
-        try:
-            parsed = pd.to_datetime(value)
-        except Exception:
-            parsed = None
-        if parsed is not None and not pd.isna(parsed):
-            result.add(parsed.strftime('%Y-%m-%d'))
-        else:
-            text = str(value or '').strip()
-            if text:
-                result.add(text[:10])
-    return result
 
 
 def compress_image(filepath: str, max_size: int = MAX_FILE_SIZE) -> str:

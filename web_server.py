@@ -72,6 +72,13 @@ from utils.stock_exporter import (
 )
 from utils.tushare_ext_store import TushareExtStore
 from utils.tushare_ext_sync import DEFAULT_INDEX_SYMBOLS, TushareExtSync
+from utils.tushare_ext_workflow import (
+    extension_full_backfill_enabled,
+    recent_tushare_extension_trade_dates,
+    refresh_tushare_extension_data,
+    skipped_extension_stage,
+    truthy as extension_truthy,
+)
 from utils.tushare_ext_views import (
     build_adjusted_candles,
     build_index_kline_payload,
@@ -106,6 +113,8 @@ sync_selection_active = False
 wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
 watchlist_lock = Lock()
+ACTIVE_JOB_STATUSES = {'queued', 'running'}
+MAX_RETAINED_TERMINAL_JOBS = 50
 
 INDEX_KLINE_TARGETS = {
     'sh000001': {'symbol': 'sh000001', 'name': '上证指数'},
@@ -1041,10 +1050,38 @@ def _serialize_job(job):
     return serialized
 
 
+def _job_retention_key(job_id, job):
+    return (
+        str(job.get('updated_at') or job.get('finished_at') or job.get('created_at') or ''),
+        str(job_id),
+    )
+
+
+def _prune_terminal_jobs(job_map, *, keep=None, cleanup_callback=None):
+    """Retain active jobs and the newest terminal jobs in an in-memory job map."""
+    keep = MAX_RETAINED_TERMINAL_JOBS if keep is None else max(int(keep), 0)
+    terminal_jobs = [
+        (job_id, job)
+        for job_id, job in job_map.items()
+        if job.get('status') not in ACTIVE_JOB_STATUSES
+    ]
+    overflow = len(terminal_jobs) - keep
+    if overflow <= 0:
+        return []
+
+    removed = []
+    for job_id, _job in sorted(terminal_jobs, key=lambda item: _job_retention_key(*item))[:overflow]:
+        job_map.pop(job_id, None)
+        if cleanup_callback:
+            cleanup_callback(job_id)
+        removed.append(job_id)
+    return removed
+
+
 def _find_running_job():
     with selection_jobs_lock:
         for job in selection_jobs.values():
-            if job.get('status') in {'queued', 'running'}:
+            if job.get('status') in ACTIVE_JOB_STATUSES:
                 return _serialize_job(job)
     return None
 
@@ -1074,7 +1111,7 @@ def _append_update_job_log(job_id, message):
 def _find_running_update_job():
     with update_jobs_lock:
         for job in update_jobs.values():
-            if job.get('status') in {'queued', 'running'}:
+            if job.get('status') in ACTIVE_JOB_STATUSES:
                 return _serialize_job(job)
     return None
 
@@ -1082,7 +1119,7 @@ def _find_running_update_job():
 def _find_running_diagnostic_job(report_path=None):
     with diagnostic_jobs_lock:
         for job in diagnostic_jobs.values():
-            if job.get('status') not in {'queued', 'running'}:
+            if job.get('status') not in ACTIVE_JOB_STATUSES:
                 continue
             if report_path is None or job.get('error_report_path') == str(report_path):
                 return _serialize_job(job)
@@ -1152,6 +1189,10 @@ def _create_update_job(provider, max_stocks=None):
     with update_jobs_lock:
         update_jobs[job_id] = job
         update_cancel_events[job_id] = Event()
+        _prune_terminal_jobs(
+            update_jobs,
+            cleanup_callback=lambda removed_id: update_cancel_events.pop(removed_id, None),
+        )
     return job_id
 
 
@@ -1176,6 +1217,7 @@ def _create_diagnostic_job(update_job, mode):
     }
     with diagnostic_jobs_lock:
         diagnostic_jobs[diagnostic_id] = job
+        _prune_terminal_jobs(diagnostic_jobs)
     return diagnostic_id
 
 
@@ -1262,6 +1304,7 @@ def _create_selection_job(requested_boards, requested_strategies, formula_spec=N
     _append_job_log(job, '任务已创建，等待执行。')
     with selection_jobs_lock:
         selection_jobs[job_id] = job
+        _prune_terminal_jobs(selection_jobs)
     return job_id
 
 
@@ -1550,52 +1593,19 @@ def _refresh_market_caches_for_job(job_id, data_dir):
 
 
 def _truthy(value):
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in {'1', 'true', 'yes', 'on', 'full'}
+    return extension_truthy(value)
 
 
 def _tushare_extension_full_backfill_enabled(config=None):
-    env_value = os.getenv('AQS_TUSHARE_EXTENSION_FULL_BACKFILL') or os.getenv('TUSHARE_EXTENSION_FULL_BACKFILL')
-    if env_value is not None:
-        return _truthy(env_value)
-    config = config or _load_config()
-    return _truthy(
-        get_config_value(config, 'data_source', 'tushare', 'extension_full_backfill')
-        or get_config_value(config, 'tushare_extension', 'full_backfill')
-    )
+    return extension_full_backfill_enabled(config or _load_config())
 
 
 def _recent_tushare_extension_trade_dates(store, latest_text, count=2):
-    dates = []
-    try:
-        for row in store.query_rows('trade_cal', end_date=latest_text, descending=True):
-            cal_date = str(row.get('cal_date') or row.get('trade_date') or '').strip()
-            if not cal_date or cal_date > latest_text:
-                continue
-            if str(row.get('is_open')).strip() not in {'1', '1.0', 'True', 'true'}:
-                continue
-            if cal_date not in dates:
-                dates.append(cal_date)
-            if len(dates) >= count:
-                break
-    except Exception:
-        dates = []
-
-    current = pd.to_datetime(latest_text)
-    while len(dates) < count:
-        fallback = (current - pd.offsets.BDay(len(dates))).strftime('%Y%m%d')
-        if fallback not in dates:
-            dates.append(fallback)
-        if len(dates) >= count:
-            break
-    return dates[:count]
+    return recent_tushare_extension_trade_dates(store, latest_text, count=count)
 
 
 def _skipped_extension_stage(reason):
-    return {'status': 'skipped', 'reason': reason}
+    return skipped_extension_stage(reason)
 
 
 def _refresh_tushare_extension_data_for_job(
@@ -1613,15 +1623,6 @@ def _refresh_tushare_extension_data_for_job(
     """Run optional Tushare extension stages after the core CSV sync succeeds."""
 
     store = _tushare_ext_store()
-    sync = TushareExtSync(store, provider.pro, pro_bar=getattr(getattr(provider, 'ts', None), 'pro_bar', None))
-    latest_text = pd.to_datetime(latest_trade_date).strftime('%Y%m%d')
-    full_backfill_enabled = (
-        _truthy(full_backfill)
-        if full_backfill is not None
-        else _tushare_extension_full_backfill_enabled()
-    )
-    results = {}
-    warnings = []
 
     def extension_halted():
         if _is_halted():
@@ -1640,106 +1641,34 @@ def _refresh_tushare_extension_data_for_job(
     def progress_callback(payload):
         ensure_extension_continues()
         dataset = payload.get('dataset') or 'extension'
-        status = payload.get('status') or 'running'
         _update_update_job(
             job_id,
             current_step=f'Tushare 扩展数据: {dataset}',
             progress_pct=99,
         )
-        if status == 'warning':
-            _append_update_job_log(job_id, payload.get('warning') or f'{dataset} 同步存在权限/数据警告')
 
-    def run_stage(name, func):
-        try:
-            ensure_extension_continues()
-            _append_update_job_log(job_id, f'开始同步 Tushare 扩展数据: {name}。')
-            stage_result = func()
-            ensure_extension_continues()
-            results[name] = stage_result
-            _append_update_job_log(job_id, f'Tushare 扩展数据 {name} 同步完成。')
-        except InterruptedError:
-            raise
-        except Exception as exc:
-            warning = f'Tushare 扩展数据 {name} 同步失败，已保留主行情更新结果: {exc}'
-            warnings.append(warning)
-            results[name] = {'status': 'warning', 'warning': warning}
-            _append_update_job_log(job_id, warning)
-            _append_system_log(
-                'tushare_extension_stage_warning',
-                warning,
-                {'job_id': job_id, 'stage': name},
-            )
-
-    run_stage(
-        'basics',
-        lambda: sync.sync_basics(
-            progress_callback=progress_callback,
-            halt_checker=extension_halted,
-        ),
-    )
-    run_stage(
-        'index',
-        lambda: sync.ensure_index_cache(
-            progress_callback=progress_callback,
-            halt_checker=extension_halted,
-        ),
-    )
-    if full_backfill_enabled or price_datasets is not None:
-        price_start = (pd.to_datetime(latest_text) - pd.DateOffset(years=6)).strftime('%Y%m%d')
-        run_stage(
-            'prices',
-            lambda: sync.sync_price_tracks(
-                target_universe,
-                start_date=price_start,
-                end_date=latest_text,
-                datasets=price_datasets,
-                progress_callback=progress_callback,
-                halt_checker=extension_halted,
-            ),
+    def warning_callback(stage, warning):
+        _append_system_log(
+            'tushare_extension_stage_warning',
+            warning,
+            {'job_id': job_id, 'stage': stage},
         )
-    else:
-        ensure_extension_continues()
-        reason = '默认更新跳过全市场价格扩展回填；设置 AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1 后手动运行完整回填'
-        results['prices'] = _skipped_extension_stage(reason)
-        _append_update_job_log(job_id, f'Tushare 扩展数据 prices 已跳过: {reason}。')
-    run_stage(
-        'valuation',
-        lambda: sync.sync_valuation_snapshot(
-            [latest_text],
-            progress_callback=progress_callback,
-            halt_checker=extension_halted,
-        ),
-    )
-    ensure_extension_continues()
-    trading_dates = _recent_tushare_extension_trade_dates(store, latest_text, count=2)
-    run_stage(
-        'trading',
-        lambda: sync.sync_trading_snapshot(
-            trading_dates,
-            datasets=trading_datasets,
-            progress_callback=progress_callback,
-            halt_checker=extension_halted,
-        ),
-    )
-    if full_backfill_enabled or financial_datasets is not None:
-        run_stage(
-            'financial',
-            lambda: sync.sync_financials_for_universe(
-                target_universe,
-                end_date=latest_text,
-                datasets=financial_datasets,
-                progress_callback=progress_callback,
-                halt_checker=extension_halted,
-            ),
-        )
-    else:
-        ensure_extension_continues()
-        reason = '默认更新跳过全市场财务历史回填；设置 AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1 后手动运行完整回填'
-        results['financial'] = _skipped_extension_stage(reason)
-        _append_update_job_log(job_id, f'Tushare 扩展数据 financial 已跳过: {reason}。')
 
-    status = 'completed_with_warnings' if warnings or store.list_warnings() else 'completed'
-    summary = {'status': status, 'datasets': results, 'warnings': warnings + store.list_warnings()}
+    summary = refresh_tushare_extension_data(
+        provider,
+        target_universe,
+        latest_trade_date,
+        store=store,
+        config=_load_config(),
+        full_backfill=full_backfill,
+        price_datasets=price_datasets,
+        financial_datasets=financial_datasets,
+        trading_datasets=trading_datasets,
+        halt_checker=extension_halted,
+        progress_callback=progress_callback,
+        log_callback=lambda message: _append_update_job_log(job_id, message),
+        warning_callback=warning_callback,
+    )
     _update_update_job(job_id, tushare_extension=summary)
     return summary
 
@@ -2832,6 +2761,7 @@ def start_wyckoff_stock():
                 'result': None,
                 'error': None,
             }
+            _prune_terminal_jobs(wyckoff_jobs)
         thread = Thread(target=_run_wyckoff_job, args=(job_id, query), daemon=True)
         thread.start()
         return jsonify({'success': True, 'job_id': job_id, 'data': wyckoff_jobs[job_id]})
