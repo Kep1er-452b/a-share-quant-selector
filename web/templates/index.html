@@ -788,8 +788,11 @@
                             <input class="indicator-color" id="stock-ma-color" type="color" value="#ffd700" aria-label="均线颜色">
                             <button class="icon-btn" id="stock-ma-add-btn" type="button" aria-label="添加均线" title="添加均线">+</button>
                             <div class="indicator-chip-list" id="stock-ma-list"></div>
+                            <button class="indicator-toggle sequence-toggle active" id="stock-sequence-toggle" type="button" aria-label="显示十三转" aria-pressed="true" title="显示/隐藏十三转">
+                                <span class="sequence-toggle-icon" aria-hidden="true">13</span>
+                                <span>十三转</span>
+                            </button>
                         </div>
-                        <button class="indicator-toggle active" id="stock-sequence-toggle" type="button" aria-label="显示十三转" aria-pressed="true" title="显示/隐藏十三转">13</button>
                         <div class="indicator-editor macd-editor">
                             <span class="indicator-editor-label">MACD</span>
                             <input class="indicator-input" id="stock-macd-fast" type="number" min="2" max="60" value="12" aria-label="MACD快线">

@@ -15,6 +15,8 @@ def test_dashboard_index_controls_and_stock_layout_markup_exist():
     assert 'id="stock-range-toolbar"' in html
     assert 'data-limit="all"' in html
     assert 'id="stock-sequence-toggle"' in html
+    assert 'class="indicator-toggle sequence-toggle active"' in html
+    assert 'class="sequence-toggle-icon"' in html
 
 
 def test_frontend_uses_adjusted_data_indicator_settings_and_chinese_tooltips():
@@ -50,3 +52,4 @@ def test_stock_info_panels_keep_empty_extension_sections_visible():
 def test_universe_count_has_purple_style_hook():
     css = (ROOT / "web/static/css/style.css").read_text(encoding="utf-8")
     assert ".quote-price.universe-count" in css
+    assert ".sequence-toggle-icon" in css
