@@ -109,6 +109,11 @@ def test_core_series_indicators_match_python_fallback(monkeypatch):
     pd.testing.assert_series_equal(actual_exist, expected_exist)
 
 
+def test_quant_core_sma_tdx_rejects_nan_so_python_fallback_handles_semantics():
+    with pytest.raises(quant_core.QuantCoreUnavailable):
+        quant_core.sma_tdx_forward(np.array([1.0, np.nan, 2.0], dtype=float), 3, 1)
+
+
 def test_large_window_rolling_indicators_match_python_fallback(monkeypatch):
     frame = _price_frame(240).iloc[::-1].reset_index(drop=True)
     close = frame["close"].copy()

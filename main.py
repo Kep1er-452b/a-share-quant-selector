@@ -1124,7 +1124,7 @@ B1完美图形匹配:
         from strategy.pattern_config import MIN_SIMILARITY_SCORE, DEFAULT_LOOKBACK_DAYS
         default_min_similarity = MIN_SIMILARITY_SCORE
         default_lookback_days = DEFAULT_LOOKBACK_DAYS
-    except:
+    except ImportError:
         default_min_similarity = 60.0
         default_lookback_days = 25
     

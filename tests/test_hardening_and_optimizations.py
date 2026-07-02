@@ -7,9 +7,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 
+import main
+from strategy.bowl_rebound import BowlReboundStrategy
 from strategy.b1_min_j_complex import B1MinJComplexStrategy
+from strategy.b1_v242b import B1V242BStrategy
 from strategy.b1_v242p import calculate_b1_v242p_indicators
 from strategy.pattern_library import B1PatternLibrary
+import utils.stock_exporter as stock_exporter
 from utils.csv_manager import CSVManager
 from utils.technical import KDJ, normalize_price_frame, prepare_selection_features
 
@@ -100,3 +104,80 @@ def test_csv_update_stock_is_locked_and_keeps_descending_order(tmp_path):
     result = manager.read_stock("000001")
     assert result["date"].is_monotonic_decreasing
     assert result["date"].nunique() == len(result)
+
+
+def test_bowl_rebound_signal_does_not_require_market_cap_column():
+    strategy = BowlReboundStrategy(params={"M": 3})
+    frame = pd.DataFrame([
+        {
+            "date": "2026-06-03",
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.8,
+            "close": 10.5,
+            "volume": 5000,
+            "J": 10.0,
+            "trend_above": True,
+            "j_low": True,
+            "fall_in_bowl": True,
+            "near_duokong": False,
+            "near_short_trend": False,
+            "key_candle": True,
+            "vol_ratio": 5.0,
+            "short_term_trend": 10.8,
+            "bull_bear_line": 10.2,
+        },
+        {
+            "date": "2026-06-02",
+            "open": 9.0,
+            "high": 10.0,
+            "low": 8.8,
+            "close": 9.5,
+            "volume": 1000,
+            "J": 15.0,
+            "trend_above": True,
+            "j_low": True,
+            "fall_in_bowl": False,
+            "near_duokong": False,
+            "near_short_trend": False,
+            "key_candle": False,
+            "vol_ratio": 1.0,
+            "short_term_trend": 10.0,
+            "bull_bear_line": 9.5,
+        },
+    ])
+
+    signals = strategy.select_stocks(frame, stock_name="测试")
+
+    assert signals
+    assert signals[0]["market_cap"] == 0
+
+
+def test_b1_v242b_fd15_volume_ratio_uses_configurable_param():
+    frame = _price_frame(80).sort_values("date", ascending=False).reset_index(drop=True)
+    frame["ref_close_1"] = frame["close"].shift(-1).fillna(frame["close"])
+    frame["ref_vol_1"] = 100.0
+    frame.loc[0, "open"] = 10.0
+    frame.loc[0, "close"] = 9.0
+    frame.loc[0, "volume"] = 150.0
+    frame.loc[0, "ref_close_1"] = 10.0
+    frame.loc[0, "ref_vol_1"] = 100.0
+    frame["K"] = 10.0
+    frame["D"] = 10.0
+    frame["J"] = 10.0
+
+    result = B1V242BStrategy(params={"FD15_VOL_RATIO": 2.0}).calculate_indicators(frame)
+
+    assert bool(result.loc[0, "FD15"]) is False
+
+
+def test_stock_exporter_downloads_dir_uses_current_user_home():
+    source = Path(stock_exporter.__file__).read_text(encoding="utf-8")
+    assert 'Path("/Users/chenxingyu/Downloads")' not in source
+    assert stock_exporter.DOWNLOADS_DIR == Path.home() / "Downloads"
+
+
+def test_main_pattern_config_fallback_only_catches_import_error():
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    assert "except ImportError:" in source
+    assert "except:\n        default_min_similarity" not in source

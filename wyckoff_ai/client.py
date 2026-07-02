@@ -37,10 +37,18 @@ def parse_json_content(content: str) -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
+        decoder = json.JSONDecoder()
+        payload = None
+        for match in re.finditer(r"\{", text):
+            try:
+                candidate, _ = decoder.raw_decode(text[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
             raise WyckoffClientError("模型未返回合法 JSON") from exc
-        payload = json.loads(match.group(0))
     if not isinstance(payload, dict):
         raise WyckoffClientError("模型 JSON 根节点必须是对象")
     return payload
@@ -118,7 +126,14 @@ class DeepSeekWyckoffClient:
                 errors.append(f"{name}: API 调用失败: {exc}")
                 continue
 
-            message = response.choices[0].message
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                errors.append(f"{name}: API 返回 choices 为空")
+                continue
+            message = getattr(choices[0], "message", None)
+            if message is None:
+                errors.append(f"{name}: API 返回 message 为空")
+                continue
             content = message.content or ""
             if not content.strip():
                 reasoning = getattr(message, "reasoning_content", None)

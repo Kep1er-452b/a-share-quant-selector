@@ -1608,6 +1608,7 @@ def _refresh_tushare_extension_data_for_job(
     price_datasets=None,
     financial_datasets=None,
     trading_datasets=None,
+    halt_checker=None,
 ):
     """Run optional Tushare extension stages after the core CSV sync succeeds."""
 
@@ -1622,7 +1623,22 @@ def _refresh_tushare_extension_data_for_job(
     results = {}
     warnings = []
 
+    def extension_halted():
+        if _is_halted():
+            return True
+        if halt_checker is None:
+            return False
+        try:
+            return bool(halt_checker())
+        except InterruptedError:
+            return True
+
+    def ensure_extension_continues():
+        if extension_halted():
+            raise InterruptedError('用户已停止此次更新')
+
     def progress_callback(payload):
+        ensure_extension_continues()
         dataset = payload.get('dataset') or 'extension'
         status = payload.get('status') or 'running'
         _update_update_job(
@@ -1635,8 +1651,10 @@ def _refresh_tushare_extension_data_for_job(
 
     def run_stage(name, func):
         try:
+            ensure_extension_continues()
             _append_update_job_log(job_id, f'开始同步 Tushare 扩展数据: {name}。')
             stage_result = func()
+            ensure_extension_continues()
             results[name] = stage_result
             _append_update_job_log(job_id, f'Tushare 扩展数据 {name} 同步完成。')
         except InterruptedError:
@@ -1652,8 +1670,20 @@ def _refresh_tushare_extension_data_for_job(
                 {'job_id': job_id, 'stage': name},
             )
 
-    run_stage('basics', lambda: sync.sync_basics(progress_callback=progress_callback))
-    run_stage('index', lambda: sync.ensure_index_cache(progress_callback=progress_callback))
+    run_stage(
+        'basics',
+        lambda: sync.sync_basics(
+            progress_callback=progress_callback,
+            halt_checker=extension_halted,
+        ),
+    )
+    run_stage(
+        'index',
+        lambda: sync.ensure_index_cache(
+            progress_callback=progress_callback,
+            halt_checker=extension_halted,
+        ),
+    )
     if full_backfill_enabled or price_datasets is not None:
         price_start = (pd.to_datetime(latest_text) - pd.DateOffset(years=6)).strftime('%Y%m%d')
         run_stage(
@@ -1664,14 +1694,23 @@ def _refresh_tushare_extension_data_for_job(
                 end_date=latest_text,
                 datasets=price_datasets,
                 progress_callback=progress_callback,
-                halt_checker=_is_halted,
+                halt_checker=extension_halted,
             ),
         )
     else:
+        ensure_extension_continues()
         reason = '默认更新跳过全市场价格扩展回填；设置 AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1 后手动运行完整回填'
         results['prices'] = _skipped_extension_stage(reason)
         _append_update_job_log(job_id, f'Tushare 扩展数据 prices 已跳过: {reason}。')
-    run_stage('valuation', lambda: sync.sync_valuation_snapshot([latest_text], progress_callback=progress_callback))
+    run_stage(
+        'valuation',
+        lambda: sync.sync_valuation_snapshot(
+            [latest_text],
+            progress_callback=progress_callback,
+            halt_checker=extension_halted,
+        ),
+    )
+    ensure_extension_continues()
     trading_dates = _recent_tushare_extension_trade_dates(store, latest_text, count=2)
     run_stage(
         'trading',
@@ -1679,6 +1718,7 @@ def _refresh_tushare_extension_data_for_job(
             trading_dates,
             datasets=trading_datasets,
             progress_callback=progress_callback,
+            halt_checker=extension_halted,
         ),
     )
     if full_backfill_enabled or financial_datasets is not None:
@@ -1689,10 +1729,11 @@ def _refresh_tushare_extension_data_for_job(
                 end_date=latest_text,
                 datasets=financial_datasets,
                 progress_callback=progress_callback,
-                halt_checker=_is_halted,
+                halt_checker=extension_halted,
             ),
         )
     else:
+        ensure_extension_continues()
         reason = '默认更新跳过全市场财务历史回填；设置 AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1 后手动运行完整回填'
         results['financial'] = _skipped_extension_stage(reason)
         _append_update_job_log(job_id, f'Tushare 扩展数据 financial 已跳过: {reason}。')
@@ -1989,6 +2030,7 @@ def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
                 provider,
                 target_universe,
                 provider_state.get('latest_trade_date') or datetime.now().strftime('%Y-%m-%d'),
+                halt_checker=lambda: _is_halted() or is_cancelled(),
             )
             ensure_update_continues()
         switch_allowed = (
@@ -2687,7 +2729,22 @@ def _run_wyckoff_job(job_id, query):
             progress_pct=1,
         )
 
+        def ensure_wyckoff_continues():
+            if _is_halted():
+                _update_wyckoff_job(
+                    job_id,
+                    status='cancelled',
+                    current_step='系统已急停',
+                    message='系统已急停，威科夫分析已停止。',
+                    progress_pct=0,
+                    error='系统已急停',
+                )
+                raise InterruptedError('系统已急停')
+
+        ensure_wyckoff_continues()
+
         def progress_callback(payload):
+            ensure_wyckoff_continues()
             _update_wyckoff_job(
                 job_id,
                 status='running',
@@ -2704,6 +2761,7 @@ def _run_wyckoff_job(job_id, query):
             output_dir=_wyckoff_outputs_root(),
         )
         result = pipeline.analyze_stock(query, progress_callback=progress_callback)
+        ensure_wyckoff_continues()
         _attach_wyckoff_chart_url(result)
         _update_wyckoff_job(
             job_id,
@@ -2713,6 +2771,8 @@ def _run_wyckoff_job(job_id, query):
             progress_pct=100,
             result=result,
         )
+    except InterruptedError:
+        return
     except WyckoffPipelineError as e:
         error_report_path = write_error_report(
             'wyckoff',

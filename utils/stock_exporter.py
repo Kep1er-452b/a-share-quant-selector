@@ -21,7 +21,7 @@ from utils.provider_router import get_active_provider_name, provider_data_dir
 from utils.strategy_labels import fallback_stock_name
 
 
-DOWNLOADS_DIR = Path("/Users/chenxingyu/Downloads")
+DOWNLOADS_DIR = Path.home() / "Downloads"
 
 
 try:

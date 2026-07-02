@@ -79,6 +79,49 @@ def test_index_payload_accepts_detail_limit_over_month_window(tmp_path):
     assert payload["candles"][0]["date"] < "2026-01-01"
 
 
+def test_index_detail_resamples_weekly_and_monthly_from_daily_cache(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    rows = []
+    for offset, trade_date in enumerate(pd.bdate_range("2026-04-01", "2026-06-30")):
+        rows.append(
+            {
+                "ts_code": "000001.SH",
+                "trade_date": trade_date.strftime("%Y%m%d"),
+                "open": 3000 + offset,
+                "high": 3010 + offset,
+                "low": 2990 + offset,
+                "close": 3005 + offset,
+                "vol": 1000 + offset,
+                "amount": 2000 + offset,
+            }
+        )
+    store.upsert_rows("index_daily", rows, key_fields=("ts_code", "trade_date"))
+
+    weekly = build_index_kline_payload(
+        store,
+        "sh000001",
+        period="weekly",
+        limit=20,
+        today=date(2026, 7, 1),
+    )
+    monthly = build_index_kline_payload(
+        store,
+        "sh000001",
+        period="monthly",
+        limit=20,
+        today=date(2026, 7, 1),
+    )
+
+    assert weekly["period"] == "weekly"
+    assert weekly["source"] == "tushare:index_daily:weekly"
+    assert weekly["cache_status"] == "ready"
+    assert weekly["candles"][-1]["trade_date"] == "20260630"
+    assert weekly["candles"][-1]["volume"] > rows[-1]["vol"]
+    assert monthly["period"] == "monthly"
+    assert monthly["source"] == "tushare:index_daily:monthly"
+    assert [item["trade_date"] for item in monthly["candles"]] == ["20260430", "20260529", "20260630"]
+
+
 def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     store.upsert_rows(
@@ -141,6 +184,36 @@ def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
     assert summary["metrics"]["margin_balance"]["value"] == 500.0
     assert summary["metrics"]["northbound_money"]["delta"] == 15.0
     assert summary["metrics"]["market_amount"]["unit"] == "亿元"
+
+
+def test_market_trading_summary_uses_and_invalidates_sqlite_cache(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "moneyflow",
+        [
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_mf_amount": 30_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_mf_amount": 10_000},
+        ],
+        key_fields=("trade_date", "ts_code"),
+    )
+
+    first = build_market_trading_summary(store, "2026-06-30")
+    second = build_market_trading_summary(store, "2026-06-30")
+    store.upsert_rows(
+        "moneyflow",
+        [
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_mf_amount": 60_000},
+            {"trade_date": "20260629", "ts_code": "000001.SZ", "net_mf_amount": 10_000},
+        ],
+        key_fields=("trade_date", "ts_code"),
+    )
+    third = build_market_trading_summary(store, "2026-06-30")
+
+    assert first["cache_status"] == "refreshed"
+    assert second["cache_status"] == "hit"
+    assert second["metrics"]["main_money_flow"]["value"] == 3.0
+    assert third["cache_status"] == "refreshed"
+    assert third["metrics"]["main_money_flow"]["value"] == 6.0
 
 
 def test_market_trading_summary_keeps_missing_money_data_empty(tmp_path):

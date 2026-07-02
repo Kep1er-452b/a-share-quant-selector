@@ -271,7 +271,6 @@ def _load_tushare_metadata_industries(
     try:
         import tushare as ts
 
-        ts.set_token(token)
         pro = ts.pro_api(token)
         df = pro.stock_basic(
             exchange="",

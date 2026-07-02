@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils import error_logging
 import web_server
 
 
@@ -211,6 +212,23 @@ def test_write_endpoints_validate_payload_shape_and_lengths():
     assert response.status_code == 400
 
 
+def test_error_report_id_is_sanitized_before_path_join(monkeypatch, tmp_path):
+    monkeypatch.setattr(error_logging, "ERROR_DIR", tmp_path)
+
+    report_path = error_logging.write_error_report(
+        "web/../server",
+        RuntimeError("boom"),
+        error_id="../outside/id",
+    )
+
+    assert report_path.parent == tmp_path
+    assert ".." not in report_path.name
+    assert "/" not in report_path.name
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["error_id"] == "---outside-id"
+    assert payload["module"] == "web/../server"
+
+
 def test_selection_endpoints_reject_running_update():
     client = web_server.app.test_client()
     job_id = web_server._create_update_job("tushare")
@@ -354,3 +372,41 @@ def test_pre_cancelled_update_job_finishes_as_cancelled(monkeypatch, tmp_path):
         with web_server.update_jobs_lock:
             web_server.update_jobs.pop(job_id, None)
             web_server.update_cancel_events.pop(job_id, None)
+
+
+def test_wyckoff_job_honors_global_halt_before_pipeline(monkeypatch, tmp_path):
+    job_id = "wyckoff-halt-test"
+    now = "2026-07-02 12:00:00"
+    with web_server.wyckoff_jobs_lock:
+        web_server.wyckoff_jobs[job_id] = {
+            "job_id": job_id,
+            "query": "000001",
+            "status": "queued",
+            "current_step": "排队",
+            "message": "",
+            "progress_pct": 0,
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+            "error": None,
+            "error_report_path": None,
+        }
+
+    class FailIfConstructed:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("halted Wyckoff job should not construct pipeline")
+
+    monkeypatch.setattr(web_server, "WyckoffPipeline", FailIfConstructed)
+    monkeypatch.setattr(web_server, "write_error_report", lambda *args, **kwargs: tmp_path / "wyckoff-error.json")
+    web_server.halt_event.set()
+
+    try:
+        web_server._run_wyckoff_job(job_id, "000001")
+        with web_server.wyckoff_jobs_lock:
+            job = dict(web_server.wyckoff_jobs[job_id])
+        assert job["status"] == "cancelled"
+        assert job["current_step"] == "系统已急停"
+    finally:
+        web_server.halt_event.clear()
+        with web_server.wyckoff_jobs_lock:
+            web_server.wyckoff_jobs.pop(job_id, None)

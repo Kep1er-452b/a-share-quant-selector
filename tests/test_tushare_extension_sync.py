@@ -1,6 +1,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from utils.tushare_ext_store import TushareExtStore
 from utils.tushare_ext_sync import TushareExtSync
@@ -195,6 +196,19 @@ def test_sync_daily_basic_and_finance_permission_warning(tmp_path):
     assert finance["datasets"]["fina_indicator"]["status"] == "warning"
     warnings = store.list_warnings()
     assert warnings[0]["dataset"] == "fina_indicator"
+
+
+def test_sync_valuation_and_trading_honor_halt_checker(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    pro = FakePro()
+    sync = TushareExtSync(store, pro)
+
+    with pytest.raises(InterruptedError):
+        sync.sync_valuation_snapshot(["20260630"], halt_checker=lambda: True)
+    with pytest.raises(InterruptedError):
+        sync.sync_trading_snapshot(["20260630"], datasets=["top_list"], halt_checker=lambda: True)
+
+    assert pro.calls == []
 
 
 def test_sync_price_tracks_writes_raw_periods_and_adj_factor(tmp_path):

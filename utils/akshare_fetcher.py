@@ -374,6 +374,10 @@ class AKShareFetcher(BaseDataProvider):
                 except requests.RequestException as exc:
                     last_error = exc
                     self._note_runtime_stat(f"http_{mode}_error")
+                finally:
+                    close_session = getattr(request_session, "close", None)
+                    if callable(close_session):
+                        close_session()
             if attempt + 1 < max(self.network_retries, 1):
                 time.sleep(min(0.5 * (attempt + 1), 2.0))
         raise last_error

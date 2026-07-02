@@ -3,11 +3,13 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from collections import deque
 from threading import Lock
 
 import pandas as pd
 
 import utils.data_provider as data_provider_module
+import utils.tushare_fetcher as tushare_fetcher_module
 from utils.csv_manager import CSVManager
 from utils.data_provider import BaseDataProvider
 from utils.tushare_fetcher import TushareFetcher
@@ -86,6 +88,28 @@ def test_tushare_daily_basic_date_cache_deduplicates_concurrent_requests(monkeyp
     assert call_count == 1
     assert fetcher.daily_basic_cache_hits == 7
     assert all(len(frame) == 1 for frame in frames)
+
+
+def test_tushare_rate_limit_sleep_happens_outside_daily_basic_lock(monkeypatch):
+    fetcher = TushareFetcher.__new__(TushareFetcher)
+    fetcher.daily_basic_lock = Lock()
+    fetcher.daily_basic_calls = deque([100.0])
+    fetcher.daily_basic_limit_per_minute = 1
+    timeline = iter([100.0, 160.6, 160.6])
+
+    monkeypatch.setattr(tushare_fetcher_module.time, "time", lambda: next(timeline))
+
+    def fake_sleep(seconds):
+        acquired = fetcher.daily_basic_lock.acquire(blocking=False)
+        if acquired:
+            fetcher.daily_basic_lock.release()
+        assert acquired, "daily_basic throttle slept while holding the shared rate-limit lock"
+
+    monkeypatch.setattr(tushare_fetcher_module.time, "sleep", fake_sleep)
+
+    fetcher._throttle_daily_basic()
+
+    assert list(fetcher.daily_basic_calls) == [160.6]
 
 
 def _history_frame(adj_factor=None):

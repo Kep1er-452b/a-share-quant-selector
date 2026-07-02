@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime
@@ -39,6 +40,8 @@ class TushareExtStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_ext_rows_dataset_code_date
                     ON ext_dataset_rows(dataset, ts_code, trade_date);
+                CREATE INDEX IF NOT EXISTS idx_ext_rows_dataset_date
+                    ON ext_dataset_rows(dataset, trade_date);
 
                 CREATE TABLE IF NOT EXISTS ext_sync_state (
                     dataset TEXT NOT NULL,
@@ -148,6 +151,18 @@ class TushareExtStore:
         with self.connect() as conn:
             return [json.loads(row["payload_json"]) for row in conn.execute(sql, params)]
 
+    def get_row(self, dataset: str, row_key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json
+                FROM ext_dataset_rows
+                WHERE dataset = ? AND row_key = ?
+                """,
+                (dataset, row_key),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
     def latest_trade_date(self, dataset: str, *, ts_code: str | None = None) -> str | None:
         clauses = ["dataset = ?", "trade_date IS NOT NULL", "trade_date != ''"]
         params: list[object] = [dataset]
@@ -158,6 +173,53 @@ class TushareExtStore:
         with self.connect() as conn:
             row = conn.execute(sql, params).fetchone()
         return row["latest"] if row and row["latest"] else None
+
+    def latest_trade_date_before(self, datasets: Sequence[str], before_date: str) -> str | None:
+        selected = [str(dataset) for dataset in datasets or [] if str(dataset or "").strip()]
+        if not selected:
+            return None
+        placeholders = ",".join("?" for _ in selected)
+        sql = (
+            "SELECT MAX(trade_date) AS latest "
+            "FROM ext_dataset_rows "
+            f"WHERE dataset IN ({placeholders}) "
+            "AND trade_date IS NOT NULL AND trade_date != '' AND trade_date < ?"
+        )
+        with self.connect() as conn:
+            row = conn.execute(sql, [*selected, str(before_date)]).fetchone()
+        return row["latest"] if row and row["latest"] else None
+
+    def rows_signature(self, datasets: Sequence[str], trade_dates: Sequence[str]) -> str:
+        selected_datasets = [str(dataset) for dataset in datasets or [] if str(dataset or "").strip()]
+        selected_dates = [str(item) for item in trade_dates or [] if str(item or "").strip()]
+        digest = hashlib.sha256()
+        digest.update(json.dumps([selected_datasets, selected_dates], ensure_ascii=False).encode("utf-8"))
+        if not selected_datasets or not selected_dates:
+            return digest.hexdigest()
+
+        dataset_placeholders = ",".join("?" for _ in selected_datasets)
+        date_placeholders = ",".join("?" for _ in selected_dates)
+        sql = (
+            "SELECT dataset, row_key, trade_date, updated_at, payload_json "
+            "FROM ext_dataset_rows "
+            f"WHERE dataset IN ({dataset_placeholders}) AND trade_date IN ({date_placeholders}) "
+            "ORDER BY dataset, trade_date, row_key"
+        )
+        params = [*selected_datasets, *selected_dates]
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        for row in rows:
+            digest.update(str(row["dataset"]).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(row["trade_date"]).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(row["row_key"]).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(row["updated_at"]).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(row["payload_json"]).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
 
     def set_sync_state(
         self,

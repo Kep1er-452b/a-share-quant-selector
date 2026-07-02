@@ -571,37 +571,38 @@ class TushareFetcher(BaseDataProvider):
         return any(keyword in message.lower() if keyword.isascii() else keyword in message for keyword in rate_limit_keywords)
 
     @staticmethod
-    def _throttle_call_window(calls, limit_per_minute, label):
-        now = time.time()
-        while calls and now - calls[0] >= 60:
-            calls.popleft()
+    def _throttle_call_window(lock, calls, limit_per_minute, label):
+        while True:
+            with lock:
+                now = time.time()
+                while calls and now - calls[0] >= 60:
+                    calls.popleft()
 
-        if len(calls) >= limit_per_minute:
-            wait_seconds = 60 - (now - calls[0]) + 0.5
-            wait_seconds = max(wait_seconds, 0.5)
+                if len(calls) < limit_per_minute:
+                    calls.append(now)
+                    return
+
+                wait_seconds = 60 - (now - calls[0]) + 0.5
+                wait_seconds = max(wait_seconds, 0.5)
+
             print(f"  {label} 接口接近限流，等待 {wait_seconds:.1f} 秒后继续...")
             time.sleep(wait_seconds)
-            now = time.time()
-            while calls and now - calls[0] >= 60:
-                calls.popleft()
-
-        calls.append(time.time())
 
     def _throttle_daily_basic(self):
-        with self.daily_basic_lock:
-            self._throttle_call_window(
-                self.daily_basic_calls,
-                self.daily_basic_limit_per_minute,
-                "daily_basic",
-            )
+        self._throttle_call_window(
+            self.daily_basic_lock,
+            self.daily_basic_calls,
+            self.daily_basic_limit_per_minute,
+            "daily_basic",
+        )
 
     def _throttle_pro_bar(self):
-        with self.pro_bar_lock:
-            self._throttle_call_window(
-                self.pro_bar_calls,
-                self.pro_bar_limit_per_minute,
-                "daily/adj_factor",
-            )
+        self._throttle_call_window(
+            self.pro_bar_lock,
+            self.pro_bar_calls,
+            self.pro_bar_limit_per_minute,
+            "daily/adj_factor",
+        )
 
     def _call_daily_basic(self, **kwargs):
         self._throttle_daily_basic()

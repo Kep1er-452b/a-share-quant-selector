@@ -149,12 +149,15 @@ class TushareExtSync:
         symbols: Iterable[str] = DEFAULT_INDEX_SYMBOLS,
         today: date | None = None,
         progress_callback: Callable[[dict], None] | None = None,
+        halt_checker: Callable[[], bool] | None = None,
     ) -> dict:
         today = today or datetime.now().date()
         end_date = self._date_text(today)
         fetched_rows = 0
         datasets = {}
         for symbol in symbols:
+            if halt_checker and halt_checker():
+                raise InterruptedError("用户已停止此次更新")
             latest = self.store.latest_trade_date("index_daily", ts_code=symbol)
             if latest:
                 start_date = self._date_text(pd.to_datetime(latest) + pd.Timedelta(days=1))
@@ -177,12 +180,15 @@ class TushareExtSync:
         *,
         today: date | None = None,
         progress_callback: Callable[[dict], None] | None = None,
+        halt_checker: Callable[[], bool] | None = None,
     ) -> dict:
         today = today or datetime.now().date()
         year_start = f"{today.year}0101"
         year_end = f"{today.year}1231"
         results = {}
         for dataset, spec in BASIC_ENDPOINTS.items():
+            if halt_checker and halt_checker():
+                raise InterruptedError("用户已停止此次更新")
             result = self._call_dataset(
                 dataset,
                 spec["method"],
@@ -195,6 +201,8 @@ class TushareExtSync:
             results[dataset] = result
 
         for hs_type in ("SH", "SZ"):
+            if halt_checker and halt_checker():
+                raise InterruptedError("用户已停止此次更新")
             result = self._call_dataset(
                 "hs_const",
                 "hs_const",
@@ -206,6 +214,8 @@ class TushareExtSync:
             )
             results[f"hs_const_{hs_type}"] = result
 
+        if halt_checker and halt_checker():
+            raise InterruptedError("用户已停止此次更新")
         trade_cal = self._call_dataset(
             "trade_cal",
             "trade_cal",
@@ -228,11 +238,16 @@ class TushareExtSync:
         trade_dates: Iterable[str],
         *,
         progress_callback: Callable[[dict], None] | None = None,
+        halt_checker: Callable[[], bool] | None = None,
     ) -> dict:
         results = {}
         for trade_date in trade_dates:
+            if halt_checker and halt_checker():
+                raise InterruptedError("用户已停止此次更新")
             date_text = self._date_text(trade_date)
             for dataset, spec in VALUATION_ENDPOINTS.items():
+                if halt_checker and halt_checker():
+                    raise InterruptedError("用户已停止此次更新")
                 params = dict(spec.get("params") or {})
                 params["trade_date"] = date_text
                 result = self._call_dataset(
@@ -404,12 +419,17 @@ class TushareExtSync:
         *,
         datasets: Iterable[str] | None = None,
         progress_callback: Callable[[dict], None] | None = None,
+        halt_checker: Callable[[], bool] | None = None,
     ) -> dict:
         selected = list(datasets or TRADING_ENDPOINTS.keys())
         results = {}
         for trade_date in trade_dates:
+            if halt_checker and halt_checker():
+                raise InterruptedError("用户已停止此次更新")
             date_text = self._date_text(trade_date)
             for dataset in selected:
+                if halt_checker and halt_checker():
+                    raise InterruptedError("用户已停止此次更新")
                 spec = TRADING_ENDPOINTS[dataset]
                 result = self._call_dataset(
                     dataset,

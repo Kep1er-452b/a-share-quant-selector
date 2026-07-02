@@ -24,6 +24,7 @@ class B1V242BStrategy(BaseStrategy):
             "PLRY_VOL_RATIO": 1.95,
             "HALF_DOWN_VOL_RATIO": 0.5,
             "TOP_RANGE_RATIO": 0.95,
+            "FD15_VOL_RATIO": 1.2,
             "B1_TREND_TOLERANCE": 0.985,
         }
         if params:
@@ -73,7 +74,7 @@ class B1V242BStrategy(BaseStrategy):
         result["FD15"] = (
             (result["close"] < ref_close_1) &
             (result["close"] <= result["open"]) &
-            (result["volume"] >= 1.2 * ref_vol_1)
+            (result["volume"] >= self.params["FD15_VOL_RATIO"] * ref_vol_1)
         )
         result["CNT28"] = COUNT(result["TOP15O"] & result["FD15"], 21)
         result["GOOD28"] = result["CNT28"] <= 0

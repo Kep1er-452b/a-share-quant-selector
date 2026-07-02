@@ -72,7 +72,8 @@ def write_error_report(
     ERROR_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now()
     safe_module = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(module or "system"))
-    safe_id = error_id or timestamp.strftime("%Y%m%d-%H%M%S-%f")
+    raw_id = error_id or timestamp.strftime("%Y%m%d-%H%M%S-%f")
+    safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(raw_id))
     path = ERROR_DIR / f"{timestamp.strftime('%Y%m%d-%H%M%S')}-{safe_module}-{safe_id}.json"
     payload = {
         "error_id": safe_id,

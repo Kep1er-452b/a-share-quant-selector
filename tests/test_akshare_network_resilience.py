@@ -228,6 +228,34 @@ def test_eastmoney_direct_retry_ignores_system_proxy(monkeypatch, tmp_path):
     assert frame.iloc[0]["data_source"] == "akshare:eastmoney:direct:update"
 
 
+def test_request_get_closes_per_request_sessions(monkeypatch, tmp_path):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+    closed = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, url, **kwargs):
+            return FakeResponse()
+
+        def close(self):
+            closed.append(self.trust_env)
+
+    monkeypatch.setattr(akshare_fetcher.requests, "Session", FakeSession)
+
+    response = fetcher._request_get("https://example.test/quote")
+
+    assert response.status_code == 200
+    assert closed == [True]
+
+
 def test_recent_listing_short_history_is_accepted(tmp_path):
     fetcher = AKShareFetcher(data_dir=str(tmp_path))
     recent = pd.DataFrame(

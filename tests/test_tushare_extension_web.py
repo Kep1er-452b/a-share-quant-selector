@@ -1,6 +1,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 import web_server
 from utils.tushare_ext_store import TushareExtStore
@@ -360,6 +361,25 @@ def test_refresh_tushare_extension_data_skips_heavy_stages_by_default(monkeypatc
     assert store.latest_trade_date("daily", ts_code="000001.SZ") is None
     assert store.query_rows("fina_indicator", ts_code="000001.SZ") == []
     assert store.query_rows("top_list", ts_code="000001.SZ")
+
+
+def test_refresh_tushare_extension_data_honors_job_cancel_before_stages(monkeypatch, tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    monkeypatch.setattr(web_server, "_tushare_ext_store", lambda: store, raising=False)
+    monkeypatch.setattr(web_server, "_append_update_job_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_server, "_append_system_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_server, "_update_update_job", lambda *args, **kwargs: None)
+
+    with pytest.raises(InterruptedError):
+        web_server._refresh_tushare_extension_data_for_job(
+            "job-test",
+            ExtensionProvider(),
+            [{"code": "000001", "ts_code": "000001.SZ"}],
+            "2026-06-30",
+            halt_checker=lambda: True,
+        )
+
+    assert store.query_rows("stock_basic") == []
 
 
 def test_warm_tushare_index_cache_background_is_best_effort(monkeypatch, tmp_path):

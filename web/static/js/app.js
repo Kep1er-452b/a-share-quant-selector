@@ -473,7 +473,7 @@ function classifyBoard(code) {
 
 function boardBadge(boardOrCode) {
     const board = BOARD_LABELS[boardOrCode] ? boardOrCode : classifyBoard(boardOrCode);
-    return `<span class="board-badge ${board}">${BOARD_LABELS[board] || board}</span>`;
+    return `<span class="board-badge ${escapeHtml(board)}">${escapeHtml(BOARD_LABELS[board] || board)}</span>`;
 }
 
 function abortActiveRequests() {
@@ -2936,7 +2936,7 @@ async function loadWatchlist(forceReload = false) {
     }
 
     const tbody = document.getElementById('watchlist-tbody');
-    tbody.innerHTML = '<tr><td colspan="9" class="state-loading">正在加载自选股...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="state-loading">正在加载自选股...</td></tr>';
     try {
         const result = await apiFetch('/api/watchlist');
         if (!result.success) {
@@ -3161,6 +3161,9 @@ async function pollWyckoffJob() {
         }
         if (job.status === 'error') {
             throw new Error(`${job.error || job.message || '威科夫分析失败'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`);
+        }
+        if (job.status === 'cancelled') {
+            throw new Error(job.error || job.message || '威科夫分析已停止');
         }
     } catch (error) {
         stopWyckoffProgress();
@@ -3572,8 +3575,10 @@ async function runWyckoffAnalysis() {
         }
         state.wyckoffJobId = result.job_id;
         renderWyckoffProgress(result.data || {});
-        state.wyckoffPollTimer = window.setInterval(pollWyckoffJob, 1200);
         await pollWyckoffJob();
+        if (state.wyckoffRunning && state.wyckoffJobId && !state.wyckoffPollTimer) {
+            state.wyckoffPollTimer = window.setInterval(pollWyckoffJob, 1200);
+        }
     } catch (error) {
         stopWyckoffProgress();
         updateGlobalTicker(`WYCKOFF ERROR   ${query}   ${error.message}`);

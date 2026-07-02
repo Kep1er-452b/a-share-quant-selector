@@ -59,3 +59,46 @@ def test_store_returns_latest_trade_date_for_dataset_and_code(tmp_path):
 
     assert store.latest_trade_date("index_daily", ts_code="000001.SH") == "20260630"
     assert store.latest_trade_date("index_daily", ts_code="399006.SZ") == "20260629"
+
+
+def test_store_indexes_dataset_trade_date_and_finds_previous_date(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "moneyflow",
+        [
+            {"trade_date": "20260627", "ts_code": "000001.SZ", "net_mf_amount": 10},
+            {"trade_date": "20260630", "ts_code": "000001.SZ", "net_mf_amount": 20},
+        ],
+        key_fields=("trade_date", "ts_code"),
+    )
+    store.upsert_rows(
+        "top_list",
+        [{"trade_date": "20260629", "ts_code": "000002.SZ", "net_amount": 30}],
+        key_fields=("trade_date", "ts_code"),
+    )
+
+    with store.connect() as conn:
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(ext_dataset_rows)")}
+
+    assert "idx_ext_rows_dataset_date" in indexes
+    assert store.latest_trade_date_before(["moneyflow", "top_list"], "20260630") == "20260629"
+    assert store.latest_trade_date_before(["moneyflow"], "20260627") is None
+
+
+def test_store_rows_signature_changes_when_cached_source_payload_changes(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "moneyflow",
+        [{"trade_date": "20260630", "ts_code": "000001.SZ", "net_mf_amount": 10}],
+        key_fields=("trade_date", "ts_code"),
+    )
+
+    initial = store.rows_signature(["moneyflow"], ["20260630"])
+    store.upsert_rows(
+        "moneyflow",
+        [{"trade_date": "20260630", "ts_code": "000001.SZ", "net_mf_amount": 11}],
+        key_fields=("trade_date", "ts_code"),
+    )
+
+    assert store.rows_signature(["moneyflow"], ["20260630"]) != initial
+    assert store.get_row("moneyflow", "20260630|000001.SZ")["net_mf_amount"] == 11

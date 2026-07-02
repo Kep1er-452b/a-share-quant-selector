@@ -242,13 +242,17 @@ class BowlReboundStrategy(BaseStrategy):
         # ========== 构建选股信号 ==========
         
         latest_key = key_candles.iloc[0]
+        try:
+            market_cap = float(latest.get('market_cap', 0) or 0)
+        except (TypeError, ValueError):
+            market_cap = 0.0
         
         signal_info = {
             'date': latest_date,
             'close': round(latest['close'], 2),
             'J': round(latest['J'], 2),
             'volume_ratio': round(latest['vol_ratio'], 2) if not pd.isna(latest['vol_ratio']) else 1.0,
-            'market_cap': round(latest['market_cap'] / 1e8, 2),
+            'market_cap': round(market_cap / 1e8, 2),
             'short_term_trend': round(latest['short_term_trend'], 2),
             'bull_bear_line': round(latest['bull_bear_line'], 2),
             'reasons': reasons,

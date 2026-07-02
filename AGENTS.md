@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `7867558298d6a1d20c40d6d40a95a5e2c5462809`
-  (`Add stock sequence toggle and refresh industry cache gaps`, 2026-07-01).
+  `a8675caa81a0fec2c6fce61d86a999d7174178f3`
+  (`Align sequence toggle with indicator controls`, 2026-07-02).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -181,9 +181,17 @@ Critical rules:
   provider exposes it. Frontend qfq display can derive adjusted candles from
   raw daily plus `adj_factor` only when the derived candles cover every visible
   chart date, falling back to the current CSV `data` payload otherwise.
+- Index detail weekly/monthly views are locally resampled from cached
+  `index_daily` rows to save Tushare API quota. Do not make startup or detail
+  views fetch `index_weekly` / `index_monthly` unless the user explicitly
+  changes this policy.
 - Market trading extension datasets currently include `top_list`, `top_inst`,
   `block_trade`, `moneyflow`, `margin`, `margin_detail`, `moneyflow_hsgt`, and
   historical/limited `hk_hold`.
+- Market Pulse trading summaries may be cached in `ext_dataset_rows` under the
+  `market_trading_summary` dataset. Cache validity depends on a signature of
+  the source trading datasets and visible market-turnover inputs; keep this
+  cache out of its own source signature.
 
 ## 7. Strategy Architecture
 
@@ -278,10 +286,11 @@ At commit `b038324`, the full suite result was:
 ```
 
 The latest comprehensive verification on branch
-`codex/tushare-comprehensive-upgrade` passed:
+`codex/tushare-comprehensive-upgrade`, including uncommitted review fixes atop
+`a8675ca`, passed:
 
 ```text
-146 passed
+166 passed
 ```
 
 Useful runtime checks:
@@ -320,17 +329,34 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `7867558` on branch
+Baseline commit: `a8675ca` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
 
+- Uncommitted review fixes on top of `a8675ca` add local weekly/monthly index
+  resampling from `index_daily`, SQLite `dataset+trade_date` lookup helpers and
+  a source-signature cache for Market Pulse trading summaries, removal of the
+  accidental global `tushare.set_token()` call in industry metadata refresh,
+  and per-update cancellation propagation through all Tushare extension stages.
+  Additional uncommitted fixes from the user's artificial review report handle
+  Bowl Rebound missing-`market_cap` output, `Downloads` path portability,
+  B1V242B's configurable `FD15_VOL_RATIO`, DeepSeek/Wyckoff JSON and empty
+  `choices` handling, sanitized error-report IDs, Tushare rate-limit sleeps
+  outside shared locks, AkShare per-request session closing, fast K-line key
+  candle markers, standard K-line key-date normalization, Wyckoff HALT
+  cancellation, frontend watchlist/board-badge/Wyckoff polling hardening,
+  `main.py`'s import-only fallback, and C-core SMA NaN fallback semantics.
+  Verification passed: focused review tests `74 passed`, previous
+  extension/cache/Web focused tests, Python compile, `node --check`,
+  `git diff --check`, and full suite `166 passed`. These changes are
+  intentionally not committed yet for user review.
 - The Tushare comprehensive upgrade branch adds a SQLite extension
   warehouse, extension sync/read-model modules, Tushare-backed F1 index K-lines,
   `/api/index-detail/<symbol>`, stock extension payloads, Market Pulse trading
   summaries, qfq adjusted candles from `adj_factor`, configurable MA overlays,
   and a MACD panel. Focused extension/market tests currently pass:
-  `36 passed`.
+  `39 passed`.
 - The default update job now runs lightweight Tushare extension stages after
   main CSV sync and market-cache refresh: basics, index, latest valuation, and
   recent trading snapshots for current/previous comparisons. Heavy price and

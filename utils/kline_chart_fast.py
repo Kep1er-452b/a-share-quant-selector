@@ -22,6 +22,25 @@ DEFAULT_OUTPUT_DIR = '/tmp/kline_charts'
 DEFAULT_DPI = 40
 TARGET_FILE_SIZE = 12 * 1024  # 12KB
 
+
+def _normalize_key_candle_dates(key_candle_dates: list | None) -> set[str]:
+    result = set()
+    for value in key_candle_dates or []:
+        if isinstance(value, pd.Timestamp):
+            result.add(value.strftime('%Y-%m-%d'))
+            continue
+        try:
+            parsed = pd.to_datetime(value)
+        except Exception:
+            parsed = None
+        if parsed is not None and not pd.isna(parsed):
+            result.add(parsed.strftime('%Y-%m-%d'))
+        else:
+            text = str(value or '').strip()
+            if text:
+                result.add(text[:10])
+    return result
+
 def generate_kline_chart_fast(
     stock_code: str,
     stock_name: str,
@@ -63,6 +82,7 @@ def generate_kline_chart_fast(
     M = params.get('M', 20)
     if len(df_plot) > M:
         df_plot = df_plot.tail(M).reset_index(drop=True)
+    key_candle_date_set = _normalize_key_candle_dates(key_candle_dates)
     
     # 创建图形（简化设置，降低DPI以减小文件大小）
     fig, (ax_kline, ax_vol) = plt.subplots(2, 1, figsize=(6, 4), dpi=40, 
@@ -83,6 +103,16 @@ def generate_kline_chart_fast(
         
         # 影线
         ax_kline.plot([i, i], [row['low'], row['high']], color=color, linewidth=0.8)
+        if row['date'].strftime('%Y-%m-%d') in key_candle_date_set:
+            price_range = max(df_plot['high'].max() - df_plot['low'].min(), 0.01)
+            ax_kline.scatter(
+                i,
+                row['high'] + price_range * 0.03,
+                marker='*',
+                s=60,
+                color='#f39c12',
+                zorder=5,
+            )
     
     # 绘制趋势线（如果存在）
     # 短期趋势线 - 蓝色，多空线 - 黄色

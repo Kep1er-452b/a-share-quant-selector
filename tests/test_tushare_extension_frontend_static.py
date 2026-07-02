@@ -49,6 +49,19 @@ def test_stock_info_panels_keep_empty_extension_sections_visible():
     assert "formatTradingValue" in js
 
 
+def test_frontend_review_hardening_for_watchlist_and_wyckoff_polling():
+    js = (ROOT / "web/static/js/app.js").read_text(encoding="utf-8")
+
+    assert 'colspan="10" class="state-loading"' in js
+    assert "escapeHtml(BOARD_LABELS[board] || board)" in js
+
+    start = js.index("state.wyckoffJobId = result.job_id;")
+    immediate_poll = js.index("await pollWyckoffJob();", start)
+    interval_start = js.index("state.wyckoffPollTimer = window.setInterval", start)
+    assert immediate_poll < interval_start
+    assert "job.status === 'cancelled'" in js
+
+
 def test_universe_count_has_purple_style_hook():
     css = (ROOT / "web/static/css/style.css").read_text(encoding="utf-8")
     assert ".quote-price.universe-count" in css

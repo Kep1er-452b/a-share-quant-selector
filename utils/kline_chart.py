@@ -21,6 +21,25 @@ plt.rcParams['axes.unicode_minus'] = False
 MAX_FILE_SIZE = 10 * 1024
 
 
+def _normalize_key_candle_dates(key_candle_dates: list | None) -> set[str]:
+    result = set()
+    for value in key_candle_dates or []:
+        if isinstance(value, pd.Timestamp):
+            result.add(value.strftime('%Y-%m-%d'))
+            continue
+        try:
+            parsed = pd.to_datetime(value)
+        except Exception:
+            parsed = None
+        if parsed is not None and not pd.isna(parsed):
+            result.add(parsed.strftime('%Y-%m-%d'))
+        else:
+            text = str(value or '').strip()
+            if text:
+                result.add(text[:10])
+    return result
+
+
 def compress_image(filepath: str, max_size: int = MAX_FILE_SIZE) -> str:
     """
     使用PIL二次压缩图片
@@ -190,6 +209,7 @@ def generate_kline_chart(
     
     # 绘制K线
     width = 0.6
+    key_candle_date_set = _normalize_key_candle_dates(key_candle_dates)
     for i, row in df.iterrows():
         is_up = row['close'] >= row['open']
         color = '#e74c3c' if is_up else '#27ae60'  # 涨红跌绿
@@ -207,7 +227,7 @@ def generate_kline_chart(
         ax_kline.plot([i, i], [row['low'], row['high']], color=color, linewidth=0.8)
         
         # 关键K线标记（星号）
-        if row['date'] in key_candle_dates or (isinstance(row['date'], pd.Timestamp) and row['date'].strftime('%Y-%m-%d') in [d.strftime('%Y-%m-%d') if isinstance(d, pd.Timestamp) else d for d in key_candle_dates]):
+        if row['date'].strftime('%Y-%m-%d') in key_candle_date_set:
             ax_kline.scatter(i, row['high'] + price_range * 0.03, marker='*', 
                            s=200, color='#f39c12', zorder=5)
     

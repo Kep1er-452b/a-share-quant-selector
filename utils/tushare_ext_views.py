@@ -20,9 +20,23 @@ INDEX_SYMBOLS = {
 
 PERIOD_DATASETS = {
     "daily": "index_daily",
-    "weekly": "index_weekly",
-    "monthly": "index_monthly",
+    "weekly": "index_daily",
+    "monthly": "index_daily",
 }
+INDEX_RESAMPLE_RULES = {
+    "weekly": "W-FRI",
+    "monthly": "ME",
+}
+TRADING_SUMMARY_SOURCE_DATASETS = (
+    "daily",
+    "daily_basic",
+    "moneyflow",
+    "top_list",
+    "block_trade",
+    "margin",
+    "moneyflow_hsgt",
+)
+TRADING_SUMMARY_CACHE_DATASET = "market_trading_summary"
 
 
 def _date_text(value) -> str:
@@ -148,6 +162,51 @@ def calculate_macd(
     }
 
 
+def _resample_index_rows(rows: list[dict], period: str) -> list[dict]:
+    if period == "daily" or not rows:
+        return rows
+    rule = INDEX_RESAMPLE_RULES.get(period)
+    if not rule:
+        return rows
+
+    frame = pd.DataFrame(rows)
+    if frame.empty or "trade_date" not in frame.columns:
+        return []
+    frame = frame.copy()
+    frame["_trade_date"] = pd.to_datetime(frame["trade_date"], format="%Y%m%d", errors="coerce")
+    frame = frame.dropna(subset=["_trade_date"]).sort_values("_trade_date")
+    if frame.empty:
+        return []
+
+    for column in ("open", "high", "low", "close", "vol", "volume", "amount"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    output: list[dict] = []
+    for _, group in frame.groupby(pd.Grouper(key="_trade_date", freq=rule)):
+        if group.empty:
+            continue
+        group = group.sort_values("_trade_date")
+        first = group.iloc[0]
+        last = group.iloc[-1]
+        high = group["high"].max() if "high" in group.columns else None
+        low = group["low"].min() if "low" in group.columns else None
+        volume_field = "vol" if "vol" in group.columns else "volume" if "volume" in group.columns else None
+        record = {
+            "ts_code": last.get("ts_code"),
+            "trade_date": last["_trade_date"].strftime("%Y%m%d"),
+            "open": first.get("open"),
+            "high": high,
+            "low": low,
+            "close": last.get("close"),
+            "amount": group["amount"].sum() if "amount" in group.columns else None,
+        }
+        if volume_field:
+            record["vol"] = group[volume_field].sum()
+        output.append(record)
+    return output
+
+
 def build_index_kline_payload(
     store: TushareExtStore,
     symbol: str,
@@ -168,6 +227,7 @@ def build_index_kline_payload(
     end_date = _date_text(today)
 
     all_rows = store.query_rows(dataset, ts_code=ts_code, end_date=end_date, descending=False)
+    all_rows = _resample_index_rows(all_rows, period)
     closes = [_to_number(row.get("close")) for row in all_rows]
     ma50 = calculate_moving_average(closes, 50)
     ma200 = calculate_moving_average(closes, 200)
@@ -212,7 +272,7 @@ def build_index_kline_payload(
         "limit": resolved_limit,
         "total_bars": len(all_candles),
         "max_limit": int(max_limit),
-        "source": f"tushare:{dataset}",
+        "source": f"tushare:{dataset}" if period == "daily" else f"tushare:{dataset}:{period}",
         "cache_status": "ready" if candles else "empty",
         "candles": candles,
         "sync_warnings": store.list_warnings(),
@@ -267,6 +327,10 @@ def _margin_balance_yi(rows: Iterable[dict]) -> float | None:
 
 
 def _previous_trade_date(store: TushareExtStore, latest_date: str, datasets: Iterable[str]) -> str | None:
+    if hasattr(store, "latest_trade_date_before"):
+        previous = store.latest_trade_date_before(list(datasets), latest_date)
+        if previous:
+            return previous
     candidates: set[str] = set()
     for dataset in datasets:
         for row in store.query_rows(dataset, end_date=latest_date, descending=True):
@@ -287,6 +351,30 @@ def _metric(label: str, value: float | None, previous: float | None, unit: str =
     }
 
 
+def _market_summary_signature(
+    store: TushareExtStore,
+    *,
+    latest: str,
+    previous: str | None,
+    market_amount_yi: float | None,
+    previous_market_amount_yi: float | None,
+) -> dict:
+    dates = [latest]
+    if previous:
+        dates.append(previous)
+    if hasattr(store, "rows_signature"):
+        source_signature = store.rows_signature(TRADING_SUMMARY_SOURCE_DATASETS, dates)
+    else:
+        source_signature = ""
+    return {
+        "latest": latest,
+        "previous": previous,
+        "market_amount_yi": market_amount_yi,
+        "previous_market_amount_yi": previous_market_amount_yi,
+        "source_signature": source_signature,
+    }
+
+
 def build_market_trading_summary(
     store: TushareExtStore,
     latest_date: str,
@@ -295,8 +383,19 @@ def build_market_trading_summary(
     previous_market_amount_yi: float | None = None,
 ) -> dict:
     latest = _date_text(latest_date)
-    datasets = ("daily", "daily_basic", "moneyflow", "top_list", "block_trade", "margin", "moneyflow_hsgt")
-    previous = _previous_trade_date(store, latest, datasets)
+    previous = _previous_trade_date(store, latest, TRADING_SUMMARY_SOURCE_DATASETS)
+    cache_signature = _market_summary_signature(
+        store,
+        latest=latest,
+        previous=previous,
+        market_amount_yi=market_amount_yi,
+        previous_market_amount_yi=previous_market_amount_yi,
+    )
+    cached = store.get_row(TRADING_SUMMARY_CACHE_DATASET, latest) if hasattr(store, "get_row") else None
+    if cached and cached.get("cache_signature") == cache_signature:
+        cached["cache_status"] = "hit"
+        cached["sync_warnings"] = store.list_warnings()
+        return cached
 
     current_daily = _rows_for_date(store, "daily", latest)
     previous_daily = _rows_for_date(store, "daily", previous) if previous else []
@@ -339,12 +438,27 @@ def build_market_trading_summary(
         "margin_balance": _metric("两融余额", margin_balance, previous_margin_balance, "亿元"),
         "northbound_money": _metric("北向资金", northbound_money, previous_northbound_money, "亿元"),
     }
-    return {
+    summary = {
         "trade_date": _display_date(latest),
+        "trade_date_key": latest,
         "previous_trade_date": _display_date(previous) if previous else None,
+        "previous_trade_date_key": previous,
         "metrics": metrics,
         "sync_warnings": store.list_warnings(),
+        "cache_signature": cache_signature,
+        "cache_status": "refreshed",
     }
+    try:
+        store.upsert_rows(
+            TRADING_SUMMARY_CACHE_DATASET,
+            [summary],
+            key_fields=("trade_date_key",),
+            trade_date_field="trade_date_key",
+        )
+    except Exception as exc:
+        summary["cache_status"] = "refresh_uncached"
+        summary["cache_warning"] = str(exc)
+    return summary
 
 
 def _latest_row(store: TushareExtStore, dataset: str, ts_code: str) -> dict:
