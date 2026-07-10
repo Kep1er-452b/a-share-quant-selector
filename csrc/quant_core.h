@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+#if defined(_WIN32)
+#define QC_API __declspec(dllexport)
+#else
+#define QC_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -15,16 +21,16 @@ enum {
     QC_ERR_ALLOC = -4
 };
 
-int qc_rolling_mean_forward(const double *values, int64_t length, int window, double *out);
-int qc_rolling_sum_forward(const double *values, int64_t length, int window, double *out);
-int qc_rolling_min_forward(const double *values, int64_t length, int window, double *out);
-int qc_rolling_max_forward(const double *values, int64_t length, int window, double *out);
-int qc_count_forward(const int8_t *values, int64_t length, int window, double *out);
-int qc_exist_forward(const int8_t *values, int64_t length, int window, int8_t *out);
-int qc_ref_forward(const double *values, int64_t length, int periods, double *out);
-int qc_ema_forward(const double *values, int64_t length, int span, double *out);
-int qc_sma_tdx_forward(const double *values, int64_t length, int period, int weight, double *out);
-int qc_kdj_ascending(
+QC_API int qc_rolling_mean_forward(const double *values, int64_t length, int window, double *out);
+QC_API int qc_rolling_sum_forward(const double *values, int64_t length, int window, double *out);
+QC_API int qc_rolling_min_forward(const double *values, int64_t length, int window, double *out);
+QC_API int qc_rolling_max_forward(const double *values, int64_t length, int window, double *out);
+QC_API int qc_count_forward(const int8_t *values, int64_t length, int window, double *out);
+QC_API int qc_exist_forward(const int8_t *values, int64_t length, int window, int8_t *out);
+QC_API int qc_ref_forward(const double *values, int64_t length, int periods, double *out);
+QC_API int qc_ema_forward(const double *values, int64_t length, int span, double *out);
+QC_API int qc_sma_tdx_forward(const double *values, int64_t length, int period, int weight, double *out);
+QC_API int qc_kdj_ascending(
     const double *close,
     const double *low,
     const double *high,
@@ -36,7 +42,7 @@ int qc_kdj_ascending(
     double *d_out,
     double *j_out
 );
-int qc_zhixing_trend_forward(
+QC_API int qc_zhixing_trend_forward(
     const double *close,
     int64_t length,
     int m1,
@@ -46,7 +52,7 @@ int qc_zhixing_trend_forward(
     double *short_out,
     double *bull_out
 );
-int qc_prepare_selection_features_forward(
+QC_API int qc_prepare_selection_features_forward(
     const double *open,
     const double *high,
     const double *low,

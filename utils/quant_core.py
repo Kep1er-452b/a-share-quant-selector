@@ -212,6 +212,8 @@ def ema_forward(values, span: int) -> np.ndarray:
 
 def sma_tdx_forward(values, period: int, weight: int) -> np.ndarray:
     arr = _as_float64(values)
+    if np.isnan(arr).any():
+        raise QuantCoreUnavailable("SMA NaN semantics are delegated to pandas fallback")
     out = _empty_float(arr.size)
     _check(
         _library().qc_sma_tdx_forward(arr, arr.size, int(period), int(weight), out),

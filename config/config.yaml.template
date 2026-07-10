@@ -10,19 +10,15 @@ data_dir: data
 
 # 数据源配置
 data_source:
-  default_provider: "akshare"  # 可选: akshare / tushare
-  akshare:
-    allow_mock_data: false  # 仅演示/开发时可显式改为 true，真实选股请保持 false
-    direct_retry_timeout_seconds: 4  # 直连仅用于线路探测，失败后本轮自动熔断
-  tencent:
-    max_workers: 4  # Tencent WAF 对高并发敏感，建议保持保守并发
-    min_request_interval_seconds: 0.35
-    request_jitter_seconds: 0.05
-    cooldown_every_requests: 400
-    cooldown_seconds: 8
-    max_request_interval_seconds: 1.2
+  default_provider: "tushare"  # 生产更新只支持 Tushare
   tushare:
     token: ""  # 推荐优先使用环境变量 TUSHARE_TOKEN 或本机 config/config_local.yaml
+    max_workers: 8
+    pro_bar_limit_per_minute: 160
+    daily_basic_limit_per_minute: 180
+    network_circuit_consecutive_failures: 8
+    network_circuit_window_size: 20
+    network_circuit_failure_ratio: 0.8
 
 # 钉钉机器人配置
 # 1. 在钉钉群中添加自定义机器人
@@ -62,5 +58,5 @@ update:
 selection:
   mode: parallel      # parallel / sequential
   backend: process    # process / thread / sequential
-  max_workers: 14     # Windows 8C/16T machines usually work well at 12-14
+  max_workers: 14     # Windows 8C/16T 机器通常适合 12-14
   chunk_size: 50      # 每个工作单元处理的股票数

@@ -10,6 +10,32 @@ class TencentFetcher(AKShareFetcher):
 
     provider_name = "tencent"
 
+    def get_target_universe(self, board: str = "all", max_stocks=None, max_retries: int = 3):
+        if max_stocks:
+            cached = self._load_local_stock_names()
+            if len(cached) < max_stocks:
+                shared, shared_path = self._load_shared_stock_names()
+                if shared:
+                    cached = shared
+                    if self.stock_names_file != shared_path:
+                        self._save_stock_names(shared)
+            if len(cached) < max_stocks:
+                cached = DEFAULT_STOCK_LIST.copy()
+            universe = []
+            for code, name in sorted(cached.items()):
+                item = {
+                    "code": str(code).zfill(6),
+                    "name": name,
+                    "board": self.classify_board(code),
+                    "market": None,
+                }
+                if board == "all" or item["board"] == board:
+                    universe.append(item)
+                if len(universe) >= max_stocks:
+                    return universe
+            return universe
+        return super().get_target_universe(board=board, max_stocks=max_stocks, max_retries=max_retries)
+
     def get_market_caps(self, stock_codes):
         """Fetch market caps from Tencent quote data for the Tencent warehouse."""
         return self._fetch_market_cap_tencent(stock_codes)

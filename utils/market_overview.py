@@ -51,8 +51,8 @@ INDUSTRY_FETCH_TIMEOUT_SECONDS = 12
 INDUSTRY_FETCH_MAX_SECONDS = 120
 HEATMAP_SCOPES = ("all", "main", "chinext", "star")
 HEATMAP_METRICS = ("daily", "weekly", "monthly", "five_day")
-SNAPSHOT_SCHEMA_VERSION = 2
-HEATMAP_PAYLOAD_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
+HEATMAP_PAYLOAD_SCHEMA_VERSION = 3
 
 HIDDEN_MARKET_STOCK_CODES = {"300391"}
 HIDDEN_MARKET_STOCK_NAMES = {"长药退"}
@@ -166,6 +166,8 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
     latest_date = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
     latest_close = _safe_float(df.iloc[0]["close"])
     previous_close = _metric_base_close(df, "daily")
+    latest_amount = _safe_float(df.iloc[0].get("amount"))
+    previous_amount = _safe_float(df.iloc[1].get("amount")) if len(df) > 1 else None
     market_cap = normalize_market_cap_yuan(df.iloc[0].get("market_cap"), source_unit="yuan") or 0
     if pd.isna(latest_date) or latest_close is None:
         return None
@@ -186,6 +188,8 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
         "latest_date": latest_date.strftime("%Y-%m-%d"),
         "latest_price": round(latest_close, 2),
         "previous_close": round(previous_close, 2) if previous_close is not None else None,
+        "amount": round(latest_amount, 2) if latest_amount is not None else None,
+        "previous_amount": round(previous_amount, 2) if previous_amount is not None else None,
         "market_cap": round(market_cap or 0.0, 2),
         "data_count": len(df),
         "metrics": metrics,
@@ -238,7 +242,11 @@ def _load_tushare_token() -> str:
     return ""
 
 
-def _load_tushare_metadata_industries(data_path: Path, csv_codes: set[str]) -> tuple[Dict[str, str], Dict[str, str], str]:
+def _load_tushare_metadata_industries(
+    data_path: Path,
+    csv_codes: set[str],
+    fetch_if_empty: bool = True,
+) -> tuple[Dict[str, str], Dict[str, str], str]:
     meta_path = data_path / "tushare_stock_map.json"
     mapping: Dict[str, str] = {}
     source_map: Dict[str, str] = {}
@@ -253,7 +261,7 @@ def _load_tushare_metadata_industries(data_path: Path, csv_codes: set[str]) -> t
                 mapping[code] = industry
                 source_map[code] = "tushare_stock_map"
 
-    if mapping or not _is_tushare_provider_dir(data_path):
+    if mapping or not _is_tushare_provider_dir(data_path) or not fetch_if_empty:
         return mapping, source_map, ""
 
     token = _load_tushare_token()
@@ -263,7 +271,6 @@ def _load_tushare_metadata_industries(data_path: Path, csv_codes: set[str]) -> t
     try:
         import tushare as ts
 
-        ts.set_token(token)
         pro = ts.pro_api(token)
         df = pro.stock_basic(
             exchange="",
@@ -505,6 +512,15 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
         if code not in previous_mapping:
             previous_mapping[code] = label
             previous_source_map[code] = related_sources.get(code, "related_industry_cache")
+    metadata_items, metadata_sources, metadata_error = _load_tushare_metadata_industries(
+        data_path,
+        csv_codes,
+        fetch_if_empty=False,
+    )
+    for code, label in metadata_items.items():
+        if code not in previous_mapping:
+            previous_mapping[code] = label
+            previous_source_map[code] = metadata_sources.get(code, "tushare_stock_map")
     previous_ratio = len(previous_mapping) / max(len(csv_codes), 1)
 
     if previous_mapping and previous_ratio >= INDUSTRY_CACHE_REUSE_MIN_RATIO:
@@ -521,11 +537,22 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
             "eastmoney_count": 0,
             "cninfo_count": 0,
             "reused_count": len(previous_mapping),
-            "related_reused_count": sum(1 for source in previous_source_map.values() if source != "previous_cache"),
+            "related_reused_count": sum(
+                1
+                for source in previous_source_map.values()
+                if source not in {"previous_cache", "tushare_stock_map", "tushare_stock_basic"}
+            ),
+            "tushare_metadata_count": sum(
+                1
+                for source in previous_source_map.values()
+                if source in {"tushare_stock_map", "tushare_stock_basic"}
+            ),
             "unmapped_count": len(csv_codes - set(previous_mapping)),
             "items": previous_mapping,
             "item_sources": previous_source_map,
         }
+        if metadata_error:
+            payload["provider_error"] = metadata_error
         _write_json(industry_cache_path(data_dir), payload)
         return payload
 
@@ -1027,6 +1054,23 @@ def _build_market_stats(stocks: List[dict], metric: str) -> dict:
         "flat_count": flat_count,
         "median_change_pct": round(float(median(values)), 2) if values else None,
     }
+    latest_trade_date = max(
+        (str(stock.get("latest_date") or "") for stock in stocks if stock.get("latest_date")),
+        default="",
+    )
+    latest_amounts = []
+    previous_amounts = []
+    for stock in stocks:
+        if latest_trade_date and str(stock.get("latest_date") or "") != latest_trade_date:
+            continue
+        amount = _safe_float(stock.get("amount"))
+        previous_amount = _safe_float(stock.get("previous_amount"))
+        if amount is not None:
+            latest_amounts.append(amount)
+        if previous_amount is not None:
+            previous_amounts.append(previous_amount)
+    stats["market_amount_yi"] = round(sum(latest_amounts) / 100_000_000, 4) if latest_amounts else None
+    stats["previous_market_amount_yi"] = round(sum(previous_amounts) / 100_000_000, 4) if previous_amounts else None
     if metric == "daily":
         distribution = _market_distribution(stocks, values)
         stats["limit_up_count"] = distribution[0]["count"]

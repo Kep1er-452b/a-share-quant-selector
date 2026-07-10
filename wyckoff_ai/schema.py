@@ -43,6 +43,8 @@ MODE_ALIASES = {
 }
 
 MAX_DATE_SNAP_DAYS = 10
+READING_ORDER = "背景 -> 价量形态 -> 行为性质 -> CM意图 -> 行动/风险"
+DEFAULT_RISK_NOTE = "本分析仅为基于历史量价结构的技术分析，不构成投资建议。"
 
 
 class WyckoffSchemaError(ValueError):
@@ -82,6 +84,30 @@ def _require_text(payload: dict[str, Any], key: str, default: str = "") -> str:
     if not value:
         raise WyckoffSchemaError(f"AI 输出缺少必要文本字段: {key}")
     return value
+
+
+def _short_text(value: Any, limit: int, default: str = "") -> str:
+    text = str(value or default).strip()
+    return text[:limit]
+
+
+def _coerce_text_list(value: Any, limit: int = 6) -> list[str]:
+    if value is None:
+        return []
+    raw_items = value if isinstance(value, list) else [value]
+    result = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            label = str(item.get("name") or item.get("title") or "").strip()
+            detail = str(item.get("description") or item.get("condition") or item.get("text") or "").strip()
+            text = f"{label}: {detail}" if label and detail else (detail or label)
+        else:
+            text = str(item or "").strip()
+        if text:
+            result.append(text[:220])
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _date_index(df: pd.DataFrame) -> dict[str, dict[str, float]]:
@@ -271,6 +297,96 @@ def _validate_key_levels(levels: Any, df: pd.DataFrame) -> list[dict[str, Any]]:
     return normalized
 
 
+def _default_action_bias(mode: str) -> str:
+    if mode in {"accumulation", "reaccumulation"}:
+        return "等待右手边确认；优先看Spring、SOS/JOC或LPS的质量。"
+    if mode in {"distribution", "redistribution"}:
+        return "风险优先；等待SOW/破冰或LPSY这类供应确认。"
+    if mode == "markup":
+        return "偏多背景但不追逐结论；重点观察回调是否低量守住关键支撑。"
+    if mode == "markdown":
+        return "偏弱背景；重点观察反弹是否无需求以及下跌是否有供应跟随。"
+    return "等待；先看右手边证据，不强行命名结构。"
+
+
+def _default_invalidation(mode: str) -> str:
+    if mode in {"accumulation", "reaccumulation", "markup"}:
+        return "若关键支撑被放量跌破且反弹无需求，偏强或吸筹假设失效。"
+    if mode in {"distribution", "redistribution", "markdown"}:
+        return "若需求放量收复关键阻力并出现有效跟随，偏弱或派发假设失效。"
+    return "目前没有明确假设；等待SOS/JOC、SOW/破冰、Spring或UT等右手边证据后再定义失效条件。"
+
+
+def _default_limitations(df: pd.DataFrame) -> list[str]:
+    limitations = []
+    if "volume" not in df.columns or df["volume"].isna().all():
+        limitations.append("成交量缺失或不可用，供求和努力/结果判断置信度降低。")
+    if len(df) < 250:
+        limitations.append("可用样本少于250根，长期背景和区间因果判断置信度降低。")
+    adjustment_repairs = getattr(df, "attrs", {}).get("adjustment_repairs") or []
+    if adjustment_repairs:
+        limitations.append("数据经过临时复权断层修复，结论需结合原始价量口径复核。")
+    if not limitations:
+        limitations.append("未见额外数据限制，但仍需后续价量行为确认。")
+    return limitations
+
+
+def _validate_book_judgment(
+    value: Any,
+    payload: dict[str, Any],
+    df: pd.DataFrame,
+    available_dates: set[str],
+    mode: str,
+) -> dict[str, Any]:
+    if value is None:
+        judgment: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        judgment = value
+    else:
+        raise WyckoffSchemaError("book_judgment 必须是对象")
+
+    latest_date = max(available_dates)
+    if judgment.get("as_of"):
+        as_of = _normalize_date(judgment.get("as_of"), available_dates, "book_judgment.as_of")
+    else:
+        as_of = latest_date
+
+    scenarios = _coerce_text_list(judgment.get("next_scenarios"), limit=4)
+    if not scenarios:
+        scenarios = _coerce_text_list(payload.get("scenarios"), limit=4)
+    if not scenarios:
+        scenarios = [
+            "若出现放量突破并低量回测，可转入偏强确认路径。",
+            "若出现放量跌破并无需求反弹，可转入偏弱或失效路径。",
+        ]
+
+    limitations = _coerce_text_list(judgment.get("limitations"), limit=6)
+    volume_limitation = str(judgment.get("volume_limitation") or "").strip()
+    if volume_limitation:
+        limitations.append(volume_limitation[:220])
+    if not limitations:
+        limitations = _default_limitations(df)
+
+    return {
+        "as_of": as_of,
+        "reading_order": _short_text(judgment.get("reading_order"), 80, READING_ORDER) or READING_ORDER,
+        "background": _short_text(
+            judgment.get("background"),
+            260,
+            payload.get("background_text") or payload.get("summary_text") or "结构背景仍需右手边价量证据确认。",
+        ),
+        "action_bias": _short_text(judgment.get("action_bias"), 180, _default_action_bias(mode)),
+        "next_scenarios": scenarios,
+        "invalidation": _short_text(judgment.get("invalidation"), 220, _default_invalidation(mode)),
+        "limitations": limitations,
+        "risk_note": _short_text(
+            judgment.get("risk_note"),
+            160,
+            "这是基于CSV价量行为的场景研判，不是确定性预测或个性化投资建议。",
+        ),
+    }
+
+
 def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
     """Validate model output against the actual CSV dates and prices."""
     if not isinstance(payload, dict):
@@ -286,15 +402,20 @@ def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, An
     normalized["current_phase"] = str(payload.get("current_phase") or "unclear").strip()[:32]
     normalized["summary_text"] = _require_text(payload, "summary_text")
     normalized["background_text"] = str(payload.get("background_text") or "").strip()[:240]
-    normalized["risk_note"] = str(
-        payload.get("risk_note") or "本分析仅为基于历史量价结构的技术分析，不构成投资建议。"
-    ).strip()
+    normalized["risk_note"] = str(payload.get("risk_note") or DEFAULT_RISK_NOTE).strip()
     normalized["events"] = _validate_events(payload.get("events"), prices_by_date)
     normalized["ranges"] = _validate_ranges(payload.get("ranges"), available_dates)
     normalized["phases"] = _validate_phases(payload.get("phases"), available_dates)
     normalized["key_levels"] = _validate_key_levels(payload.get("key_levels"), df)
     scenarios = payload.get("scenarios") or []
     normalized["scenarios"] = scenarios if isinstance(scenarios, list) else [str(scenarios)]
+    normalized["book_judgment"] = _validate_book_judgment(
+        payload.get("book_judgment"),
+        payload,
+        df,
+        available_dates,
+        mode,
+    )
     normalized["conclusion_text"] = str(payload.get("conclusion_text") or "").strip()[:180]
     return normalized
 

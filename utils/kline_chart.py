@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import os
+from utils.kline_chart_utils import normalize_key_candle_dates as _normalize_key_candle_dates
 from utils.strategy_labels import category_label
 
 # 设置中文字体
@@ -190,6 +191,7 @@ def generate_kline_chart(
     
     # 绘制K线
     width = 0.6
+    key_candle_date_set = _normalize_key_candle_dates(key_candle_dates)
     for i, row in df.iterrows():
         is_up = row['close'] >= row['open']
         color = '#e74c3c' if is_up else '#27ae60'  # 涨红跌绿
@@ -207,7 +209,7 @@ def generate_kline_chart(
         ax_kline.plot([i, i], [row['low'], row['high']], color=color, linewidth=0.8)
         
         # 关键K线标记（星号）
-        if row['date'] in key_candle_dates or (isinstance(row['date'], pd.Timestamp) and row['date'].strftime('%Y-%m-%d') in [d.strftime('%Y-%m-%d') if isinstance(d, pd.Timestamp) else d for d in key_candle_dates]):
+        if row['date'].strftime('%Y-%m-%d') in key_candle_date_set:
             ax_kline.scatter(i, row['high'] + price_range * 0.03, marker='*', 
                            s=200, color='#f39c12', zorder=5)
     

@@ -427,6 +427,95 @@ def merge_annotations(auto: dict[str, Any], annotations_path: str | None) -> dic
     return merged
 
 
+def add_book_judgment(df: pd.DataFrame, analysis: dict[str, Any]) -> dict[str, Any]:
+    """Add the decision layer required by the current 威科夫二世 workflow."""
+    d = enrich(df)
+    mode = analysis.get("mode", "unclear")
+    last_close = float(d["close"].iloc[-1])
+    last_date = date_str(d, len(d) - 1)
+    events_text = " ".join(str(e.get("term", "")) for e in analysis.get("events", []))
+    box = analysis.get("ranges", [{}])[0] if analysis.get("ranges") else {}
+    box_low = float(box.get("low", np.nan)) if box else np.nan
+    box_high = float(box.get("high", np.nan)) if box else np.nan
+    ma50 = float(d["ma50"].iloc[-1])
+    ma200 = float(d["ma200"].iloc[-1])
+    has_vol = has_volume(d)
+
+    if mode == "accumulation":
+        if np.isfinite(box_high) and last_close > box_high:
+            background = "吸筹/再吸筹后尝试离开区间，需求正在验证能否进入Phase E。"
+            action_bias = "偏多但等回测质量；追高风险高于低量测试。"
+            invalidation = "若收盘重新跌回吸筹区且伴随放量阴线，SOS/JOC或离区判断失效。"
+        elif np.isfinite(box_low) and last_close < box_low:
+            background = "价格低于吸筹区下沿，Spring或震仓需要快速收回才能成立。"
+            action_bias = "等待；必须先看到需求吸收供应。"
+            invalidation = "若低位反弹无需求并继续放量下破，吸筹判断降级为弱势/SOW。"
+        else:
+            background = "价格仍在吸筹区间内，重点看右手边是否出现Spring测试、SOS/JOC或LPS。"
+            action_bias = "等待右手边确认；区间中部不强行交易。"
+            invalidation = "若区间下沿被放量跌破且反弹无需求，吸筹假设失效。"
+        next_scenarios = [
+            "若回调缩量、小实体并守住JOC/SOS或区间上沿，可按LPS/测试偏多解读。",
+            "若上涨遇到高量滞涨或放量阴线跟随，说明供应仍在，需要减弱多头判断。",
+        ]
+    elif mode == "distribution":
+        if np.isfinite(box_low) and last_close < box_low:
+            background = "派发/再派发后跌破冰线，供应正在验证Phase E式降价。"
+            action_bias = "偏空；优先观察反弹是否无需求、能否形成LPSY。"
+            invalidation = "若需求放量收复冰线并站回派发区，SOW/破冰判断失效。"
+        elif np.isfinite(box_high) and last_close > box_high:
+            background = "价格高于派发区上沿，UT/派发读法必须等待失败回落确认。"
+            action_bias = "等待；不要只因高位就做空。"
+            invalidation = "若突破后低量回测成功并继续上行，派发假设降级。"
+        else:
+            background = "价格仍在派发区间内，重点看UT、SOW、破冰或无需求反弹。"
+            action_bias = "风险优先；多头需防CM借公众需求派发。"
+            invalidation = "若区间上沿被需求柱突破且低量回测成功，派发判断失效。"
+        next_scenarios = [
+            "若反弹小实体、低量或努力无结果，符合LPSY/无需求反弹，偏空延续。",
+            "若下跌没有供应跟随并被需求快速收回，需要降低派发置信度。",
+        ]
+    else:
+        background = "结构证据不足，尚不能可靠命名为吸筹或派发。"
+        action_bias = "等待；先画关键支撑/阻力和趋势背景。"
+        invalidation = "目前没有明确假设，先等待SOS/JOC、SOW/破冰、Spring或UT这类右手边证据。"
+        next_scenarios = [
+            "若出现放量突破并低量回测，可转入吸筹后JOC路径。",
+            "若出现放量跌破并无需求反弹，可转入派发后SOW路径。",
+        ]
+
+    if "Spring" in events_text and mode == "accumulation":
+        next_scenarios.insert(0, "Spring之后必须看到需求跟随；若反弹无需求，按失败Spring处理。")
+    if "UT" in events_text and mode == "distribution":
+        next_scenarios.insert(0, "UT之后必须看到供应跟随；若需求重新吸收并站上阻力，UT失效。")
+
+    limitations = []
+    if not has_vol:
+        limitations.append("CSV缺少有效成交量；供求、努力与结果、SC/BC/SOS/SOW等判断置信度降低。")
+    if len(d) < 250:
+        limitations.append("可用样本较短，长期背景和区间因果判断置信度降低。")
+    if not limitations:
+        limitations.append("未见额外数据限制，但仍需后续价量行为确认。")
+
+    analysis["book_judgment"] = {
+        "as_of": last_date,
+        "reading_order": "背景 -> 价量形态 -> 行为性质 -> CM意图 -> 行动/风险",
+        "background": background,
+        "action_bias": action_bias,
+        "next_scenarios": next_scenarios,
+        "invalidation": invalidation,
+        "limitations": limitations,
+        "context": {
+            "last_close": round(last_close, 4),
+            "ma50": round(ma50, 4),
+            "ma200": round(ma200, 4),
+            "has_volume": bool(has_vol),
+        },
+        "risk_note": "这是基于CSV价量行为的场景研判，不是确定性预测或个性化投资建议。",
+    }
+    return analysis
+
+
 def wrap_label(text: str, width: int = 18, max_lines: int | None = None) -> str:
     """Wrap Chinese/English labels into predictable short lines."""
     normalized = re.sub(r"\s+", " ", str(text or "").strip())
@@ -481,12 +570,22 @@ def draw_chart(df: pd.DataFrame, analysis: dict[str, Any], output: str, title: s
     y_max = float(np.nanmax(df["high"]))
     y_pad = (y_max - y_min) * 0.12 or y_max * 0.05 or 1.0
     ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    phase_y_levels = [y_max + y_pad * ratio for ratio in (0.82, 0.62, 0.42, 0.22)]
+    phase_slots: list[tuple[float, int]] = []
     for idx, phase in enumerate(analysis.get("phases", [])):
         start = pd.to_datetime(phase["start"])
         end = pd.to_datetime(phase["end"])
         ax.axvline(start, color="black", ls="--", lw=2.0, alpha=0.75)
         mid = start + (end - start) / 2
-        phase_y = y_max + y_pad * (0.62 if idx % 2 == 0 else 0.42)
+        mid_num = float(mdates.date2num(mid))
+        phase_y = phase_y_levels[idx % len(phase_y_levels)]
+        for level_idx, candidate_y in enumerate(phase_y_levels):
+            if all(level_idx != used_level or abs(mid_num - used_mid) > 80 for used_mid, used_level in phase_slots):
+                phase_y = candidate_y
+                phase_slots.append((mid_num, level_idx))
+                break
+        else:
+            phase_slots.append((mid_num, idx % len(phase_y_levels)))
         phase_label = wrap_label(phase["label"], width=9, max_lines=2)
         ax.text(
             mid,
@@ -495,7 +594,7 @@ def draw_chart(df: pd.DataFrame, analysis: dict[str, Any], output: str, title: s
             color="#b30000",
             ha="center",
             va="center",
-            fontsize=15,
+            fontsize=14,
             fontweight="bold",
         )
     if analysis.get("phases"):
@@ -671,7 +770,8 @@ def draw_chart_pillow(df: pd.DataFrame, analysis: dict[str, Any], output: str, t
     draw_polyline(draw, ma50_points, "#1f77b4", width=3, dashed=True)
     draw_polyline(draw, ma200_points, "#d62728", width=3, dashed=True)
 
-    phase_y = top + 28
+    phase_y_levels = [top + 28, top + 62, top + 96, top + 130]
+    phase_label_boxes: list[tuple[float, float, float, float]] = []
     for phase in analysis.get("phases", []):
         start_i = date_to_i.get(str(phase["start"]), 0)
         end_i = date_to_i.get(str(phase["end"]), n - 1)
@@ -680,7 +780,28 @@ def draw_chart_pillow(df: pd.DataFrame, analysis: dict[str, Any], output: str, t
         mid = x_at(max(0, min(n - 1, int((start_i + end_i) / 2))))
         label = str(phase["label"])
         tw, th = text_size(draw, label, big_font)
-        draw.text((mid - tw / 2, phase_y - th / 2), label, fill="#b30000", font=big_font)
+        label_x = min(max(left + 8, mid - tw / 2), right - tw - 8)
+        label_y = phase_y_levels[0] - th / 2
+        for candidate_y in phase_y_levels:
+            candidate = (
+                label_x - 8,
+                candidate_y - th / 2 - 4,
+                label_x + tw + 8,
+                candidate_y + th / 2 + 4,
+            )
+            if not any(
+                candidate[0] < box[2]
+                and candidate[2] > box[0]
+                and candidate[1] < box[3]
+                and candidate[3] > box[1]
+                for box in phase_label_boxes
+            ):
+                label_y = candidate_y - th / 2
+                phase_label_boxes.append(candidate)
+                break
+        else:
+            label_y = phase_y_levels[-1] - th / 2
+        draw.text((label_x, label_y), label, fill="#b30000", font=big_font)
     if analysis.get("phases"):
         end_i = date_to_i.get(str(analysis["phases"][-1]["end"]), n - 1)
         draw_dashed_line(draw, (x_at(end_i), top, x_at(end_i), price_bottom), fill="#333333", width=2, dash=14)
@@ -777,7 +898,7 @@ def main() -> None:
     args = parser.parse_args()
 
     df = load_prices(args.csv, args.lookback)
-    analysis = merge_annotations(choose_structure(df), args.annotations)
+    analysis = add_book_judgment(df, merge_annotations(choose_structure(df), args.annotations))
     output = str(Path(args.output).expanduser())
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     draw_chart(df, analysis, output, args.title)

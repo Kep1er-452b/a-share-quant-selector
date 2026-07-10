@@ -45,9 +45,10 @@ def ensure_quant_core_built():
         cwd=ROOT,
         text=True,
         capture_output=True,
+        errors="replace",
     )
     if result.returncode != 0:
-        pytest.skip(f"quant core build failed: {result.stderr.strip()}")
+        pytest.skip(f"quant core build failed: {(result.stderr or 'no compiler output').strip()}")
     importlib.reload(quant_core)
     if not quant_core.available():
         pytest.skip(f"quant core unavailable: {quant_core.load_error()}")

@@ -139,12 +139,13 @@ class WyckoffPipeline:
 
     @staticmethod
     def _format_analysis_text(analysis: dict[str, Any]) -> str:
+        judgment = analysis.get("book_judgment") or {}
         lines = [
             f"结构判断：{analysis.get('mode', 'unclear')}",
             f"当前阶段：{analysis.get('current_phase', 'unclear')}",
             "",
         ]
-        background = str(analysis.get("background_text") or "").strip()
+        background = str(judgment.get("background") or analysis.get("background_text") or "").strip()
         if background:
             lines.extend(["背景判断：", background, ""])
 
@@ -165,7 +166,13 @@ class WyckoffPipeline:
                 meaning = f"：{item.get('meaning')}" if item.get("meaning") else ""
                 lines.append(f"- {item.get('price')}: {item.get('label')}{meaning}")
 
+        action_bias = str(judgment.get("action_bias") or "").strip()
+        if action_bias:
+            lines.append("")
+            lines.append(f"当前判断：{action_bias}")
+
         scenarios = analysis.get("scenarios") or []
+        next_scenarios = judgment.get("next_scenarios") or []
         if scenarios:
             lines.append("")
             lines.append("后续场景：")
@@ -176,11 +183,31 @@ class WyckoffPipeline:
                     lines.append(f"- {label}: {desc}")
                 else:
                     lines.append(f"- {item}")
+        if next_scenarios:
+            if not scenarios:
+                lines.append("")
+                lines.append("后续场景：")
+            lines.append("下一步确认：")
+            for item in next_scenarios:
+                lines.append(f"- {item}")
+
+        invalidation = str(judgment.get("invalidation") or "").strip()
+        if invalidation:
+            lines.append("")
+            lines.append(f"失效条件：{invalidation}")
+
+        limitations = judgment.get("limitations") or []
+        if limitations:
+            lines.append("")
+            lines.append("限制：")
+            for item in limitations:
+                lines.append(f"- {item}")
+
         conclusion = str(analysis.get("conclusion_text") or "").strip()
         if conclusion:
             lines.append("")
             lines.append(f"一句话结论：{conclusion}")
-        risk_note = analysis.get("risk_note")
+        risk_note = judgment.get("risk_note") or analysis.get("risk_note")
         if risk_note:
             lines.append("")
             lines.append(str(risk_note))

@@ -11,11 +11,14 @@ from typing import Optional
 
 
 VALID_PROVIDERS = ("tushare", "akshare", "tencent")
+UPDATE_PROVIDERS = VALID_PROVIDERS
+ACTIVATABLE_PROVIDERS = VALID_PROVIDERS
+ARCHIVED_PROVIDERS = ()
 ACTIVE_PROVIDER_FILE = "active_provider.json"
 PROVIDER_STATE_FILE = "provider_state.json"
 
 
-def normalize_provider(provider: Optional[str], default: str = "akshare") -> str:
+def normalize_provider(provider: Optional[str], default: str = "tushare") -> str:
     value = str(provider or default).strip().lower()
     if value not in VALID_PROVIDERS:
         raise ValueError(f"不支持的数据源: {provider}")
@@ -120,6 +123,8 @@ def warehouse_summary(data_dir: str | Path, provider: str) -> dict:
         "status_summary": state.get("status_summary") or {},
         "runtime_stats": state.get("runtime_stats") or {},
         "runtime_diagnostics": state.get("runtime_diagnostics") or {},
+        "archived": provider in ARCHIVED_PROVIDERS,
+        "read_only": provider in ARCHIVED_PROVIDERS,
     }
 
 
@@ -151,10 +156,10 @@ def list_provider_statuses(data_dir: str | Path) -> list[dict]:
 def load_active_provider(data_dir: str | Path) -> dict:
     payload = _read_json(active_provider_path(data_dir), {})
     provider = payload.get("active_provider")
-    if provider in VALID_PROVIDERS:
+    if provider in ACTIVATABLE_PROVIDERS:
         return payload
 
-    statuses = list_provider_statuses(data_dir)
+    statuses = [warehouse_summary(data_dir, provider) for provider in ACTIVATABLE_PROVIDERS]
     ready = [
         status for status in statuses
         if status.get("stock_count") and status.get("latest_trade_date")
@@ -178,18 +183,18 @@ def load_active_provider(data_dir: str | Path) -> dict:
         }
 
     return {
-        "active_provider": "legacy",
-        "latest_trade_date": _latest_csv_date(legacy_data_dir(data_dir)),
+        "active_provider": "tushare",
+        "latest_trade_date": None,
         "updated_at": None,
         "generation": 0,
-        "source": "legacy_fallback",
+        "source": "provider_default",
     }
 
 
-def get_active_provider_name(data_dir: str | Path, default: str = "akshare") -> str:
+def get_active_provider_name(data_dir: str | Path, default: str = "tushare") -> str:
     payload = load_active_provider(data_dir)
     provider = payload.get("active_provider")
-    if provider in VALID_PROVIDERS:
+    if provider in ACTIVATABLE_PROVIDERS:
         return provider
     return default
 
@@ -197,7 +202,7 @@ def get_active_provider_name(data_dir: str | Path, default: str = "akshare") -> 
 def active_data_dir(data_dir: str | Path, allow_legacy_fallback: bool = True) -> Path:
     payload = load_active_provider(data_dir)
     provider = payload.get("active_provider")
-    if provider in VALID_PROVIDERS:
+    if provider in ACTIVATABLE_PROVIDERS:
         path = provider_data_dir(data_dir, provider)
         if path.exists() and _has_stock_csv_file(path):
             return path
@@ -222,6 +227,8 @@ def activate_provider(data_dir: str | Path, provider: str, summary: dict | None 
     previous = load_active_provider(data_dir)
     generation = int(previous.get("generation") or 0) + 1
     summary = summary or warehouse_summary(data_dir, provider)
+    if not summary.get("stock_count"):
+        raise ValueError(f"{provider} 本地数据仓为空，不能激活")
     payload = {
         "active_provider": provider,
         "latest_trade_date": summary.get("latest_trade_date"),

@@ -6,14 +6,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.market_overview import _build_market_stats, _group_stocks_by_industry
 
 
-def _stock(code, name, board, change_pct, previous_close=10.0, latest_price=None, data_count=100):
+def _stock(
+    code,
+    name,
+    board,
+    change_pct,
+    previous_close=10.0,
+    latest_price=None,
+    data_count=100,
+    latest_date="2026-06-10",
+    amount=None,
+    previous_amount=None,
+):
     return {
         "code": code,
         "name": name,
         "board": board,
-        "latest_date": "2026-06-10",
+        "latest_date": latest_date,
         "latest_price": latest_price if latest_price is not None else previous_close * (1 + change_pct / 100),
         "previous_close": previous_close,
+        "amount": amount,
+        "previous_amount": previous_amount,
         "market_cap": 1_000_000_000,
         "data_count": data_count,
         "metrics": {"daily": change_pct},
@@ -47,6 +60,27 @@ def test_market_stats_round_limit_prices_to_the_price_tick():
     stats = _build_market_stats(stocks, "daily")
 
     assert stats["limit_up_count"] == 1
+
+
+def test_market_stats_amount_uses_latest_market_date_only():
+    stocks = [
+        _stock("600001", "今日A", "main", 1.0, amount=100_000_000, previous_amount=60_000_000),
+        _stock("600002", "今日B", "main", 2.0, amount=200_000_000, previous_amount=80_000_000),
+        _stock(
+            "600003",
+            "停牌旧数据",
+            "main",
+            0.0,
+            latest_date="2026-06-09",
+            amount=9_000_000_000,
+            previous_amount=8_000_000_000,
+        ),
+    ]
+
+    stats = _build_market_stats(stocks, "daily")
+
+    assert stats["market_amount_yi"] == 3.0
+    assert stats["previous_market_amount_yi"] == 1.4
 
 
 def test_industry_groups_include_breadth_and_median_fields():

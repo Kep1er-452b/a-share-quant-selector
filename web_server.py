@@ -33,6 +33,7 @@ configure_utf8_stdio()
 from utils.csv_manager import CSVManager
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.error_logging import append_system_log as shared_append_system_log, write_error_report
+from utils.update_diagnostics import attach_auto_snapshot, resolve_update_error_report, run_update_diagnostics
 from utils.config_schema import atomic_write_yaml, validate_strategy_params
 from utils.local_config import load_config_file
 from utils.market_overview import (
@@ -74,6 +75,21 @@ from utils.stock_exporter import (
     resolve_stock_query,
     search_stocks,
 )
+from utils.tushare_ext_store import TushareExtStore
+from utils.tushare_ext_sync import DEFAULT_INDEX_SYMBOLS, TushareExtSync
+from utils.tushare_ext_workflow import (
+    extension_full_backfill_enabled,
+    recent_tushare_extension_trade_dates,
+    refresh_tushare_extension_data,
+    skipped_extension_stage,
+    truthy as extension_truthy,
+)
+from utils.tushare_ext_views import (
+    build_adjusted_candles,
+    build_index_kline_payload,
+    build_market_trading_summary,
+    build_stock_extension_payload,
+)
 from wyckoff_ai import WyckoffPipeline, has_deepseek_config
 from wyckoff_ai.naming import stock_output_folder_name
 from wyckoff_ai.pipeline import WyckoffPipelineError
@@ -95,11 +111,15 @@ selection_jobs_lock = Lock()
 update_jobs = {}
 update_jobs_lock = Lock()
 update_cancel_events = {}
+diagnostic_jobs = {}
+diagnostic_jobs_lock = Lock()
 job_admission_lock = Lock()
 sync_selection_active = False
 wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
 watchlist_lock = Lock()
+ACTIVE_JOB_STATUSES = {'queued', 'running'}
+MAX_RETAINED_TERMINAL_JOBS = 50
 
 INDEX_KLINE_TARGETS = {
     'sh000001': {'symbol': 'sh000001', 'name': '上证指数'},
@@ -112,8 +132,8 @@ LOG_DIR = runtime_logs_dir()
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 EMERGENCY_EXIT_DELAY_SECONDS = 1.2
-UPDATE_FAILURE_MIN_COVERAGE = 0.20
-UPDATE_CACHE_REFRESH_MIN_COVERAGE = 0.90
+UPDATE_FAILURE_MIN_COVERAGE = 0.98
+UPDATE_CACHE_REFRESH_MIN_COVERAGE = 0.98
 UPDATE_COVERAGE_GUARD_MIN_TARGETS = 100
 
 
@@ -148,6 +168,48 @@ def _active_provider_name():
 
 def _active_csv_manager():
     return CSVManager(_active_data_dir())
+
+
+def _tushare_provider_data_dir(data_root=None):
+    return provider_data_dir(Path(data_root or _data_root_dir()), 'tushare')
+
+
+def _tushare_ext_store(data_root=None):
+    return TushareExtStore(_tushare_provider_data_dir(data_root) / 'extended')
+
+
+def _ensure_tushare_index_cache(store=None, symbols=None):
+    """Best-effort startup/API index cache refresh; never crashes cached views."""
+
+    store = store or _tushare_ext_store()
+    symbols = tuple(symbols or DEFAULT_INDEX_SYMBOLS)
+    try:
+        config = _load_config()
+        provider = create_data_provider(
+            provider_name='tushare',
+            data_dir=str(_data_root_dir()),
+            config=config,
+        )
+        sync = TushareExtSync(store, provider.pro)
+        return sync.ensure_index_cache(symbols=symbols)
+    except Exception as exc:
+        warning = f'Tushare 指数缓存刷新失败: {exc}'
+        _append_system_log(
+            'tushare_index_cache_warning',
+            warning,
+            {'symbols': list(symbols)},
+        )
+        for symbol in symbols:
+            try:
+                store.set_sync_state(
+                    'index_daily',
+                    scope=symbol,
+                    status='warning',
+                    warning=warning,
+                )
+            except Exception:
+                pass
+        return {'status': 'warning', 'warning': warning}
 
 
 def _index_kline_cache_path(data_dir='data'):
@@ -896,8 +958,9 @@ def _get_web_selection_settings():
     mode = raw_mode if raw_mode in {'parallel', 'sequential'} else 'parallel'
 
     # Web 端默认优先线程池，避免请求内频繁拉起进程导致额外开销。
-    raw_backend = str(selection_config.get('backend', 'process')).strip().lower()
-    backend = raw_backend if raw_backend in {'process', 'thread', 'sequential'} else 'process'
+    default_backend = 'process' if platform.system() == 'Windows' else 'thread'
+    raw_backend = str(selection_config.get('backend', default_backend)).strip().lower()
+    backend = raw_backend if raw_backend in {'process', 'thread', 'sequential'} else default_backend
 
     default_workers = min(max(os.cpu_count() or 4, 1), 12)
     try:
@@ -993,10 +1056,38 @@ def _serialize_job(job):
     return serialized
 
 
+def _job_retention_key(job_id, job):
+    return (
+        str(job.get('updated_at') or job.get('finished_at') or job.get('created_at') or ''),
+        str(job_id),
+    )
+
+
+def _prune_terminal_jobs(job_map, *, keep=None, cleanup_callback=None):
+    """Retain active jobs and the newest terminal jobs in an in-memory job map."""
+    keep = MAX_RETAINED_TERMINAL_JOBS if keep is None else max(int(keep), 0)
+    terminal_jobs = [
+        (job_id, job)
+        for job_id, job in job_map.items()
+        if job.get('status') not in ACTIVE_JOB_STATUSES
+    ]
+    overflow = len(terminal_jobs) - keep
+    if overflow <= 0:
+        return []
+
+    removed = []
+    for job_id, _job in sorted(terminal_jobs, key=lambda item: _job_retention_key(*item))[:overflow]:
+        job_map.pop(job_id, None)
+        if cleanup_callback:
+            cleanup_callback(job_id)
+        removed.append(job_id)
+    return removed
+
+
 def _find_running_job():
     with selection_jobs_lock:
         for job in selection_jobs.values():
-            if job.get('status') in {'queued', 'running'}:
+            if job.get('status') in ACTIVE_JOB_STATUSES:
                 return _serialize_job(job)
     return None
 
@@ -1026,12 +1117,30 @@ def _append_update_job_log(job_id, message):
 def _find_running_update_job():
     with update_jobs_lock:
         for job in update_jobs.values():
-            if job.get('status') in {'queued', 'running'}:
+            if job.get('status') in ACTIVE_JOB_STATUSES:
+                return _serialize_job(job)
+    return None
+
+
+def _find_running_diagnostic_job(report_path=None):
+    with diagnostic_jobs_lock:
+        for job in diagnostic_jobs.values():
+            if job.get('status') not in ACTIVE_JOB_STATUSES:
+                continue
+            if report_path is None or job.get('error_report_path') == str(report_path):
                 return _serialize_job(job)
     return None
 
 
 def _selection_conflict_response():
+    running_diagnostic = _find_running_diagnostic_job()
+    if running_diagnostic:
+        return jsonify({
+            'success': False,
+            'error': '当前有数据更新自检正在执行，请等待完成后再选股',
+            'diagnostic': running_diagnostic,
+        }), 409
+
     running_update = _find_running_update_job()
     if running_update:
         return jsonify({
@@ -1055,13 +1164,14 @@ def _update_cancel_event(job_id):
         return update_cancel_events.get(job_id)
 
 
-def _create_update_job(provider):
+def _create_update_job(provider, max_stocks=None):
     job_id = uuid.uuid4().hex[:12]
     now = _job_timestamp()
     job = {
         'job_id': job_id,
         'status': 'queued',
         'provider': provider,
+        'max_stocks': max_stocks,
         'created_at': now,
         'updated_at': now,
         'started_at_monotonic': time.monotonic(),
@@ -1085,7 +1195,86 @@ def _create_update_job(provider):
     with update_jobs_lock:
         update_jobs[job_id] = job
         update_cancel_events[job_id] = Event()
+        _prune_terminal_jobs(
+            update_jobs,
+            cleanup_callback=lambda removed_id: update_cancel_events.pop(removed_id, None),
+        )
     return job_id
+
+
+def _create_diagnostic_job(update_job, mode):
+    diagnostic_id = uuid.uuid4().hex[:12]
+    now = _job_timestamp()
+    job = {
+        'diagnostic_id': diagnostic_id,
+        'update_job_id': update_job.get('job_id'),
+        'status': 'queued',
+        'mode': mode,
+        'created_at': now,
+        'updated_at': now,
+        'started_at_monotonic': time.monotonic(),
+        'elapsed_seconds': 0,
+        'current_step': '等待执行',
+        'processed_count': 0,
+        'total_count': 0,
+        'summary': None,
+        'error': None,
+        'error_report_path': update_job.get('error_report_path'),
+    }
+    with diagnostic_jobs_lock:
+        diagnostic_jobs[diagnostic_id] = job
+        _prune_terminal_jobs(diagnostic_jobs)
+    return diagnostic_id
+
+
+def _update_diagnostic_job(diagnostic_id, **updates):
+    with diagnostic_jobs_lock:
+        job = diagnostic_jobs.get(diagnostic_id)
+        if not job:
+            return None
+        job.update(updates)
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        return job
+
+
+def _run_update_diagnostic_job(diagnostic_id, report_path, mode, temporary_token):
+    def progress(payload):
+        _update_diagnostic_job(diagnostic_id, **payload)
+
+    _update_diagnostic_job(
+        diagnostic_id,
+        status='running',
+        current_step='启动数据更新自检',
+        started_at=_job_timestamp(),
+    )
+    try:
+        result = run_update_diagnostics(
+            report_path,
+            mode=mode,
+            token=temporary_token or None,
+            project_root=project_root,
+            progress_callback=progress,
+            trigger='web',
+        )
+        _update_diagnostic_job(
+            diagnostic_id,
+            status='completed',
+            current_step='自检完成',
+            summary=result.get('primary_diagnosis'),
+            result_status=result.get('status'),
+            finished_at=_job_timestamp(),
+        )
+    except Exception as exc:
+        _update_diagnostic_job(
+            diagnostic_id,
+            status='error',
+            current_step='自检失败',
+            error=str(exc),
+            finished_at=_job_timestamp(),
+        )
+    finally:
+        temporary_token = None
 
 
 def _create_selection_job(requested_boards, requested_strategies, formula_spec=None):
@@ -1121,6 +1310,7 @@ def _create_selection_job(requested_boards, requested_strategies, formula_spec=N
     _append_job_log(job, '任务已创建，等待执行。')
     with selection_jobs_lock:
         selection_jobs[job_id] = job
+        _prune_terminal_jobs(selection_jobs)
     return job_id
 
 
@@ -1139,6 +1329,7 @@ def block_requests_after_halt():
         'system_shutdown',
         'get_selection_job_status',
         'get_update_job_status',
+        'get_update_diagnostic_status',
     }
     if request.endpoint in allowed_endpoints:
         return None
@@ -1177,6 +1368,8 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
 
         data_dir = str(manager.data_dir)
         settings = _get_web_selection_settings()
+        if platform.system() == 'Windows':
+            settings['backend'] = 'process'
         backend = _resolve_selection_backend(len(candidates), settings)
         candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
         effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
@@ -1423,6 +1616,87 @@ def _refresh_market_caches_for_job(job_id, data_dir):
     _update_update_job(job_id, cache_refresh=cache_result.get('errors') or {})
 
 
+def _truthy(value):
+    return extension_truthy(value)
+
+
+def _tushare_extension_full_backfill_enabled(config=None):
+    return extension_full_backfill_enabled(config or _load_config())
+
+
+def _recent_tushare_extension_trade_dates(store, latest_text, count=2):
+    return recent_tushare_extension_trade_dates(store, latest_text, count=count)
+
+
+def _skipped_extension_stage(reason):
+    return skipped_extension_stage(reason)
+
+
+def _refresh_tushare_extension_data_for_job(
+    job_id,
+    provider,
+    target_universe,
+    latest_trade_date,
+    *,
+    full_backfill=None,
+    price_datasets=None,
+    financial_datasets=None,
+    trading_datasets=None,
+    halt_checker=None,
+):
+    """Run optional Tushare extension stages after the core CSV sync succeeds."""
+
+    store = _tushare_ext_store()
+
+    def extension_halted():
+        if _is_halted():
+            return True
+        if halt_checker is None:
+            return False
+        try:
+            return bool(halt_checker())
+        except InterruptedError:
+            return True
+
+    def ensure_extension_continues():
+        if extension_halted():
+            raise InterruptedError('用户已停止此次更新')
+
+    def progress_callback(payload):
+        ensure_extension_continues()
+        dataset = payload.get('dataset') or 'extension'
+        _update_update_job(
+            job_id,
+            current_step=f'Tushare 扩展数据: {dataset}',
+            progress_pct=99,
+        )
+
+    def warning_callback(stage, warning):
+        _append_system_log(
+            'tushare_extension_stage_warning',
+            warning,
+            {'job_id': job_id, 'stage': stage},
+        )
+
+    summary = refresh_tushare_extension_data(
+        provider,
+        target_universe,
+        latest_trade_date,
+        store=store,
+        config=_load_config(),
+        full_backfill=full_backfill,
+        price_datasets=price_datasets,
+        financial_datasets=financial_datasets,
+        trading_datasets=trading_datasets,
+        halt_checker=extension_halted,
+        progress_callback=progress_callback,
+        log_callback=lambda message: _append_update_job_log(job_id, message),
+        warning_callback=warning_callback,
+    )
+    _update_update_job(job_id, tushare_extension=summary)
+    return summary
+
+
 def _provider_update_coverage(summary):
     try:
         return float(summary.get('coverage_ratio') or 0)
@@ -1494,7 +1768,7 @@ def _provider_switch_warnings(data_root, provider, provider_state=None):
     return warnings
 
 
-def _run_update_job(job_id, provider_name, provider_token):
+def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
     config = _load_config()
     data_dir = str(_config_value(config, 'data_dir', default='data'))
     provider = None
@@ -1521,6 +1795,26 @@ def _run_update_job(job_id, provider_name, provider_token):
                     context['provider_context'] = provider_context
         return context
 
+    def enrich_error_report(report_path):
+        if provider is not None:
+            try:
+                provider.persist_error_report_path(report_path)
+            except Exception as state_error:
+                _append_system_log(
+                    'update_provider_state_error',
+                    f'更新失败状态写入错误报告路径失败: {state_error}',
+                    {'job_id': job_id},
+                )
+        try:
+            attach_auto_snapshot(report_path, config=config, project_root=project_root)
+        except Exception as snapshot_error:
+            _append_system_log(
+                'update_auto_diagnostic_error',
+                f'自动轻量自检写入失败: {snapshot_error}',
+                {'job_id': job_id, 'error_report_path': str(report_path)},
+            )
+        return report_path
+
     try:
         ensure_update_continues()
 
@@ -1545,13 +1839,25 @@ def _run_update_job(job_id, provider_name, provider_token):
             config=config,
             token=(provider_token or '').strip() or None,
         )
+        if provider_name == 'tushare':
+            _update_update_job(
+                job_id,
+                current_step='Tushare 更新前预检',
+                progress_pct=2,
+            )
+            _append_update_job_log(job_id, '正在执行 Tushare Token、权限、交易日历、基础数据与行情预检。')
+            preflight = provider.run_preflight()
+            _append_update_job_log(
+                job_id,
+                f"Tushare 预检完成: {preflight.get('status')}，最新交易日 {preflight.get('latest_trade_date')}。",
+            )
         _update_update_job(
             job_id,
             current_step='获取股票列表',
             progress_pct=2,
         )
         _append_update_job_log(job_id, f'正在获取 {provider_name} 目标股票池。')
-        target_universe = provider.get_target_universe(board='all', max_stocks=None)
+        target_universe = provider.get_target_universe(board='all', max_stocks=max_stocks)
         ensure_update_continues()
         _update_update_job(
             job_id,
@@ -1594,7 +1900,7 @@ def _run_update_job(job_id, provider_name, provider_token):
         sync_summary = provider.sync_target_data(
             target_universe,
             board='all',
-            max_stocks=None,
+            max_stocks=max_stocks,
             purpose='run',
             progress_callback=progress_callback,
             halt_checker=lambda: _is_halted() or is_cancelled(),
@@ -1622,6 +1928,7 @@ def _run_update_job(job_id, provider_name, provider_token):
                 failure_context,
                 error_id=job_id,
             )
+            enrich_error_report(error_report_path)
             _append_update_job_log(job_id, message)
             _append_update_job_log(job_id, f'错误日志: {error_report_path}')
             _append_system_log(
@@ -1669,6 +1976,16 @@ def _run_update_job(job_id, provider_name, provider_token):
             _refresh_market_caches_for_job(job_id, provider_dir)
             ensure_update_continues()
             provider_state = warehouse_summary(data_dir, provider_name)
+        if provider_name == 'tushare':
+            ensure_update_continues()
+            _refresh_tushare_extension_data_for_job(
+                job_id,
+                provider,
+                target_universe,
+                provider_state.get('latest_trade_date') or datetime.now().strftime('%Y-%m-%d'),
+                halt_checker=lambda: _is_halted() or is_cancelled(),
+            )
+            ensure_update_continues()
         switch_allowed = (
             provider_state.get('stock_count', 0) > 0
             and (provider_state.get('coverage_ratio') or 0) >= 0.98
@@ -1747,6 +2064,7 @@ def _run_update_job(job_id, provider_name, provider_token):
             error_context('data_provider'),
             error_id=job_id,
         )
+        enrich_error_report(error_report_path)
         _update_update_job(
             job_id,
             status='error',
@@ -1768,6 +2086,7 @@ def _run_update_job(job_id, provider_name, provider_token):
             error_context('unexpected'),
             error_id=job_id,
         )
+        enrich_error_report(error_report_path)
         _update_update_job(
             job_id,
             status='error',
@@ -1794,6 +2113,28 @@ def _warm_market_caches_background():
         print("✓ 市场云图缓存已就绪")
     except Exception as exc:
         print(f"⚠️ 市场云图缓存预热失败: {exc}")
+
+
+def _warm_tushare_index_cache_background():
+    try:
+        store = _tushare_ext_store()
+        result = _ensure_tushare_index_cache(store=store)
+        if result.get('status') == 'warning':
+            print(f"⚠️ Tushare 指数缓存预热降级: {result.get('warning')}")
+        else:
+            print("✓ Tushare 指数缓存已就绪")
+    except Exception as exc:
+        _append_system_log(
+            'tushare_index_cache_warm_error',
+            f'Tushare 指数缓存预热失败: {exc}',
+            {},
+        )
+        print(f"⚠️ Tushare 指数缓存预热失败: {exc}")
+
+
+@app.route('/favicon.ico')
+def favicon():
+    return Response(status=204)
 
 
 @app.route('/')
@@ -1893,10 +2234,24 @@ def search_stock_api():
 
 
 STOCK_PERIODS = {
-    'daily': {'label': '日K', 'freq': None, 'limit': 160},
-    'weekly': {'label': '周K', 'freq': 'W-FRI', 'limit': 160},
-    'monthly': {'label': '月K', 'freq': 'ME', 'limit': 120},
+    'daily': {'label': '日K', 'freq': None, 'limit': 260},
+    'weekly': {'label': '周K', 'freq': 'W-FRI', 'limit': 260},
+    'monthly': {'label': '月K', 'freq': 'ME', 'limit': 260},
 }
+STOCK_DETAIL_MAX_LIMIT = 2500
+
+
+def _parse_chart_limit(value, *, default=260, total_bars=None, max_limit=STOCK_DETAIL_MAX_LIMIT):
+    text = str(value or '').strip().lower()
+    if text == 'all':
+        if total_bars is None:
+            return int(max_limit)
+        return min(max(int(total_bars), 1), int(max_limit))
+    try:
+        parsed = int(text) if text else int(default)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return min(max(parsed, 1), int(max_limit))
 
 
 def _resample_stock_period(df, period):
@@ -1964,7 +2319,13 @@ def get_stock_detail(code):
         
         # 转换为列表格式
         data = []
-        limit = STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['limit']
+        total_bars = len(df)
+        default_limit = STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['limit']
+        limit = _parse_chart_limit(
+            request.args.get('limit'),
+            default=default_limit,
+            total_bars=total_bars,
+        )
         for i, (_, row) in enumerate(df.head(limit).iterrows()):
             data.append({
                 'date': row['date'].strftime('%Y-%m-%d'),
@@ -1996,7 +2357,17 @@ def get_stock_detail(code):
             'name': stock_name,
             'period': period,
             'period_label': STOCK_PERIODS.get(period, STOCK_PERIODS['daily'])['label'],
+            'limit': limit,
+            'total_bars': total_bars,
+            'max_limit': STOCK_DETAIL_MAX_LIMIT,
             'data': data,
+            'adjusted_data': build_adjusted_candles(
+                _tushare_ext_store(),
+                code,
+                limit=limit,
+                required_trade_dates=[item.get('date') for item in data],
+            ),
+            **build_stock_extension_payload(_tushare_ext_store(), code),
         })
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -2311,7 +2682,22 @@ def _run_wyckoff_job(job_id, query):
             progress_pct=1,
         )
 
+        def ensure_wyckoff_continues():
+            if _is_halted():
+                _update_wyckoff_job(
+                    job_id,
+                    status='cancelled',
+                    current_step='系统已急停',
+                    message='系统已急停，威科夫分析已停止。',
+                    progress_pct=0,
+                    error='系统已急停',
+                )
+                raise InterruptedError('系统已急停')
+
+        ensure_wyckoff_continues()
+
         def progress_callback(payload):
+            ensure_wyckoff_continues()
             _update_wyckoff_job(
                 job_id,
                 status='running',
@@ -2328,6 +2714,7 @@ def _run_wyckoff_job(job_id, query):
             output_dir=_wyckoff_outputs_root(),
         )
         result = pipeline.analyze_stock(query, progress_callback=progress_callback)
+        ensure_wyckoff_continues()
         _attach_wyckoff_chart_url(result)
         _update_wyckoff_job(
             job_id,
@@ -2337,6 +2724,8 @@ def _run_wyckoff_job(job_id, query):
             progress_pct=100,
             result=result,
         )
+    except InterruptedError:
+        return
     except WyckoffPipelineError as e:
         error_report_path = write_error_report(
             'wyckoff',
@@ -2396,6 +2785,7 @@ def start_wyckoff_stock():
                 'result': None,
                 'error': None,
             }
+            _prune_terminal_jobs(wyckoff_jobs)
         thread = Thread(target=_run_wyckoff_job, args=(job_id, query), daemon=True)
         thread.start()
         return jsonify({'success': True, 'job_id': job_id, 'data': wyckoff_jobs[job_id]})
@@ -2499,7 +2889,12 @@ def get_dashboard_pulse():
     try:
         data_dir = str(_active_data_dir())
         data_root = str(_data_root_dir())
-        payload = build_heatmap_payload(data_dir=data_dir, scope='all', metric='daily', refresh=False)
+        payload = build_heatmap_payload(
+            data_dir=data_dir,
+            scope='all',
+            metric='daily',
+            refresh=market_cache_needs_refresh(data_dir),
+        )
         health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
         industry_groups = [{
@@ -2530,6 +2925,12 @@ def get_dashboard_pulse():
                 'industry_groups': industry_groups,
                 'header_indices': payload.get('header_indices', []),
                 'cache_health': health,
+                'market_trading': build_market_trading_summary(
+                    _tushare_ext_store(),
+                    payload.get('latest_date') or datetime.now().strftime('%Y-%m-%d'),
+                    market_amount_yi=(payload.get('ticker_stats') or {}).get('market_amount_yi'),
+                    previous_market_amount_yi=(payload.get('ticker_stats') or {}).get('previous_market_amount_yi'),
+                ),
                 'active_provider': load_active_provider(data_root),
                 'provider_statuses': list_provider_statuses(data_root),
             }
@@ -2551,6 +2952,14 @@ def activate_data_provider():
                 'success': False,
                 'error': '当前有数据更新任务正在执行，请等待完成后再切换数据源',
                 'job': running_update,
+            }), 409
+
+        running_diagnostic = _find_running_diagnostic_job()
+        if running_diagnostic:
+            return jsonify({
+                'success': False,
+                'error': '当前有数据更新自检正在执行，请等待完成后再激活数据源',
+                'diagnostic': running_diagnostic,
             }), 409
 
         running_selection = _find_running_job()
@@ -2937,21 +3346,42 @@ def get_stats():
 def get_index_kline():
     """获取首页指数日K线。"""
     try:
-        data_dir = str(_active_data_dir())
         symbol = _normalize_csv_value(request.args.get('symbol')) or 'sh000001'
         if symbol not in INDEX_KLINE_TARGETS:
             symbol = 'sh000001'
-        limit = int(request.args.get('limit', 30))
-        limit = min(max(limit, 10), 60)
-        try:
-            payload = _fetch_index_kline(symbol, data_dir=data_dir, limit=limit)
-        except Exception as exc:
-            cache = _load_index_kline_cache(data_dir)
-            cached_payload = cache.get(symbol)
-            if cached_payload:
-                payload = {**cached_payload, 'from_cache': True, 'stale': True, 'warning': str(exc)}
-            else:
-                raise
+        months = int(request.args.get('months', 3))
+        store = _tushare_ext_store()
+        cache_result = _ensure_tushare_index_cache(store=store)
+        payload = build_index_kline_payload(store, symbol, months=months)
+        if cache_result.get('warning'):
+            payload['warning'] = cache_result['warning']
+        if not payload.get('candles') and cache_result.get('warning'):
+            return jsonify({'success': False, 'error': cache_result['warning']}), 503
+        return jsonify({'success': True, 'data': payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/index-detail/<symbol>')
+def get_index_detail(symbol):
+    """获取指数详情图表数据。"""
+    try:
+        period = _normalize_csv_value(request.args.get('period')) or 'daily'
+        if period not in {'daily', 'weekly', 'monthly'}:
+            period = 'daily'
+        limit_arg = _normalize_csv_value(request.args.get('limit')) or '260'
+        store = _tushare_ext_store()
+        cache_result = _ensure_tushare_index_cache(store=store, symbols=DEFAULT_INDEX_SYMBOLS)
+        payload = build_index_kline_payload(
+            store,
+            symbol,
+            months=6,
+            period=period,
+            limit=limit_arg,
+            max_limit=STOCK_DETAIL_MAX_LIMIT,
+        )
+        if cache_result.get('warning'):
+            payload['warning'] = cache_result['warning']
         return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -3053,7 +3483,6 @@ def get_heatmap_meta():
             if industry_items.get(stock.get('code'))
         )
         industry_unmapped_count = max(len(visible_snapshot_stocks) - industry_mapped_count, 0)
-        default_provider = get_config_value(config, 'data_source', 'default_provider', default='akshare')
         has_tushare_token = bool(
             os.getenv('TUSHARE_TOKEN')
             or get_config_value(config, 'data_source', 'tushare', 'token')
@@ -3063,7 +3492,7 @@ def get_heatmap_meta():
             'success': True,
             'data': {
                 'latest_date': cache_bundle.get('snapshot', {}).get('latest_date'),
-                'default_provider': str(default_provider or 'akshare').lower(),
+                'default_provider': 'tushare',
                 'has_tushare_token': has_tushare_token,
                 'markets': [
                     {'key': 'all', 'label': 'A股全图', 'enabled': True},
@@ -3108,7 +3537,9 @@ def get_update_options():
     """获取 Web 更新数据功能的默认选项。"""
     try:
         config = _load_config()
-        default_provider = get_config_value(config, 'data_source', 'default_provider', default='akshare')
+        configured_provider = str(get_config_value(config, 'data_source', 'default_provider') or 'tushare').lower()
+        if configured_provider not in VALID_PROVIDERS:
+            configured_provider = 'tushare'
         has_tushare_token = bool(
             os.getenv('TUSHARE_TOKEN')
             or get_config_value(config, 'data_source', 'tushare', 'token')
@@ -3122,13 +3553,14 @@ def get_update_options():
         return jsonify({
             'success': True,
             'data': {
-                'default_provider': str(default_provider or 'akshare').lower(),
+                'default_provider': configured_provider,
                 'has_tushare_token': has_tushare_token,
                 'latest_date': latest_date,
                 'active_provider': active_state.get('active_provider'),
                 'active_provider_state': active_state,
                 'providers': list_provider_statuses(data_root),
                 'legacy_provider': legacy_summary(data_root),
+                'migration_warning': None,
             }
         })
     except Exception as e:
@@ -3147,12 +3579,29 @@ def start_update_job():
             payload = {}
         if not isinstance(payload, dict):
             return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
-        provider = _normalize_csv_value(payload.get('provider')) or 'akshare'
-        if provider not in {'akshare', 'tushare', 'tencent'}:
+        provider = _normalize_csv_value(payload.get('provider')) or 'tushare'
+        if provider not in VALID_PROVIDERS:
             return jsonify({'success': False, 'error': '不支持的数据源'}), 400
 
         tushare_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
+        max_stocks = payload.get('max_stocks')
+        if max_stocks in ('', None):
+            max_stocks = None
+        else:
+            try:
+                max_stocks = int(max_stocks)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'max_stocks 必须是正整数'}), 400
+            if max_stocks <= 0 or max_stocks > 100:
+                return jsonify({'success': False, 'error': 'max_stocks 必须在 1 到 100 之间'}), 400
         with job_admission_lock:
+            running_diagnostic = _find_running_diagnostic_job()
+            if running_diagnostic:
+                return jsonify({
+                    'success': False,
+                    'error': '当前有数据更新自检正在执行，请等待完成后再更新数据',
+                    'diagnostic': running_diagnostic,
+                }), 409
             running_job = _find_running_update_job()
             if running_job:
                 return jsonify({
@@ -3168,10 +3617,10 @@ def start_update_job():
                     'error': '当前有选股任务正在执行，请等待完成后再更新数据',
                     'job': running_selection,
                 }), 409
-            job_id = _create_update_job(provider)
+            job_id = _create_update_job(provider, max_stocks=max_stocks)
         thread = Thread(
             target=_run_update_job,
-            args=(job_id, provider, tushare_token),
+            args=(job_id, provider, tushare_token, max_stocks),
             daemon=True,
         )
         thread.start()
@@ -3204,6 +3653,68 @@ def get_update_job_status(job_id):
             'success': True,
             'data': _serialize_job(job),
         })
+
+
+@app.route('/api/update/diagnostics/start/<job_id>', methods=['POST'])
+def start_update_diagnostic(job_id):
+    """针对既有失败更新启动有界、只读的 Tushare 自检。"""
+    try:
+        job_id = _validate_job_id(job_id)
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
+        mode = _normalize_csv_value(payload.get('mode')) or 'standard'
+        if mode not in {'standard', 'extended'}:
+            return jsonify({'success': False, 'error': '自检模式必须是 standard 或 extended'}), 400
+        temporary_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
+
+        with update_jobs_lock:
+            update_job = update_jobs.get(job_id)
+            if not update_job:
+                return jsonify({'success': False, 'error': '更新任务不存在'}), 404
+            update_snapshot = dict(update_job)
+        if update_snapshot.get('status') not in {'failed', 'error'}:
+            return jsonify({'success': False, 'error': '只允许针对 failed/error 更新任务运行自检'}), 409
+        report_path = update_snapshot.get('error_report_path')
+        if not report_path:
+            return jsonify({'success': False, 'error': '该失败任务没有错误报告'}), 409
+        report_path = str(resolve_update_error_report(report_path))
+        update_snapshot['error_report_path'] = report_path
+
+        with job_admission_lock:
+            if _find_running_update_job() or _find_running_job() or sync_selection_active:
+                return jsonify({'success': False, 'error': '更新或选股任务正在执行，不能启动自检'}), 409
+            existing = _find_running_diagnostic_job()
+            if existing:
+                message = '该错误报告已有自检正在执行' if existing.get('error_report_path') == report_path else '已有数据更新自检正在执行'
+                return jsonify({'success': False, 'error': message, 'diagnostic': existing}), 409
+            diagnostic_id = _create_diagnostic_job(update_snapshot, mode)
+
+        Thread(
+            target=_run_update_diagnostic_job,
+            args=(diagnostic_id, report_path, mode, temporary_token),
+            daemon=True,
+        ).start()
+        with diagnostic_jobs_lock:
+            created = diagnostic_jobs.get(diagnostic_id)
+        return jsonify({'success': True, 'diagnostic_id': diagnostic_id, 'data': _serialize_job(created)})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/update/diagnostics/status/<diagnostic_id>')
+def get_update_diagnostic_status(diagnostic_id):
+    try:
+        diagnostic_id = _validate_job_id(diagnostic_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    with diagnostic_jobs_lock:
+        job = diagnostic_jobs.get(diagnostic_id)
+        if not job:
+            return jsonify({'success': False, 'error': '自检任务不存在'}), 404
+        return jsonify({'success': True, 'data': _serialize_job(job)})
 
 
 @app.route('/api/update/cancel/<job_id>', methods=['POST'])
@@ -3550,6 +4061,7 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"🌐 启动Web服务器: http://{display_host}:{port}")
     Thread(target=_warm_market_caches_background, daemon=True).start()
+    Thread(target=_warm_tushare_index_cache_background, daemon=True).start()
     app.run(host=host, port=port, debug=debug, threaded=True)
 
 

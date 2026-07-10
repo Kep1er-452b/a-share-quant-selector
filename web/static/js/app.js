@@ -21,7 +21,30 @@ const STOCK_PERIOD_LABELS = {
     weekly: '周K',
     monthly: '月K',
 };
+const STOCK_CHART_LIMIT_OPTIONS = ['260', '520', '1000', 'all'];
 const STOCKS_PAGE_SIZE = 6000;
+
+function loadJsonSetting(key, fallback) {
+    try {
+        const raw = window.localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+    } catch (error) {
+        return fallback;
+    }
+}
+
+function saveJsonSetting(key, value) {
+    try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+        console.warn('localStorage write failed:', error);
+    }
+}
+
+function normalizeStockChartLimit(value) {
+    const text = String(value ?? '').trim().toLowerCase();
+    return STOCK_CHART_LIMIT_OPTIONS.includes(text) ? text : '260';
+}
 
 const state = {
     currentPage: 'dashboard',
@@ -49,10 +72,19 @@ const state = {
     selectionPollTimer: null,
     currentSelectionJobId: null,
     updatePollTimer: null,
+    updateDiagnosticPollTimer: null,
+    currentUpdateDiagnosticId: null,
     currentUpdateJobId: null,
     currentUpdateJob: null,
     indexKlineChart: null,
     currentIndexSymbol: 'sh000001',
+    indexMonths: 3,
+    maSettings: loadJsonSetting('quantMaSettings', [
+        { window: 50, color: '#ffd700' },
+        { window: 200, color: '#a855f7' },
+    ]),
+    macdSettings: loadJsonSetting('quantMacdSettings', { fast: 12, slow: 26, signal: 9 }),
+    showSequenceMarkers: loadJsonSetting('quantShowSequenceMarkers', true) !== false,
     localProgressTimer: null,
     jobStartTime: null,
     serverElapsedBase: 0,
@@ -65,19 +97,24 @@ const state = {
     heatmapPayloadCache: new Map(),
     heatmapHealth: null,
     heatmapFocusActive: false,
-    updateModalStep: 'provider',
-    updateProvider: null,
+    updateModalStep: 'token',
+    updateProvider: 'tushare',
     updateHasTushareToken: false,
-    updateDefaultProvider: 'akshare',
+    updateDefaultProvider: 'tushare',
     updateActiveProvider: null,
     updateProviderStatuses: [],
     updateLegacyProvider: null,
+    updateMigrationWarning: null,
     activeProviderState: null,
     providerStatuses: [],
     providerSwitching: false,
     globalTickerText: '',
     currentStockDetail: null,
     currentStockPeriod: 'daily',
+    currentStockLimit: normalizeStockChartLimit(loadJsonSetting('quantStockChartLimit', '260')),
+    currentStockChartData: [],
+    currentStockChartPeriod: 'daily',
+    currentStockChartDetail: {},
     pendingExportStock: null,
     watchlistLoaded: false,
     watchlistCache: [],
@@ -178,6 +215,38 @@ function formatNumber(value) {
     return numeric.toLocaleString('zh-CN');
 }
 
+function formatTradingValue(value, unit = '') {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    const digits = unit === '家' ? 0 : 2;
+    const rendered = Math.abs(numeric).toLocaleString('zh-CN', {
+        maximumFractionDigits: digits,
+        minimumFractionDigits: unit === '家' ? 0 : Math.min(digits, 2),
+    });
+    const sign = numeric < 0 ? '-' : '';
+    return `${sign}${rendered}${unit ? ` ${unit}` : ''}`;
+}
+
+function formatWanYuanMarketValue(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '--';
+    }
+    const yi = numeric / 10000;
+    if (Math.abs(yi) >= 10000) {
+        return `${(yi / 10000).toLocaleString('zh-CN', {
+            maximumFractionDigits: 2,
+            minimumFractionDigits: 2,
+        })}万亿`;
+    }
+    return `${yi.toLocaleString('zh-CN', {
+        maximumFractionDigits: 2,
+        minimumFractionDigits: 2,
+    })}亿`;
+}
+
 function formatDateTime(value) {
     if (!value) {
         return '--';
@@ -256,6 +325,56 @@ function signedClass(value) {
         return '';
     }
     return numeric > 0 ? 'price-up' : 'price-down';
+}
+
+function calculateMovingAverage(values, windowSize) {
+    const window = Math.max(Number(windowSize) || 0, 0);
+    const result = [];
+    const buffer = [];
+    values.forEach(value => {
+        const numeric = Number(value);
+        buffer.push(Number.isFinite(numeric) ? numeric : null);
+        if (buffer.length > window) {
+            buffer.shift();
+        }
+        if (!window || buffer.length < window || buffer.some(item => item === null)) {
+            result.push(null);
+        } else {
+            const total = buffer.reduce((sum, item) => sum + item, 0);
+            result.push(Number((total / window).toFixed(4)));
+        }
+    });
+    return result;
+}
+
+function ema(values, span) {
+    const alpha = 2 / ((Number(span) || 1) + 1);
+    const result = [];
+    let current = null;
+    values.forEach(value => {
+        const numeric = Number(value);
+        const safeValue = Number.isFinite(numeric) ? numeric : (current ?? 0);
+        current = current === null ? safeValue : (safeValue * alpha + current * (1 - alpha));
+        result.push(current);
+    });
+    return result;
+}
+
+function calculateMacd(values, settings = state.macdSettings) {
+    const fast = Math.max(Number(settings.fast) || 12, 2);
+    const slow = Math.max(Number(settings.slow) || 26, fast + 1);
+    const signal = Math.max(Number(settings.signal) || 9, 2);
+    const numeric = values.map(value => Number(value) || 0);
+    const fastLine = ema(numeric, fast);
+    const slowLine = ema(numeric, slow);
+    const dif = fastLine.map((value, index) => value - slowLine[index]);
+    const dea = ema(dif, signal);
+    const macd = dif.map((value, index) => (value - dea[index]) * 2);
+    return {
+        dif: dif.map(value => Number(value.toFixed(4))),
+        dea: dea.map(value => Number(value.toFixed(4))),
+        macd: macd.map(value => Number(value.toFixed(4))),
+    };
 }
 
 function heatmapColor(changePct) {
@@ -354,7 +473,7 @@ function classifyBoard(code) {
 
 function boardBadge(boardOrCode) {
     const board = BOARD_LABELS[boardOrCode] ? boardOrCode : classifyBoard(boardOrCode);
-    return `<span class="board-badge ${board}">${BOARD_LABELS[board] || board}</span>`;
+    return `<span class="board-badge ${escapeHtml(board)}">${escapeHtml(BOARD_LABELS[board] || board)}</span>`;
 }
 
 function abortActiveRequests() {
@@ -374,6 +493,13 @@ function stopUpdatePolling() {
     if (state.updatePollTimer) {
         window.clearInterval(state.updatePollTimer);
         state.updatePollTimer = null;
+    }
+}
+
+function stopUpdateDiagnosticPolling() {
+    if (state.updateDiagnosticPollTimer) {
+        window.clearInterval(state.updateDiagnosticPollTimer);
+        state.updateDiagnosticPollTimer = null;
     }
 }
 
@@ -784,6 +910,41 @@ function renderPulseDistribution(distribution) {
     }).join('');
 }
 
+function formatTradingDelta(value, unit = '') {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+        return '较昨日 --';
+    }
+    return `较昨日 ${numeric >= 0 ? '+' : ''}${formatTradingValue(numeric, unit)}`;
+}
+
+function renderMarketTradingCards(summary) {
+    const metrics = summary?.metrics || {};
+    const order = [
+        'market_amount',
+        'main_money_flow',
+        'dragon_tiger_net',
+        'dragon_tiger_count',
+        'block_trade_amount',
+        'margin_balance',
+        'northbound_money',
+    ];
+    return `
+        <div class="pulse-trading-grid">
+            ${order.map(key => {
+                const item = metrics[key] || {};
+                return `
+                    <div class="pulse-card pulse-trading-card">
+                        <div class="pulse-label">${escapeHtml(item.label || key)}</div>
+                        <div class="pulse-value ${signedClass(item.value)}">${formatTradingValue(item.value, item.unit || '')}</div>
+                        <div class="pulse-sub">${escapeHtml(formatTradingDelta(item.delta, item.unit || ''))}</div>
+                    </div>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
 function renderDashboardPulse(payload) {
     const container = document.getElementById('dashboard-market-pulse');
     if (!container) {
@@ -833,6 +994,7 @@ function renderDashboardPulse(payload) {
                 <div class="pulse-sub">全市场中位涨幅</div>
             </div>
         </div>
+        ${renderMarketTradingCards(payload?.market_trading)}
         <div class="pulse-distribution-panel">
             <div class="pulse-distribution-head">
                 <span>MARKET DISTRIBUTION</span>
@@ -1035,13 +1197,14 @@ async function switchActiveProvider(provider) {
 function renderProviderHealthCard(status, activeProvider) {
     const provider = status?.provider || '--';
     const isActive = provider === activeProvider;
-    const label = isActive ? `${providerDisplayName(provider)} ACTIVE` : providerDisplayName(provider);
-    const state = isActive ? 'ACTIVE' : String(status?.status || 'EMPTY').toUpperCase();
-    const disabled = Number(status?.stock_count || 0) <= 0 || provider === '--';
+    const archived = Boolean(status?.archived);
+    const label = archived ? `${providerDisplayName(provider)} ARCHIVE` : (isActive ? `${providerDisplayName(provider)} ACTIVE` : providerDisplayName(provider));
+    const state = archived ? 'ARCHIVED' : (isActive ? 'ACTIVE' : String(status?.status || 'EMPTY').toUpperCase());
+    const disabled = archived || Number(status?.stock_count || 0) <= 0 || provider === '--';
     return `
         <button class="health-card provider-health-card provider-switch-card ${isActive ? 'active' : ''}" type="button"
             data-provider-switch="${escapeHtml(provider)}" ${disabled ? 'disabled' : ''}
-            title="${escapeHtml(disabled ? '本地数据仓为空' : `切换到 ${providerDisplayName(provider)}`)}">
+            title="${escapeHtml(archived ? '历史仓库只读归档，不可切换' : (disabled ? '本地数据仓为空' : `切换到 ${providerDisplayName(provider)}`))}">
             <div class="pulse-label">${escapeHtml(label)}</div>
             <div class="pulse-value ${providerStatusClass(status?.status)}">${escapeHtml(state)}</div>
             <div class="pulse-sub">${escapeHtml(providerSubText(status || {}))}</div>
@@ -1199,10 +1362,67 @@ function formatCompactAmount(value) {
     return numeric.toFixed(0);
 }
 
+function formatTooltipChangePct(items, index) {
+    const current = Number(items?.[index]?.close);
+    const previous = Number(items?.[index - 1]?.close);
+    if (!Number.isFinite(current) || !Number.isFinite(previous) || previous === 0) {
+        return '涨跌幅 --';
+    }
+    const changePct = ((current / previous) - 1) * 100;
+    return `涨跌幅 <span class="${signedClass(changePct)}">${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+}
+
 function setDashboardIndexButtons(symbol) {
     document.querySelectorAll('#dashboard-index-selector .index-switch-btn').forEach(button => {
         button.classList.toggle('active', button.dataset.symbol === symbol);
     });
+}
+
+function syncIndexMonthsLabel() {
+    const input = document.getElementById('dashboard-index-months');
+    const label = document.getElementById('dashboard-index-months-label');
+    if (input) {
+        input.value = String(state.indexMonths);
+    }
+    if (label) {
+        label.textContent = `${state.indexMonths}M`;
+    }
+}
+
+async function openDashboardIndexDetail(period = 'daily') {
+    const symbol = state.currentIndexSymbol || 'sh000001';
+    const resolvedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
+    try {
+        const result = await apiFetch(`/api/index-detail/${encodeURIComponent(symbol)}?period=${encodeURIComponent(resolvedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}`);
+        if (!result.success) {
+            throw new Error(result.error || '指数详情加载失败');
+        }
+        const payload = result.data || {};
+        const candles = Array.isArray(payload.candles) ? [...payload.candles].reverse() : [];
+        state.currentStockPeriod = resolvedPeriod;
+        state.currentStockDetail = {
+            type: 'index',
+            code: symbol,
+            name: payload.name || symbol,
+            period: resolvedPeriod,
+            limit: state.currentStockLimit,
+        };
+        document.getElementById('modal-title').textContent = `${payload.name || symbol} · ${STOCK_PERIOD_LABELS[resolvedPeriod] || '日K'}`;
+        document.getElementById('stock-export-btn').disabled = true;
+        document.getElementById('stock-export-status').innerHTML = '';
+        document.getElementById('stock-info').innerHTML = '<div class="state-loading">加载指数详情...</div>';
+        document.getElementById('stock-modal').classList.add('active');
+        renderStockPeriodControls();
+        syncIndicatorControls();
+        renderStockChart(candles, resolvedPeriod, {
+            name: payload.name,
+            meta: { industry: '指数', market: payload.source, exchange: payload.ts_code },
+            valuation: {},
+            financial: {},
+        });
+    } catch (error) {
+        toast(`指数详情加载失败: ${error.message}`, 'error');
+    }
 }
 
 function resizeDashboardIndexChart(delay = 0) {
@@ -1253,6 +1473,8 @@ function renderDashboardIndexKline(payload) {
         Number(item.low),
         Number(item.high),
     ]);
+    const ma50Values = candles.map(item => item.MA50 ?? null);
+    const ma200Values = candles.map(item => item.MA200 ?? null);
     const latest = candles[candles.length - 1];
     const previous = candles[candles.length - 2];
     const changePct = previous && Number(previous.close)
@@ -1261,17 +1483,25 @@ function renderDashboardIndexKline(payload) {
     const meta = document.getElementById('dashboard-index-meta');
     if (meta) {
         const changeText = Number.isFinite(changePct) ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%` : '--';
-        meta.textContent = `${payload.name || '--'} ${latest.date} ${changeText}`;
+        meta.textContent = `${payload.name || '--'} ${latest.date} ${changeText} · ${payload.months || state.indexMonths}M`;
         meta.className = `quote-chart-meta ${Number(changePct) >= 0 ? 'positive' : 'negative'}`;
     }
 
     state.indexKlineChart.setOption({
         animation: false,
         backgroundColor: '#000000',
+        legend: {
+            top: 4,
+            left: 46,
+            data: [payload.name || 'INDEX', 'MA50', 'MA200'],
+            itemWidth: 10,
+            itemHeight: 6,
+            textStyle: { color: '#aaaaaa', fontSize: 9 },
+        },
         grid: {
             left: 44,
-            right: 12,
-            top: 14,
+            right: 48,
+            top: 28,
             bottom: 26,
         },
         tooltip: {
@@ -1293,9 +1523,11 @@ function renderDashboardIndexKline(payload) {
                 const item = candles[point.dataIndex];
                 return [
                     `${payload.name || ''} ${item.date}`,
-                    `O ${item.open}  H ${item.high}`,
-                    `L ${item.low}  C ${item.close}`,
-                    `VOL ${formatCompactAmount(item.volume)}`,
+                    `开盘 ${item.open}  最高 ${item.high}`,
+                    `最低 ${item.low}  收盘 ${item.close}`,
+                    formatTooltipChangePct(candles, point.dataIndex),
+                    `成交量 ${formatCompactAmount(item.volume)}`,
+                    `MA50 ${item.MA50 ?? '--'}  MA200 ${item.MA200 ?? '--'}`,
                 ].join('<br>');
             },
         },
@@ -1328,18 +1560,36 @@ function renderDashboardIndexKline(payload) {
                 },
             },
         },
-        series: [{
-            name: payload.name || 'INDEX',
-            type: 'candlestick',
-            data: values,
-            barWidth: '56%',
-            itemStyle: {
-                color: '#ff3131',
-                color0: '#00c853',
-                borderColor: '#ff3131',
-                borderColor0: '#00c853',
+        series: [
+            {
+                name: payload.name || 'INDEX',
+                type: 'candlestick',
+                data: values,
+                barWidth: '56%',
+                itemStyle: {
+                    color: '#ff3131',
+                    color0: '#00c853',
+                    borderColor: '#ff3131',
+                    borderColor0: '#00c853',
+                },
             },
-        }],
+            {
+                name: 'MA50',
+                type: 'line',
+                data: ma50Values,
+                showSymbol: false,
+                smooth: true,
+                lineStyle: { color: '#ffd700', width: 1.2 },
+            },
+            {
+                name: 'MA200',
+                type: 'line',
+                data: ma200Values,
+                showSymbol: false,
+                smooth: true,
+                lineStyle: { color: '#a855f7', width: 1.2 },
+            },
+        ],
     }, true);
     resizeDashboardIndexChart(30);
 }
@@ -1350,6 +1600,7 @@ async function loadDashboardIndexKline(symbol = 'sh000001') {
     }
     state.currentIndexSymbol = symbol;
     setDashboardIndexButtons(symbol);
+    syncIndexMonthsLabel();
 
     const container = document.getElementById('dashboard-sparkline');
     if (container && !state.indexKlineChart) {
@@ -1357,7 +1608,7 @@ async function loadDashboardIndexKline(symbol = 'sh000001') {
     }
 
     try {
-        const result = await apiFetch(`/api/index-kline?symbol=${encodeURIComponent(symbol)}&limit=30`);
+        const result = await apiFetch(`/api/index-kline?symbol=${encodeURIComponent(symbol)}&months=${encodeURIComponent(state.indexMonths)}`);
         if (!result.success) {
             throw new Error(result.error || '指数K线加载失败');
         }
@@ -1845,6 +2096,165 @@ function renderStockPeriodControls() {
     document.querySelectorAll('.stock-period-btn[data-period]').forEach(button => {
         button.classList.toggle('active', button.dataset.period === state.currentStockPeriod);
     });
+    document.querySelectorAll('.stock-range-btn[data-limit]').forEach(button => {
+        button.classList.toggle('active', button.dataset.limit === state.currentStockLimit);
+    });
+}
+
+function normalizeMaSettings(settings) {
+    const items = Array.isArray(settings) ? settings : [];
+    return items
+        .map(item => ({
+            window: Math.max(2, Math.min(300, Number(item.window) || 0)),
+            color: /^#[0-9a-f]{6}$/i.test(String(item.color || '')) ? item.color : '#ffd700',
+        }))
+        .filter(item => item.window >= 2);
+}
+
+function renderMaSettings() {
+    state.maSettings = normalizeMaSettings(state.maSettings);
+    const list = document.getElementById('stock-ma-list');
+    if (!list) {
+        return;
+    }
+    list.innerHTML = state.maSettings.map((item, index) => `
+        <span class="indicator-chip">
+            <span class="indicator-chip-color" style="background:${escapeHtml(item.color)}"></span>
+            MA${escapeHtml(item.window)}
+            <button type="button" data-ma-remove="${index}" aria-label="删除均线">×</button>
+        </span>
+    `).join('');
+}
+
+function applyMacdInputs() {
+    const fast = Math.max(2, Number(document.getElementById('stock-macd-fast')?.value) || 12);
+    const slow = Math.max(fast + 1, Number(document.getElementById('stock-macd-slow')?.value) || 26);
+    const signal = Math.max(2, Number(document.getElementById('stock-macd-signal')?.value) || 9);
+    state.macdSettings = { fast, slow, signal };
+    saveJsonSetting('quantMacdSettings', state.macdSettings);
+}
+
+function syncIndicatorControls() {
+    renderMaSettings();
+    const fast = document.getElementById('stock-macd-fast');
+    const slow = document.getElementById('stock-macd-slow');
+    const signal = document.getElementById('stock-macd-signal');
+    const sequenceToggle = document.getElementById('stock-sequence-toggle');
+    if (fast) fast.value = state.macdSettings.fast || 12;
+    if (slow) slow.value = state.macdSettings.slow || 26;
+    if (signal) signal.value = state.macdSettings.signal || 9;
+    if (sequenceToggle) {
+        const active = state.showSequenceMarkers !== false;
+        sequenceToggle.classList.toggle('active', active);
+        sequenceToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+}
+
+function refreshCurrentStockChart() {
+    const detail = state.currentStockDetail;
+    if (detail && detail.code) {
+        if (detail.type === 'index') {
+            openDashboardIndexDetail(detail.period || state.currentStockPeriod);
+            return;
+        }
+        viewStockDetail(detail.code, detail.name, detail.period || state.currentStockPeriod);
+    }
+}
+
+function rerenderCurrentStockChart() {
+    if (Array.isArray(state.currentStockChartData) && state.currentStockChartData.length) {
+        renderStockChart(
+            state.currentStockChartData,
+            state.currentStockChartPeriod || state.currentStockPeriod || 'daily',
+            state.currentStockChartDetail || {},
+        );
+        return;
+    }
+    refreshCurrentStockChart();
+}
+
+function toggleSequenceMarkers() {
+    state.showSequenceMarkers = state.showSequenceMarkers === false;
+    saveJsonSetting('quantShowSequenceMarkers', state.showSequenceMarkers);
+    syncIndicatorControls();
+    rerenderCurrentStockChart();
+}
+
+function addMovingAverageFromControls() {
+    const windowValue = Math.max(2, Math.min(300, Number(document.getElementById('stock-ma-window')?.value) || 50));
+    const color = document.getElementById('stock-ma-color')?.value || '#ffd700';
+    state.maSettings = normalizeMaSettings([...state.maSettings, { window: windowValue, color }]);
+    saveJsonSetting('quantMaSettings', state.maSettings);
+    renderMaSettings();
+    refreshCurrentStockChart();
+}
+
+function renderStockInfoPanel(title, items) {
+    const rows = Array.isArray(items) ? items : [];
+    if (!rows.length) {
+        return '';
+    }
+    return `
+        <section class="stock-info-panel">
+            <div class="stock-info-title">${escapeHtml(title)}</div>
+            <div class="stock-info-grid">
+                ${rows.map(item => {
+                    const displayValue = item.value === undefined || item.value === null || item.value === '' ? '--' : item.value;
+                    return `
+                    <div class="stock-info-item">
+                        <div class="stock-info-label">${escapeHtml(item.label)}</div>
+                        <div class="stock-info-value ${item.className || ''}">${escapeHtml(displayValue)}</div>
+                    </div>
+                `;
+                }).join('')}
+            </div>
+        </section>
+    `;
+}
+
+function renderStockSideInfo(detail, latest) {
+    const valuation = detail?.valuation || {};
+    const financial = detail?.financial || {};
+    const company = detail?.company || detail?.meta || {};
+    const jClass = Number(latest?.J) > 80 ? 'price-down' : (Number(latest?.J) < 20 ? 'price-up' : '');
+    const html = [
+        renderStockInfoPanel('十字线 / 行情快照', [
+            { label: '时间', value: latest?.date },
+            { label: '收盘', value: latest?.close },
+            { label: 'K', value: latest?.K },
+            { label: 'D', value: latest?.D },
+            { label: 'J', value: latest?.J, className: jClass },
+            { label: 'MIN_J', value: latest?.MIN_J },
+            { label: '知行短期', value: latest?.ZX_SHORT },
+            { label: '知行多空', value: latest?.ZX_LONG },
+        ]),
+        renderStockInfoPanel('估值指标', [
+            { label: 'PE(TTM)', value: valuation.pe_ttm },
+            { label: 'PB', value: valuation.pb },
+            { label: 'PS(TTM)', value: valuation.ps_ttm },
+            { label: '股息TTM', value: valuation.dv_ttm },
+            { label: '换手率', value: valuation.turnover_rate },
+            { label: '量比', value: valuation.volume_ratio },
+            { label: '总市值', value: formatWanYuanMarketValue(valuation.total_mv) },
+            { label: '流通市值', value: formatWanYuanMarketValue(valuation.circ_mv) },
+        ]),
+        renderStockInfoPanel('财务与公司信息', [
+            { label: 'ROE', value: financial.roe },
+            { label: 'ROA', value: financial.roa },
+            { label: '毛利率', value: financial.grossprofit_margin },
+            { label: '净利率', value: financial.netprofit_margin },
+            { label: 'EPS', value: financial.eps },
+            { label: '营收同比', value: financial.or_yoy },
+            { label: '净利润同比', value: financial.netprofit_yoy },
+            { label: '扣非净利同比', value: financial.dt_netprofit_yoy },
+            { label: '行业', value: company.industry },
+            { label: '地区', value: company.area },
+            { label: '市场', value: company.market },
+            { label: '交易所', value: company.exchange },
+            { label: '上市日期', value: company.list_date },
+        ]),
+    ].join('');
+    document.getElementById('stock-info').innerHTML = html || '<div class="state-empty">暂无扩展信息</div>';
 }
 
 async function viewStockDetail(code, name, period = state.currentStockPeriod || 'daily') {
@@ -1854,25 +2264,37 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
 
     const normalizedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
     state.currentStockPeriod = normalizedPeriod;
-    state.currentStockDetail = { code, name: name || '', period: normalizedPeriod };
+    state.currentStockLimit = normalizeStockChartLimit(state.currentStockLimit);
+    state.currentStockDetail = { code, name: name || '', period: normalizedPeriod, limit: state.currentStockLimit };
     document.getElementById('modal-title').textContent = `${formatStockTitle(code, name)} · ${STOCK_PERIOD_LABELS[normalizedPeriod]}`;
+    document.getElementById('stock-export-btn').disabled = false;
     setStockExportStatus('');
     renderStockPeriodControls();
+    syncIndicatorControls();
     document.getElementById('stock-info').innerHTML = '<div class="state-loading">加载个股详情...</div>';
     document.getElementById('stock-modal').classList.add('active');
 
     try {
-        const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}`);
+        const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}`);
         if (!result.success) {
             throw new Error(result.error || '个股详情加载失败');
         }
         const resolvedName = result.name || name || findCachedStock(code)?.name || '';
         const resolvedPeriod = result.period || normalizedPeriod;
         state.currentStockPeriod = resolvedPeriod;
-        state.currentStockDetail = { code: result.code || code, name: resolvedName, period: resolvedPeriod };
+        state.currentStockDetail = { code: result.code || code, name: resolvedName, period: resolvedPeriod, limit: state.currentStockLimit };
         document.getElementById('modal-title').textContent = `${formatStockTitle(result.code || code, resolvedName)} · ${result.period_label || STOCK_PERIOD_LABELS[resolvedPeriod] || '日K'}`;
         renderStockPeriodControls();
-        renderStockChart(result.data || [], resolvedPeriod);
+        syncIndicatorControls();
+        const rawData = result.data || [];
+        let chartData = rawData;
+        if (Array.isArray(result.adjusted_data) && result.adjusted_data.length) {
+            const adjustedByDate = new Map(result.adjusted_data.map(item => [item.date, item]));
+            chartData = rawData.map(item => adjustedByDate.has(item.date)
+                ? { ...item, ...adjustedByDate.get(item.date) }
+                : item);
+        }
+        renderStockChart(chartData, resolvedPeriod, result);
     } catch (error) {
         if (error.name === 'AbortError' && state.systemHalted) {
             return;
@@ -1881,11 +2303,15 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
     }
 }
 
-function renderStockChart(data, period = 'daily') {
+function renderStockChart(data, period = 'daily', detail = {}) {
     if (!data.length) {
         document.getElementById('stock-info').innerHTML = '<div class="state-empty">暂无图表数据</div>';
         return;
     }
+
+    state.currentStockChartData = data;
+    state.currentStockChartPeriod = period;
+    state.currentStockChartDetail = detail;
 
     const reversed = [...data].reverse();
     const labelInterval = period === 'monthly' ? 2 : (period === 'weekly' ? 6 : 12);
@@ -1896,6 +2322,18 @@ function renderStockChart(data, period = 'daily') {
         Number(item.low),
         Number(item.high),
     ]);
+    const closeValues = reversed.map(item => Number(item.close));
+    const maSeries = normalizeMaSettings(state.maSettings).map(item => ({
+        name: `MA${item.window}`,
+        window: item.window,
+        color: item.color,
+        values: calculateMovingAverage(closeValues, item.window),
+    }));
+    const macdValues = calculateMacd(closeValues, state.macdSettings);
+    const macdBars = macdValues.macd.map(value => ({
+        value,
+        itemStyle: { color: Number(value) >= 0 ? '#ff3131' : '#00c853' },
+    }));
     const volumeValues = reversed.map((item, index) => ({
         value: Number(item.volume) || 0,
         itemStyle: {
@@ -1923,10 +2361,11 @@ function renderStockChart(data, period = 'daily') {
             item.value <= maxValue &&
             Number.isFinite(item.data[1])
         );
-    const upSeqEarlyMarks = buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 1, 8);
-    const upSeqLateMarks = buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 9, 13);
-    const downSeqEarlyMarks = buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 1, 8);
-    const downSeqLateMarks = buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 9, 13);
+    const showSequenceMarkers = state.showSequenceMarkers !== false;
+    const upSeqEarlyMarks = showSequenceMarkers ? buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 1, 8) : [];
+    const upSeqLateMarks = showSequenceMarkers ? buildSequenceMarks('UP_SEQ', 'UP_SEQ_Y', 9, 13) : [];
+    const downSeqEarlyMarks = showSequenceMarkers ? buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 1, 8) : [];
+    const downSeqLateMarks = showSequenceMarkers ? buildSequenceMarks('DOWN_SEQ', 'DOWN_SEQ_Y', 9, 13) : [];
     const violentKMarks = reversed
         .map((item, index) => ({
             value: item.VIOLENT_K ? 1 : 0,
@@ -1960,7 +2399,7 @@ function renderStockChart(data, period = 'daily') {
         legend: {
             top: 6,
             right: 12,
-            data: ['K线', '知行短期趋势线', '知行多空线', '大暴力K', '成交量', 'K', 'D', 'J', 'MIN_J'],
+            data: ['K线', ...maSeries.map(item => item.name), '知行短期趋势线', '知行多空线', '大暴力K', '成交量', 'K', 'D', 'J', 'MIN_J', 'MACD', 'DIF', 'DEA'],
             itemWidth: 12,
             itemHeight: 8,
             textStyle: {
@@ -1994,10 +2433,13 @@ function renderStockChart(data, period = 'daily') {
                 const item = reversed[point.dataIndex];
                 return [
                     `${item.date}`,
-                    `O ${item.open}  H ${item.high}  L ${item.low}  C ${item.close}`,
+                    `开盘 ${item.open}  最高 ${item.high}`,
+                    `最低 ${item.low}  收盘 ${item.close}`,
+                    formatTooltipChangePct(reversed, point.dataIndex),
                     `知行短期 ${item.ZX_SHORT ?? '--'}  多空 ${item.ZX_LONG ?? '--'}`,
-                    `VOL ${formatCompactAmount(item.volume)}`,
-                    `K ${item.K}  D ${item.D}  J ${item.J}`,
+                    `成交量 ${formatCompactAmount(item.volume)}  成交额 ${formatCompactAmount(item.amount)}`,
+                    `K ${item.K ?? '--'}  D ${item.D ?? '--'}  J ${item.J ?? '--'}`,
+                    `MACD ${macdValues.macd[point.dataIndex] ?? '--'}  DIF ${macdValues.dif[point.dataIndex] ?? '--'}  DEA ${macdValues.dea[point.dataIndex] ?? '--'}`,
                     `MIN_J ${item.MIN_J}`,
                 ].join('<br>');
             },
@@ -2006,6 +2448,7 @@ function renderStockChart(data, period = 'daily') {
             { left: 52, right: 48, top: 34, height: 250 },
             { left: 52, right: 48, top: 306, height: 62 },
             { left: 52, right: 48, top: 390, height: 92 },
+            { left: 52, right: 48, top: 504, height: 82 },
         ],
         xAxis: [
             {
@@ -2030,6 +2473,20 @@ function renderStockChart(data, period = 'daily') {
             {
                 type: 'category',
                 gridIndex: 2,
+                data: dates,
+                boundaryGap: true,
+                axisLine: { lineStyle: { color: '#333333' } },
+                axisTick: { show: false },
+                axisLabel: {
+                    color: '#888888',
+                    fontSize: 10,
+                    interval: labelInterval,
+                },
+                splitLine: { show: false },
+            },
+            {
+                type: 'category',
+                gridIndex: 3,
                 data: dates,
                 boundaryGap: true,
                 axisLine: { lineStyle: { color: '#333333' } },
@@ -2077,12 +2534,22 @@ function renderStockChart(data, period = 'daily') {
                     lineStyle: { color: '#1f1f1f', type: 'dashed' },
                 },
             },
+            {
+                gridIndex: 3,
+                scale: true,
+                axisLine: { show: false },
+                axisTick: { show: false },
+                axisLabel: { color: '#888888', fontSize: 9 },
+                splitLine: {
+                    lineStyle: { color: '#1f1f1f', type: 'dashed' },
+                },
+            },
         ],
         dataZoom: [
-            { type: 'inside', xAxisIndex: [0, 1, 2], start: 0, end: 100 },
+            { type: 'inside', xAxisIndex: [0, 1, 2, 3], start: 0, end: 100 },
             {
                 type: 'slider',
-                xAxisIndex: [0, 1, 2],
+                xAxisIndex: [0, 1, 2, 3],
                 bottom: 4,
                 height: 18,
                 borderColor: '#333333',
@@ -2105,6 +2572,14 @@ function renderStockChart(data, period = 'daily') {
                     borderColor0: '#00c853',
                 },
             },
+            ...maSeries.map(item => ({
+                name: item.name,
+                type: 'line',
+                data: item.values,
+                showSymbol: false,
+                smooth: true,
+                lineStyle: { color: item.color, width: 1.2 },
+            })),
             {
                 name: '知行短期趋势线',
                 type: 'line',
@@ -2242,6 +2717,32 @@ function renderStockChart(data, period = 'daily') {
                 showSymbol: false,
                 lineStyle: { color: '#ff3131', width: 1.3 },
             },
+            {
+                name: 'MACD',
+                type: 'bar',
+                xAxisIndex: 3,
+                yAxisIndex: 3,
+                data: macdBars,
+                barWidth: '52%',
+            },
+            {
+                name: 'DIF',
+                type: 'line',
+                xAxisIndex: 3,
+                yAxisIndex: 3,
+                data: macdValues.dif,
+                showSymbol: false,
+                lineStyle: { color: '#ffffff', width: 1.1 },
+            },
+            {
+                name: 'DEA',
+                type: 'line',
+                xAxisIndex: 3,
+                yAxisIndex: 3,
+                data: macdValues.dea,
+                showSymbol: false,
+                lineStyle: { color: '#ffd700', width: 1.1 },
+            },
         ],
     });
     window.setTimeout(() => {
@@ -2250,57 +2751,7 @@ function renderStockChart(data, period = 'daily') {
         }
     }, 30);
 
-    const latest = data[0];
-    const jClass = Number(latest.J) > 80 ? 'down' : (Number(latest.J) < 20 ? 'up' : '');
-
-    document.getElementById('stock-info').innerHTML = `
-        <div class="stock-kv">
-            <div class="kv-item">
-                <div class="kv-label">最新价</div>
-                <div class="kv-value">¥${escapeHtml(latest.close)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">最高</div>
-                <div class="kv-value">¥${escapeHtml(latest.high)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">最低</div>
-                <div class="kv-value">¥${escapeHtml(latest.low)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">成交量</div>
-                <div class="kv-value">${formatNumber(latest.volume)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">市值 (亿)</div>
-                <div class="kv-value">${escapeHtml(latest.market_cap)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">K</div>
-                <div class="kv-value">${escapeHtml(latest.K)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">D</div>
-                <div class="kv-value">${escapeHtml(latest.D)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">J</div>
-                <div class="kv-value ${jClass}">${escapeHtml(latest.J)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">MIN_J</div>
-                <div class="kv-value down">${escapeHtml(latest.MIN_J)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">知行短期</div>
-                <div class="kv-value">${escapeHtml(latest.ZX_SHORT)}</div>
-            </div>
-            <div class="kv-item">
-                <div class="kv-label">知行多空</div>
-                <div class="kv-value">${escapeHtml(latest.ZX_LONG)}</div>
-            </div>
-        </div>
-    `;
+    renderStockSideInfo(detail, data[0]);
 }
 
 async function exportCurrentStock(mode = 'check') {
@@ -2362,6 +2813,8 @@ function closeModal() {
     document.getElementById('stock-modal').classList.remove('active');
     setStockExportStatus('');
     closeExportConfirm();
+    state.currentStockChartData = [];
+    state.currentStockChartDetail = {};
     if (state.chartInstance) {
         if (typeof state.chartInstance.dispose === 'function') {
             state.chartInstance.dispose();
@@ -2483,7 +2936,7 @@ async function loadWatchlist(forceReload = false) {
     }
 
     const tbody = document.getElementById('watchlist-tbody');
-    tbody.innerHTML = '<tr><td colspan="9" class="state-loading">正在加载自选股...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="state-loading">正在加载自选股...</td></tr>';
     try {
         const result = await apiFetch('/api/watchlist');
         if (!result.success) {
@@ -2708,6 +3161,9 @@ async function pollWyckoffJob() {
         }
         if (job.status === 'error') {
             throw new Error(`${job.error || job.message || '威科夫分析失败'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`);
+        }
+        if (job.status === 'cancelled') {
+            throw new Error(job.error || job.message || '威科夫分析已停止');
         }
     } catch (error) {
         stopWyckoffProgress();
@@ -3119,8 +3575,10 @@ async function runWyckoffAnalysis() {
         }
         state.wyckoffJobId = result.job_id;
         renderWyckoffProgress(result.data || {});
-        state.wyckoffPollTimer = window.setInterval(pollWyckoffJob, 1200);
         await pollWyckoffJob();
+        if (state.wyckoffRunning && state.wyckoffJobId && !state.wyckoffPollTimer) {
+            state.wyckoffPollTimer = window.setInterval(pollWyckoffJob, 1200);
+        }
     } catch (error) {
         stopWyckoffProgress();
         updateGlobalTicker(`WYCKOFF ERROR   ${query}   ${error.message}`);
@@ -3169,11 +3627,8 @@ function setUpdateModalStep(step) {
     if (!title) {
         return;
     }
-    if (step === 'provider') {
-        title.textContent = '选择更新数据源';
-        renderUpdateStopAction(null);
-    } else if (step === 'token') {
-        title.textContent = '选择 Tushare Token';
+    if (step === 'token') {
+        title.textContent = '选择数据源';
         renderUpdateStopAction(null);
     } else {
         title.textContent = '更新任务执行中';
@@ -3207,6 +3662,11 @@ function renderUpdateStopAction(job, forceVisible = false) {
     } else {
         note.textContent = '仅停止本次更新；已写入的数据和任务日志都会保留。';
     }
+
+    const diagnosticActions = document.getElementById('update-diagnostic-actions');
+    if (diagnosticActions) {
+        diagnosticActions.classList.toggle('active', ['error', 'failed'].includes(status) && Boolean(job?.error_report_path));
+    }
 }
 
 function renderUpdateTokenPrompt() {
@@ -3218,17 +3678,41 @@ function renderUpdateTokenPrompt() {
         return;
     }
 
+    const provider = state.updateProvider || 'tushare';
+    const isTushare = provider === 'tushare';
+    document.querySelectorAll('.update-provider-btn[data-provider]').forEach(button => {
+        button.classList.toggle('active', button.dataset.provider === provider);
+    });
+    input.style.display = isTushare ? '' : 'none';
+    const label = document.querySelector('label[for="update-tushare-token"]');
+    if (label) {
+        label.style.display = isTushare ? '' : 'none';
+    }
+
+    if (!isTushare) {
+        note.textContent = `${providerDisplayName(provider)} 将使用公开行情接口更新；若当前网络被风控，任务会保留错误报告。`;
+        defaultButton.style.display = 'none';
+        confirmButton.textContent = `开始 ${providerDisplayName(provider)} 更新`;
+        return;
+    }
+
     if (state.updateHasTushareToken) {
-        note.textContent = '选择了 Tushare。可直接使用本机默认 Token，也可在下方手动输入临时 Token。';
+        note.textContent = 'Tushare 可直接使用本机默认 Token，也可在下方手动输入临时 Token。';
         defaultButton.style.display = '';
         input.placeholder = 'MANUAL TOKEN OPTIONAL';
         confirmButton.textContent = '使用输入 Token 更新';
     } else {
-        note.textContent = '选择了 Tushare。当前未检测到本机默认 Token，请手动输入。';
+        note.textContent = '当前未检测到本机默认 Tushare Token，请手动输入。';
         defaultButton.style.display = 'none';
         input.placeholder = 'INPUT TUSHARE TOKEN';
         confirmButton.textContent = '开始更新';
     }
+}
+
+function selectUpdateProvider(provider) {
+    state.updateProvider = provider || 'tushare';
+    renderUpdateProviderOptions();
+    renderUpdateTokenPrompt();
 }
 
 async function loadUpdateOptions() {
@@ -3239,10 +3723,14 @@ async function loadUpdateOptions() {
         }
         const data = result.data || {};
         state.updateHasTushareToken = Boolean(data.has_tushare_token);
-        state.updateDefaultProvider = data.default_provider || 'akshare';
+        state.updateDefaultProvider = data.default_provider || 'tushare';
+        if (!state.updateProvider) {
+            state.updateProvider = state.updateDefaultProvider;
+        }
         state.updateActiveProvider = data.active_provider || null;
         state.updateProviderStatuses = Array.isArray(data.providers) ? data.providers : [];
         state.updateLegacyProvider = data.legacy_provider || null;
+        state.updateMigrationWarning = data.migration_warning || null;
         renderUpdateProviderOptions();
         renderUpdateTokenPrompt();
     } catch (error) {
@@ -3265,7 +3753,7 @@ function renderUpdateProviderOptions() {
         const provider = button.dataset.provider;
         const meta = button.querySelector('[data-provider-meta]');
         const status = statuses.get(provider) || {};
-        button.classList.toggle('active', provider === state.updateActiveProvider);
+        button.classList.toggle('active', provider === state.updateProvider);
         if (!meta) {
             return;
         }
@@ -3290,12 +3778,11 @@ function openUpdateModal() {
         pollUpdateJobStatus();
         return;
     }
-    state.updateProvider = null;
+    state.updateProvider = state.updateDefaultProvider || 'tushare';
     state.currentUpdateJob = null;
     document.getElementById('update-tushare-token').value = '';
     renderUpdateTokenPrompt();
-    renderUpdateProviderOptions();
-    setUpdateModalStep('provider');
+    setUpdateModalStep('token');
     document.getElementById('update-modal').classList.add('active');
     loadUpdateOptions();
 }
@@ -3350,6 +3837,77 @@ async function stopUpdateJobAndKeepLogs() {
     }
 }
 
+async function startUpdateDiagnostic(mode) {
+    const jobId = state.currentUpdateJobId;
+    if (!jobId || !state.currentUpdateJob || !['error', 'failed'].includes(state.currentUpdateJob.status)) {
+        toast('当前没有可自检的失败更新任务', 'error');
+        return;
+    }
+    const buttons = [
+        document.getElementById('update-diagnostic-standard-btn'),
+        document.getElementById('update-diagnostic-extended-btn'),
+    ];
+    buttons.forEach(button => { if (button) button.disabled = true; });
+    document.getElementById('update-diagnostic-note').textContent = `正在启动${mode === 'extended' ? '扩展' : '标准'}自检...`;
+    try {
+        const result = await apiFetch(`/api/update/diagnostics/start/${jobId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                mode,
+                tushare_token: document.getElementById('update-tushare-token').value.trim(),
+            }),
+        });
+        if (!result.success) {
+            throw new Error(result.error || '自检启动失败');
+        }
+        state.currentUpdateDiagnosticId = result.diagnostic_id;
+        stopUpdateDiagnosticPolling();
+        state.updateDiagnosticPollTimer = window.setInterval(pollUpdateDiagnosticStatus, 1000);
+        await pollUpdateDiagnosticStatus();
+    } catch (error) {
+        buttons.forEach(button => { if (button) button.disabled = false; });
+        document.getElementById('update-diagnostic-note').textContent = `自检启动失败: ${error.message}`;
+        toast(`自检启动失败: ${error.message}`, 'error');
+    }
+}
+
+async function pollUpdateDiagnosticStatus() {
+    if (!state.currentUpdateDiagnosticId) {
+        return;
+    }
+    try {
+        const result = await apiFetch(`/api/update/diagnostics/status/${state.currentUpdateDiagnosticId}`);
+        if (!result.success) {
+            throw new Error(result.error || '自检状态同步失败');
+        }
+        const diagnostic = result.data || {};
+        const progress = diagnostic.total_count
+            ? ` ${formatNumber(diagnostic.processed_count || 0)}/${formatNumber(diagnostic.total_count)}`
+            : '';
+        document.getElementById('update-diagnostic-note').textContent = `${diagnostic.current_step || '自检执行中'}${progress}`;
+        if (diagnostic.status === 'completed') {
+            stopUpdateDiagnosticPolling();
+            const diagnosis = diagnostic.summary || {};
+            document.getElementById('update-diagnostic-note').textContent =
+                `根因: ${diagnosis.summary || diagnosis.code || diagnostic.result_status || '自检完成'}；建议: ${diagnosis.remediation || '查看错误报告中的 diagnostics.runs'}；日志: ${diagnostic.error_report_path}`;
+            state.currentUpdateDiagnosticId = null;
+            document.getElementById('update-diagnostic-standard-btn').disabled = false;
+            document.getElementById('update-diagnostic-extended-btn').disabled = false;
+            toast('自检完成，结果已追加到原错误报告', diagnostic.result_status === 'failed' ? 'error' : 'success', 5200);
+        } else if (diagnostic.status === 'error') {
+            throw new Error(diagnostic.error || '自检失败');
+        }
+    } catch (error) {
+        stopUpdateDiagnosticPolling();
+        state.currentUpdateDiagnosticId = null;
+        document.getElementById('update-diagnostic-standard-btn').disabled = false;
+        document.getElementById('update-diagnostic-extended-btn').disabled = false;
+        document.getElementById('update-diagnostic-note').textContent = `自检失败: ${error.message}`;
+        toast(`自检失败: ${error.message}`, 'error');
+    }
+}
+
 async function startUpdateJob(provider, token = '') {
     state.currentUpdateJob = null;
     setUpdateModalStep('progress');
@@ -3377,7 +3935,7 @@ async function startUpdateJob(provider, token = '') {
         state.updatePollTimer = window.setInterval(pollUpdateJobStatus, 1000);
         await pollUpdateJobStatus();
     } catch (error) {
-        setUpdateModalStep('provider');
+        setUpdateModalStep('token');
         toast(`更新失败: ${error.message}`, 'error');
     }
 }
@@ -4892,6 +5450,33 @@ function bindEvents() {
         }
         loadDashboardIndexKline(button.dataset.symbol);
     });
+    document.getElementById('dashboard-index-months').addEventListener('input', event => {
+        state.indexMonths = Math.max(3, Math.min(6, Number(event.target.value) || 3));
+        syncIndexMonthsLabel();
+    });
+    document.getElementById('dashboard-index-months').addEventListener('change', () => {
+        loadDashboardIndexKline(state.currentIndexSymbol || 'sh000001');
+    });
+    document.getElementById('dashboard-index-detail-btn').addEventListener('click', openDashboardIndexDetail);
+    document.getElementById('stock-ma-add-btn').addEventListener('click', addMovingAverageFromControls);
+    document.getElementById('stock-sequence-toggle').addEventListener('click', toggleSequenceMarkers);
+    document.getElementById('stock-ma-list').addEventListener('click', event => {
+        const button = event.target.closest('[data-ma-remove]');
+        if (!button) {
+            return;
+        }
+        const index = Number(button.dataset.maRemove);
+        state.maSettings = state.maSettings.filter((_, itemIndex) => itemIndex !== index);
+        saveJsonSetting('quantMaSettings', state.maSettings);
+        renderMaSettings();
+        refreshCurrentStockChart();
+    });
+    ['stock-macd-fast', 'stock-macd-slow', 'stock-macd-signal'].forEach(id => {
+        document.getElementById(id).addEventListener('change', () => {
+            applyMacdInputs();
+            refreshCurrentStockChart();
+        });
+    });
     document.getElementById('refresh-selection-options-btn').addEventListener('click', () => loadSelectionOptions(true));
     document.getElementById('watchlist-add-btn').addEventListener('click', addWatchlistItem);
     document.getElementById('watchlist-refresh-btn').addEventListener('click', () => loadWatchlist(true));
@@ -5002,24 +5587,26 @@ function bindEvents() {
         loadHeatmap();
     });
 
-    document.querySelectorAll('.update-provider-btn').forEach(button => {
-        button.addEventListener('click', async () => {
-            state.updateProvider = button.dataset.provider;
-            if (state.updateProvider === 'tushare') {
-                setUpdateModalStep('token');
-                return;
-            }
-            await startUpdateJob(state.updateProvider);
-        });
-    });
-    document.getElementById('update-token-back-btn').addEventListener('click', () => setUpdateModalStep('provider'));
     document.getElementById('update-token-default-btn').addEventListener('click', async () => {
         await startUpdateJob('tushare', '');
     });
     document.getElementById('update-token-confirm-btn').addEventListener('click', async () => {
-        await startUpdateJob('tushare', document.getElementById('update-tushare-token').value.trim());
+        const provider = state.updateProvider || 'tushare';
+        const token = provider === 'tushare'
+            ? document.getElementById('update-tushare-token').value.trim()
+            : '';
+        await startUpdateJob(provider, token);
+    });
+    document.getElementById('update-provider-grid').addEventListener('click', event => {
+        const button = event.target.closest('.update-provider-btn[data-provider]');
+        if (!button || button.disabled) {
+            return;
+        }
+        selectUpdateProvider(button.dataset.provider);
     });
     document.getElementById('update-stop-btn').addEventListener('click', stopUpdateJobAndKeepLogs);
+    document.getElementById('update-diagnostic-standard-btn').addEventListener('click', () => startUpdateDiagnostic('standard'));
+    document.getElementById('update-diagnostic-extended-btn').addEventListener('click', () => startUpdateDiagnostic('extended'));
     document.getElementById('update-modal-close-btn').addEventListener('click', closeUpdateModal);
     document.getElementById('update-modal').addEventListener('click', event => {
         if (event.target.id === 'update-modal') {
@@ -5034,8 +5621,20 @@ function bindEvents() {
     });
     document.getElementById('modal-close-btn').addEventListener('click', closeModal);
     document.getElementById('stock-period-toolbar').addEventListener('click', event => {
+        const rangeButton = event.target.closest('[data-limit]');
+        if (rangeButton && state.currentStockDetail) {
+            state.currentStockLimit = normalizeStockChartLimit(rangeButton.dataset.limit);
+            saveJsonSetting('quantStockChartLimit', state.currentStockLimit);
+            renderStockPeriodControls();
+            refreshCurrentStockChart();
+            return;
+        }
         const button = event.target.closest('[data-period]');
         if (!button || !state.currentStockDetail) {
+            return;
+        }
+        if (state.currentStockDetail.type === 'index') {
+            openDashboardIndexDetail(button.dataset.period);
             return;
         }
         viewStockDetail(

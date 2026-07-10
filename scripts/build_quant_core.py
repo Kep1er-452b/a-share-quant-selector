@@ -24,7 +24,7 @@ def library_name() -> str:
     return "libquant_core.so"
 
 
-def resolve_compiler(compiler: str | None = None) -> str:
+def resolve_compiler(compiler: str | None = None) -> str | None:
     if compiler:
         if shutil.which(compiler):
             return compiler
@@ -35,7 +35,7 @@ def resolve_compiler(compiler: str | None = None) -> str:
     for candidate in ("clang", "gcc", "cc"):
         if shutil.which(candidate):
             return candidate
-    return "clang"
+    return None
 
 
 def build(compiler: str | None = None, extra_cflags: list[str] | None = None) -> Path:
@@ -43,7 +43,11 @@ def build(compiler: str | None = None, extra_cflags: list[str] | None = None) ->
     output = BUILD_DIR / library_name()
     system = platform.system()
     compiler = resolve_compiler(compiler)
-    command = [compiler, "-O3", "-std=c11", "-Wall", "-Wextra", "-fPIC", "-I", str(ROOT / "csrc")]
+    if compiler is None:
+        raise RuntimeError("No supported C compiler found; install clang, gcc, or cc.")
+    command = [compiler, "-O3", "-std=c11", "-Wall", "-Wextra", "-I", str(ROOT / "csrc")]
+    if system != "Windows":
+        command.append("-fPIC")
     if extra_cflags:
         command.extend(extra_cflags)
     if system == "Darwin":

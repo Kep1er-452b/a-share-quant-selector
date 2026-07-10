@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils import error_logging
 import web_server
 
 
@@ -75,6 +76,80 @@ def test_status_accepts_existing_short_job_ids():
         with web_server.update_jobs_lock:
             web_server.update_jobs.pop(update_job_id, None)
             web_server.update_cancel_events.pop(update_job_id, None)
+
+
+def test_terminal_web_jobs_are_pruned_without_dropping_active_jobs(monkeypatch):
+    monkeypatch.setattr(web_server, "MAX_RETAINED_TERMINAL_JOBS", 2)
+    active_update_id = "active-update"
+    stale_update_ids = [f"stale-update-{index}" for index in range(4)]
+    active_selection_id = "active-selection"
+    stale_selection_ids = [f"stale-selection-{index}" for index in range(4)]
+
+    try:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.clear()
+            web_server.update_cancel_events.clear()
+            web_server.update_jobs[active_update_id] = {
+                "job_id": active_update_id,
+                "status": "running",
+                "created_at": "2026-07-02T09:00:00",
+                "updated_at": "2026-07-02T09:00:00",
+            }
+            web_server.update_cancel_events[active_update_id] = web_server.Event()
+            for index, job_id in enumerate(stale_update_ids):
+                web_server.update_jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "created_at": f"2026-07-02T08:0{index}:00",
+                    "updated_at": f"2026-07-02T08:0{index}:00",
+                }
+                web_server.update_cancel_events[job_id] = web_server.Event()
+
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.clear()
+            web_server.selection_jobs[active_selection_id] = {
+                "job_id": active_selection_id,
+                "status": "queued",
+                "created_at": "2026-07-02T09:00:00",
+                "updated_at": "2026-07-02T09:00:00",
+            }
+            for index, job_id in enumerate(stale_selection_ids):
+                web_server.selection_jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "error",
+                    "created_at": f"2026-07-02T08:0{index}:00",
+                    "updated_at": f"2026-07-02T08:0{index}:00",
+                }
+
+        new_update_id = web_server._create_update_job("tushare")
+        new_selection_id = web_server._create_selection_job(["main"], ["B1V242BStrategy"])
+
+        with web_server.update_jobs_lock:
+            assert active_update_id in web_server.update_jobs
+            assert new_update_id in web_server.update_jobs
+            terminal_updates = [
+                job_id
+                for job_id, job in web_server.update_jobs.items()
+                if job.get("status") not in {"queued", "running"}
+            ]
+            assert terminal_updates == stale_update_ids[-2:]
+            assert set(web_server.update_cancel_events) == {active_update_id, new_update_id, *terminal_updates}
+
+        with web_server.selection_jobs_lock:
+            assert active_selection_id in web_server.selection_jobs
+            assert new_selection_id in web_server.selection_jobs
+            terminal_selections = [
+                job_id
+                for job_id, job in web_server.selection_jobs.items()
+                if job.get("status") not in {"queued", "running"}
+            ]
+            assert terminal_selections == stale_selection_ids[-2:]
+    finally:
+        with web_server.update_jobs_lock:
+            web_server.update_jobs.clear()
+            web_server.update_cancel_events.clear()
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.clear()
 
 
 def test_stock_snapshot_rows_are_sorted_by_code_before_pagination(monkeypatch):
@@ -162,7 +237,7 @@ def test_provider_activate_rejects_empty_provider(monkeypatch, tmp_path):
     assert "本地数据仓为空" in response.get_json()["error"]
 
 
-def test_provider_activate_switches_and_reports_stale_warnings(monkeypatch, tmp_path):
+def test_provider_activate_allows_akshare_and_tencent_when_warehouse_exists(monkeypatch, tmp_path):
     monkeypatch.setattr(web_server, "_data_root_dir", lambda: tmp_path)
     monkeypatch.setattr(web_server, "_find_running_update_job", lambda: None)
     monkeypatch.setattr(web_server, "_find_running_job", lambda: None)
@@ -183,14 +258,19 @@ def test_provider_activate_switches_and_reports_stale_warnings(monkeypatch, tmp_
     )
     client = web_server.app.test_client()
 
+    response = client.post("/api/provider/activate", json={"provider": "akshare"}, headers=_headers())
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["success"] is True
+    assert payload["data"]["active_provider"]["active_provider"] == "akshare"
+
     response = client.post("/api/provider/activate", json={"provider": "tencent"}, headers=_headers())
 
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["success"] is True
     assert payload["data"]["active_provider"]["active_provider"] == "tencent"
-    assert any("落后于本地最新" in warning for warning in payload["data"]["warnings"])
-    assert any("覆盖率" in warning for warning in payload["data"]["warnings"])
 
 
 def test_write_endpoints_validate_payload_shape_and_lengths():
@@ -204,6 +284,23 @@ def test_write_endpoints_validate_payload_shape_and_lengths():
         headers=_headers(),
     )
     assert response.status_code == 400
+
+
+def test_error_report_id_is_sanitized_before_path_join(monkeypatch, tmp_path):
+    monkeypatch.setattr(error_logging, "ERROR_DIR", tmp_path)
+
+    report_path = error_logging.write_error_report(
+        "web/../server",
+        RuntimeError("boom"),
+        error_id="../outside/id",
+    )
+
+    assert report_path.parent == tmp_path
+    assert ".." not in report_path.name
+    assert "/" not in report_path.name
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["error_id"] == "---outside-id"
+    assert payload["module"] == "web/../server"
 
 
 def test_selection_endpoints_reject_running_update():
@@ -349,3 +446,41 @@ def test_pre_cancelled_update_job_finishes_as_cancelled(monkeypatch, tmp_path):
         with web_server.update_jobs_lock:
             web_server.update_jobs.pop(job_id, None)
             web_server.update_cancel_events.pop(job_id, None)
+
+
+def test_wyckoff_job_honors_global_halt_before_pipeline(monkeypatch, tmp_path):
+    job_id = "wyckoff-halt-test"
+    now = "2026-07-02 12:00:00"
+    with web_server.wyckoff_jobs_lock:
+        web_server.wyckoff_jobs[job_id] = {
+            "job_id": job_id,
+            "query": "000001",
+            "status": "queued",
+            "current_step": "排队",
+            "message": "",
+            "progress_pct": 0,
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+            "error": None,
+            "error_report_path": None,
+        }
+
+    class FailIfConstructed:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("halted Wyckoff job should not construct pipeline")
+
+    monkeypatch.setattr(web_server, "WyckoffPipeline", FailIfConstructed)
+    monkeypatch.setattr(web_server, "write_error_report", lambda *args, **kwargs: tmp_path / "wyckoff-error.json")
+    web_server.halt_event.set()
+
+    try:
+        web_server._run_wyckoff_job(job_id, "000001")
+        with web_server.wyckoff_jobs_lock:
+            job = dict(web_server.wyckoff_jobs[job_id])
+        assert job["status"] == "cancelled"
+        assert job["current_step"] == "系统已急停"
+    finally:
+        web_server.halt_event.clear()
+        with web_server.wyckoff_jobs_lock:
+            web_server.wyckoff_jobs.pop(job_id, None)

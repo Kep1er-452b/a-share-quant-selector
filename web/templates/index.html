@@ -129,7 +129,7 @@
                             <div class="quote-block">
                                 <div class="quote-label">A-SHARE UNIVERSE</div>
                                 <div class="quote-symbol">ALL BOARDS</div>
-                                <div class="quote-price positive" id="stat-stocks">--</div>
+                                <div class="quote-price universe-count" id="stat-stocks">--</div>
                                 <div class="quote-change" id="hero-universe">ALL BOARDS</div>
                             </div>
                             <div class="quote-chart-shell">
@@ -139,6 +139,13 @@
                                         <button class="index-switch-btn" data-symbol="sz399006" type="button">创业板</button>
                                         <button class="index-switch-btn" data-symbol="sh000688" type="button">科创</button>
                                         <button class="index-switch-btn" data-symbol="sz399001" type="button">深成指</button>
+                                    </div>
+                                    <div class="index-range-control">
+                                        <input id="dashboard-index-months" type="range" min="3" max="6" step="1" value="3" aria-label="指数显示月份">
+                                        <span id="dashboard-index-months-label">3M</span>
+                                        <button class="icon-btn" id="dashboard-index-detail-btn" type="button" aria-label="查看指数详细信息" title="查看指数详细信息">
+                                            <span aria-hidden="true">▣</span>
+                                        </button>
                                     </div>
                                     <span class="quote-chart-meta" id="dashboard-index-meta">D1 / 30T</span>
                                 </div>
@@ -662,36 +669,30 @@
         <div class="modal-header">
             <div>
                 <div class="modal-kicker">DATA UPDATE</div>
-                <span class="modal-title" id="update-modal-title">选择更新数据源</span>
+                <span class="modal-title" id="update-modal-title">Tushare 数据更新</span>
             </div>
             <button class="modal-close" id="update-modal-close-btn" type="button">X</button>
         </div>
         <div class="modal-body update-modal-body">
-            <div class="update-modal-step active" id="update-provider-step">
-                <div class="update-modal-note">请选择本次更新要使用的数据源。</div>
-                <div class="update-legacy-note" id="update-legacy-note">旧数据仓状态读取中</div>
-                <div class="update-provider-grid">
+            <div class="update-modal-step active" id="update-token-step">
+                <div class="update-modal-note" id="update-token-note">选择本次要更新的数据源。Tushare 可使用默认 Token，AkShare 和 Tencent 会直接使用公开接口。</div>
+                <div class="update-provider-grid" id="update-provider-grid">
                     <button class="update-provider-btn" data-provider="tushare" type="button">
                         <span class="provider-name">TUSHARE</span>
-                        <span class="provider-meta" data-provider-meta="tushare">状态读取中</span>
+                        <span class="provider-meta" data-provider-meta>--</span>
                     </button>
                     <button class="update-provider-btn" data-provider="akshare" type="button">
                         <span class="provider-name">AKSHARE</span>
-                        <span class="provider-meta" data-provider-meta="akshare">状态读取中</span>
+                        <span class="provider-meta" data-provider-meta>--</span>
                     </button>
                     <button class="update-provider-btn" data-provider="tencent" type="button">
                         <span class="provider-name">TENCENT</span>
-                        <span class="provider-meta" data-provider-meta="tencent">状态读取中</span>
+                        <span class="provider-meta" data-provider-meta>--</span>
                     </button>
                 </div>
-            </div>
-
-            <div class="update-modal-step" id="update-token-step">
-                <div class="update-modal-note" id="update-token-note">选择了 Tushare。可使用本机默认 Token，也可手动输入。</div>
                 <label class="update-token-label" for="update-tushare-token">TUSHARE TOKEN</label>
                 <input class="search-input update-token-input" id="update-tushare-token" type="password" placeholder="INPUT TOKEN OR LEAVE BLANK">
                 <div class="update-token-actions">
-                    <button class="btn btn-ghost" id="update-token-back-btn" type="button">返回</button>
                     <button class="btn btn-secondary" id="update-token-default-btn" type="button">使用默认 Token</button>
                     <button class="btn btn-primary" id="update-token-confirm-btn" type="button">开始更新</button>
                 </div>
@@ -740,6 +741,13 @@
                         停止此次更新并保留日志
                     </button>
                 </div>
+                <div class="update-diagnostic-actions" id="update-diagnostic-actions">
+                    <div class="update-stop-note" id="update-diagnostic-note">失败后可将自检结果追加到同一错误报告。</div>
+                    <div class="update-token-actions">
+                        <button class="btn btn-secondary" id="update-diagnostic-standard-btn" type="button">标准自检</button>
+                        <button class="btn btn-ghost" id="update-diagnostic-extended-btn" type="button">扩展自检</button>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -763,9 +771,39 @@
                 <button class="stock-period-btn active" data-period="daily" type="button">日K</button>
                 <button class="stock-period-btn" data-period="weekly" type="button">周K</button>
                 <button class="stock-period-btn" data-period="monthly" type="button">月K</button>
+                <div class="stock-range-toolbar" id="stock-range-toolbar" aria-label="K线显示范围">
+                    <span class="stock-range-label">范围</span>
+                    <button class="stock-range-btn active" data-limit="260" type="button">260</button>
+                    <button class="stock-range-btn" data-limit="520" type="button">520</button>
+                    <button class="stock-range-btn" data-limit="1000" type="button">1000</button>
+                    <button class="stock-range-btn" data-limit="all" type="button">全部</button>
+                </div>
             </div>
-            <div id="stock-chart"></div>
-            <div id="stock-info"></div>
+            <div class="stock-detail-layout">
+                <div class="stock-chart-column">
+                    <div class="stock-indicator-toolbar" id="stock-indicator-toolbar">
+                        <div class="indicator-editor">
+                            <span class="indicator-editor-label">MA</span>
+                            <input class="indicator-input" id="stock-ma-window" type="number" min="2" max="300" value="50" aria-label="均线周期">
+                            <input class="indicator-color" id="stock-ma-color" type="color" value="#ffd700" aria-label="均线颜色">
+                            <button class="icon-btn" id="stock-ma-add-btn" type="button" aria-label="添加均线" title="添加均线">+</button>
+                            <div class="indicator-chip-list" id="stock-ma-list"></div>
+                            <button class="indicator-toggle sequence-toggle active" id="stock-sequence-toggle" type="button" aria-label="显示十三转" aria-pressed="true" title="显示/隐藏十三转">
+                                <span class="sequence-toggle-icon" aria-hidden="true">13</span>
+                                <span>十三转</span>
+                            </button>
+                        </div>
+                        <div class="indicator-editor macd-editor">
+                            <span class="indicator-editor-label">MACD</span>
+                            <input class="indicator-input" id="stock-macd-fast" type="number" min="2" max="60" value="12" aria-label="MACD快线">
+                            <input class="indicator-input" id="stock-macd-slow" type="number" min="3" max="120" value="26" aria-label="MACD慢线">
+                            <input class="indicator-input" id="stock-macd-signal" type="number" min="2" max="60" value="9" aria-label="MACD信号线">
+                        </div>
+                    </div>
+                    <div id="stock-chart"></div>
+                </div>
+                <aside id="stock-info"></aside>
+            </div>
         </div>
     </div>
 </div>
