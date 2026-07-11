@@ -79,6 +79,37 @@ def test_index_payload_accepts_detail_limit_over_month_window(tmp_path):
     assert payload["candles"][0]["date"] < "2026-01-01"
 
 
+def test_index_payload_returns_bounded_indicator_context(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    rows = []
+    for offset, trade_date in enumerate(pd.bdate_range("2024-01-01", periods=500)):
+        rows.append(
+            {
+                "ts_code": "000001.SH",
+                "trade_date": trade_date.strftime("%Y%m%d"),
+                "open": 3000 + offset,
+                "high": 3010 + offset,
+                "low": 2990 + offset,
+                "close": 3005 + offset,
+                "vol": 1000 + offset,
+                "amount": 2000 + offset,
+            }
+        )
+    store.upsert_rows("index_daily", rows, key_fields=("ts_code", "trade_date"))
+
+    payload = build_index_kline_payload(
+        store,
+        "sh000001",
+        today=date(2026, 1, 1),
+        limit=260,
+        indicator_lookback=200,
+    )
+
+    assert len(payload["candles"]) == 260
+    assert len(payload["calculation_candles"]) == 459
+    assert payload["candles"][0]["MA200"] is not None
+
+
 def test_index_detail_resamples_weekly_and_monthly_from_daily_cache(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     rows = []
@@ -184,6 +215,28 @@ def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
     assert summary["metrics"]["margin_balance"]["value"] == 500.0
     assert summary["metrics"]["northbound_money"]["delta"] == 15.0
     assert summary["metrics"]["market_amount"]["unit"] == "亿元"
+
+
+def test_market_trading_summary_uses_latest_available_margin_date(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "margin",
+        [
+            {"trade_date": "20260708", "exchange_id": "SSE", "rzrqye": 50_000_000_000},
+            {"trade_date": "20260708", "exchange_id": "SZSE", "rzrqye": 30_000_000_000},
+            {"trade_date": "20260706", "exchange_id": "SSE", "rzrqye": 45_000_000_000},
+            {"trade_date": "20260706", "exchange_id": "SZSE", "rzrqye": 25_000_000_000},
+        ],
+        key_fields=("trade_date", "exchange_id"),
+    )
+
+    summary = build_market_trading_summary(store, "2026-07-09")
+    metric = summary["metrics"]["margin_balance"]
+
+    assert metric["value"] == 800.0
+    assert metric["delta"] == 100.0
+    assert metric["as_of_date"] == "2026-07-08"
+    assert metric["previous_as_of_date"] == "2026-07-06"
 
 
 def test_market_trading_summary_uses_and_invalidates_sqlite_cache(tmp_path):

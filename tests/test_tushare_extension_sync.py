@@ -134,7 +134,7 @@ def test_sync_index_cache_fetches_from_history_when_empty(tmp_path):
 
     assert result["fetched_rows"] == 1
     assert pro.calls[0][0] == "index_daily"
-    assert pro.calls[0][1]["start_date"] == "20250507"
+    assert pro.calls[0][1]["start_date"] == "20200622"
     assert store.latest_trade_date("index_daily", ts_code="000001.SH") == "20260630"
 
 
@@ -150,7 +150,32 @@ def test_sync_index_cache_fetches_incrementally_after_latest_local_date(tmp_path
 
     sync.ensure_index_cache(symbols=["000001.SH"], today=date(2026, 7, 1))
 
-    assert pro.calls[0][1]["start_date"] == "20260630"
+    assert pro.calls[0][1]["start_date"] == "20200622"
+
+
+def test_sync_index_cache_stays_incremental_when_history_is_deep_enough(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    rows = [
+        {
+            "ts_code": "000001.SH",
+            "trade_date": trade_date.strftime("%Y%m%d"),
+            "close": 2800 + offset,
+        }
+        for offset, trade_date in enumerate(pd.bdate_range("2021-06-01", periods=1300))
+    ]
+    store.upsert_rows(
+        "index_daily",
+        rows,
+        key_fields=("ts_code", "trade_date"),
+    )
+    pro = FakePro()
+    sync = TushareExtSync(store, pro)
+
+    sync.ensure_index_cache(symbols=["000001.SH"], today=date(2026, 7, 1))
+
+    latest = rows[-1]["trade_date"]
+    expected = (pd.to_datetime(latest) + pd.Timedelta(days=1)).strftime("%Y%m%d")
+    assert pro.calls[0][1]["start_date"] == expected
 
 
 def test_sync_trading_snapshot_records_permission_warnings(tmp_path):

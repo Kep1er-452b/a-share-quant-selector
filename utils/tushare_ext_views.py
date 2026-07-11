@@ -216,6 +216,7 @@ def build_index_kline_payload(
     period: str = "daily",
     limit: int | str | None = None,
     max_limit: int = 2500,
+    indicator_lookback: int = 300,
 ) -> dict:
     months = min(max(int(months or 3), 3), 6)
     today = today or datetime.now().date()
@@ -263,6 +264,13 @@ def build_index_kline_payload(
             resolved_limit = min(max(resolved_limit, 1), int(max_limit))
         candles = all_candles[-resolved_limit:]
 
+    if resolved_limit is None:
+        calculation_candles = candles
+    else:
+        safe_lookback = min(max(int(indicator_lookback or 1), 1), 600)
+        context_count = min(len(all_candles), resolved_limit + safe_lookback - 1)
+        calculation_candles = all_candles[-context_count:]
+
     return {
         "symbol": symbol,
         "ts_code": ts_code,
@@ -275,6 +283,7 @@ def build_index_kline_payload(
         "source": f"tushare:{dataset}" if period == "daily" else f"tushare:{dataset}:{period}",
         "cache_status": "ready" if candles else "empty",
         "candles": candles,
+        "calculation_candles": calculation_candles,
         "sync_warnings": store.list_warnings(),
     }
 
@@ -341,14 +350,29 @@ def _previous_trade_date(store: TushareExtStore, latest_date: str, datasets: Ite
     return max(candidates) if candidates else None
 
 
-def _metric(label: str, value: float | None, previous: float | None, unit: str = "") -> dict:
+def _metric(
+    label: str,
+    value: float | None,
+    previous: float | None,
+    unit: str = "",
+    *,
+    as_of_date: str | None = None,
+    previous_as_of_date: str | None = None,
+) -> dict:
     return {
         "label": label,
         "value": value,
         "previous_value": previous,
         "delta": None if value is None or previous is None else round(value - previous, 4),
         "unit": unit,
+        "as_of_date": _display_date(as_of_date) if as_of_date else None,
+        "previous_as_of_date": _display_date(previous_as_of_date) if previous_as_of_date else None,
     }
+
+
+def _latest_dataset_date(store: TushareExtStore, dataset: str, cutoff: str) -> str | None:
+    rows = store.query_rows(dataset, end_date=cutoff, limit=1, descending=True)
+    return _date_text(rows[0].get("trade_date")) if rows else None
 
 
 def _market_summary_signature(
@@ -367,6 +391,7 @@ def _market_summary_signature(
     else:
         source_signature = ""
     return {
+        "version": 2,
         "latest": latest,
         "previous": previous,
         "market_amount_yi": market_amount_yi,
@@ -407,8 +432,10 @@ def build_market_trading_summary(
     previous_hsgt = _rows_for_date(store, "moneyflow_hsgt", previous) if previous else []
     current_moneyflow = _rows_for_date(store, "moneyflow", latest)
     previous_moneyflow = _rows_for_date(store, "moneyflow", previous) if previous else []
-    current_margin = _rows_for_date(store, "margin", latest)
-    previous_margin = _rows_for_date(store, "margin", previous) if previous else []
+    margin_date = _latest_dataset_date(store, "margin", latest)
+    previous_margin_date = _latest_dataset_date(store, "margin", str(int(margin_date) - 1)) if margin_date else None
+    current_margin = _rows_for_date(store, "margin", margin_date) if margin_date else []
+    previous_margin = _rows_for_date(store, "margin", previous_margin_date) if previous_margin_date else []
 
     # Tushare daily amount is thousand yuan; top_list amount/net_amount are yuan;
     # moneyflow and block_trade amount fields are ten-thousand yuan.
@@ -435,7 +462,14 @@ def build_market_trading_summary(
         "dragon_tiger_net": _metric("龙虎榜净额", dragon_tiger_net, previous_dragon_tiger_net, "亿元"),
         "dragon_tiger_count": _metric("龙虎榜数量", float(len(current_top)), float(len(previous_top)) if previous else None, "家"),
         "block_trade_amount": _metric("大宗交易金额", block_trade_amount, previous_block_trade_amount, "亿元"),
-        "margin_balance": _metric("两融余额", margin_balance, previous_margin_balance, "亿元"),
+        "margin_balance": _metric(
+            "两融余额",
+            margin_balance,
+            previous_margin_balance,
+            "亿元",
+            as_of_date=margin_date,
+            previous_as_of_date=previous_margin_date,
+        ),
         "northbound_money": _metric("北向资金", northbound_money, previous_northbound_money, "亿元"),
     }
     summary = {

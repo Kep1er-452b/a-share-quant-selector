@@ -36,6 +36,7 @@ LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "desktop_app_launcher.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 LOCAL_PROXY_BYPASS = "127.0.0.1,localhost,::1"
+DESKTOP_STORAGE_DIR = Path.home() / "Library" / "Application Support" / "A股量化选股系统" / "webview"
 
 
 def configure_local_proxy_bypass() -> None:
@@ -56,6 +57,11 @@ def runtime_icon_path() -> Path | None:
 
     icon_path = Path(app_bundle) / "Contents" / "Resources" / RUNTIME_ICON_NAME
     return icon_path if icon_path.is_file() else None
+
+
+def desktop_storage_path() -> Path:
+    """Return the stable pywebview profile used for persisted UI preferences."""
+    return DESKTOP_STORAGE_DIR
 
 
 def setup_logging() -> None:
@@ -322,7 +328,13 @@ def run_gui() -> int:
             ))
 
     threading.Thread(target=boot, name="desktop-launcher-boot", daemon=True).start()
-    start_options = {"debug": False}
+    storage_path = desktop_storage_path()
+    storage_path.mkdir(parents=True, exist_ok=True)
+    start_options = {
+        "debug": False,
+        "private_mode": False,
+        "storage_path": str(storage_path),
+    }
     icon_path = runtime_icon_path()
     if icon_path is not None:
         start_options["icon"] = str(icon_path)

@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `380a77f18e7b588f6cb5b245b614c18c83584da9`
-  (`Harden review fixes for selection and Tushare sync`, 2026-07-02).
+  `4c0709b`
+  (`Document K-line preferences and margin fix design`, 2026-07-11).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -339,6 +339,36 @@ Baseline commit: `380a77f` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
+
+- Uncommitted K-line and Market Pulse fixes on top of `4c0709b` separate the
+  visible chart window from a bounded indicator calculation context. Stock and
+  index detail APIs accept `indicator_lookback` and return pre-window history,
+  so custom MA/MACD calculations use local history while ECharts still draws
+  only 260/520/1000/all visible bars. The lightweight index cache now repairs
+  shallow histories to a 2,200-calendar-day target before reverting to normal
+  incremental updates; the five local index caches were backfilled to 1,461
+  rows each (2020-07-02 through 2026-07-10), and the first visible MA200 in a
+  260-bar Shanghai-index view is populated.
+- K-line controls now use the versioned global `quantKlinePreferences` object,
+  migrating the prior MA, MACD, sequence, and range keys. Period, range, MA
+  configuration/colors, sequence visibility, MACD parameters, and index-month
+  range share one setting across stocks and indices. The desktop launcher now
+  starts pywebview with `private_mode=False` and a stable profile under
+  `~/Library/Application Support/A股量化选股系统/webview`; this is required for
+  preferences to survive a full App exit and relaunch. Computer Use verified
+  that weekly/520 bars/sequence off/MACD fast 13 all survived a process restart.
+- Market Pulse keeps the Tushare two-financing card. It selects the latest
+  available `margin` date not later than the market date, compares it with the
+  preceding actual margin date, invalidates the old summary cache signature,
+  and renders missing values as `--`. The live local result for market date
+  2026-07-09 is 29,596.57 亿元 as of 2026-07-08, versus 2026-07-06, instead of
+  the former misleading 0.00 display.
+- Fresh verification for this uncommitted batch passed: Python compilation,
+  JavaScript syntax, focused launcher/Tushare/Web/frontend tests (`41 passed`),
+  `git diff --check`, the full suite (`176 passed`), live API checks, index-only
+  Tushare cache backfill, and desktop exit/relaunch interaction checks. Per the
+  user's request, leave this implementation uncommitted for manual commit and
+  push.
 
 - Uncommitted fixes on top of `380a77f` cover the current small closure and
   cleanup batch: `utils/tushare_ext_workflow.py` now owns the shared CLI/Web

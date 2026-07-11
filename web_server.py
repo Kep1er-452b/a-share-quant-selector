@@ -2230,6 +2230,14 @@ def _parse_chart_limit(value, *, default=260, total_bars=None, max_limit=STOCK_D
     return min(max(parsed, 1), int(max_limit))
 
 
+def _parse_indicator_lookback(value, *, default=300, maximum=600):
+    try:
+        parsed = int(value) if value not in (None, '') else int(default)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return min(max(parsed, 1), int(maximum))
+
+
 def _resample_stock_period(df, period):
     period = period if period in STOCK_PERIODS else 'daily'
     if period == 'daily' or df.empty:
@@ -2302,6 +2310,8 @@ def get_stock_detail(code):
             default=default_limit,
             total_bars=total_bars,
         )
+        indicator_lookback = _parse_indicator_lookback(request.args.get('indicator_lookback'))
+        context_count = min(total_bars, limit + indicator_lookback - 1)
         for i, (_, row) in enumerate(df.head(limit).iterrows()):
             data.append({
                 'date': row['date'].strftime('%Y-%m-%d'),
@@ -2337,6 +2347,18 @@ def get_stock_detail(code):
             'total_bars': total_bars,
             'max_limit': STOCK_DETAIL_MAX_LIMIT,
             'data': data,
+            'calculation_data': [
+                {
+                    'date': row['date'].strftime('%Y-%m-%d'),
+                    'open': round(row['open'], 2),
+                    'high': round(row['high'], 2),
+                    'low': round(row['low'], 2),
+                    'close': round(row['close'], 2),
+                    'volume': int(row['volume']),
+                    'amount': round(row['amount'] / 1e4, 2),
+                }
+                for _, row in df.head(context_count).iterrows()
+            ],
             'adjusted_data': build_adjusted_candles(
                 _tushare_ext_store(),
                 code,
@@ -3340,6 +3362,7 @@ def get_index_detail(symbol):
         if period not in {'daily', 'weekly', 'monthly'}:
             period = 'daily'
         limit_arg = _normalize_csv_value(request.args.get('limit')) or '260'
+        indicator_lookback = _parse_indicator_lookback(request.args.get('indicator_lookback'))
         store = _tushare_ext_store()
         cache_result = _ensure_tushare_index_cache(store=store, symbols=DEFAULT_INDEX_SYMBOLS)
         payload = build_index_kline_payload(
@@ -3349,6 +3372,7 @@ def get_index_detail(symbol):
             period=period,
             limit=limit_arg,
             max_limit=STOCK_DETAIL_MAX_LIMIT,
+            indicator_lookback=indicator_lookback,
         )
         if cache_result.get('warning'):
             payload['warning'] = cache_result['warning']

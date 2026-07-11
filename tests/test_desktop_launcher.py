@@ -36,11 +36,14 @@ def test_run_gui_passes_transparent_bundle_icon_to_pywebview(tmp_path, monkeypat
     runtime_icon.parent.mkdir(parents=True)
     runtime_icon.write_bytes(b"png")
     monkeypatch.setenv(launch_desktop_app.APP_BUNDLE_ENV, str(app_bundle))
+    monkeypatch.setattr(launch_desktop_app, "desktop_storage_path", lambda: tmp_path / "webview-storage")
 
     assert launch_desktop_app.run_gui() == 0
     assert start_kwargs == {
         "debug": False,
         "icon": str(runtime_icon),
+        "private_mode": False,
+        "storage_path": str(tmp_path / "webview-storage"),
     }
 
 
@@ -63,7 +66,12 @@ def test_run_gui_does_not_pass_opaque_icns_without_app_bundle(monkeypatch):
     monkeypatch.delenv(launch_desktop_app.APP_BUNDLE_ENV, raising=False)
     monkeypatch.setattr(launch_desktop_app, "configure_local_proxy_bypass", lambda: None)
     monkeypatch.setattr(launch_desktop_app, "setup_logging", lambda: None)
+    monkeypatch.setattr(launch_desktop_app, "desktop_storage_path", lambda: Path("/tmp/aqs-webview-storage"))
     monkeypatch.setattr(launch_desktop_app.threading, "Thread", FakeThread)
 
     assert launch_desktop_app.run_gui() == 0
-    assert start_kwargs == {"debug": False}
+    assert start_kwargs == {
+        "debug": False,
+        "private_mode": False,
+        "storage_path": "/tmp/aqs-webview-storage",
+    }

@@ -69,6 +69,43 @@ class StockManager:
         return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True)
 
 
+class LongStockManager(StockManager):
+    def read_stock_for_analysis(self, code):
+        rows = []
+        for offset, trade_date in enumerate(pd.bdate_range("2024-01-01", periods=500)):
+            rows.append(
+                {
+                    "date": trade_date,
+                    "open": 10 + offset / 100,
+                    "high": 10.2 + offset / 100,
+                    "low": 9.8 + offset / 100,
+                    "close": 10.1 + offset / 100,
+                    "volume": 100000 + offset,
+                    "amount": 2000000 + offset,
+                    "turnover": 1.0,
+                    "market_cap": 10000000000,
+                }
+            )
+        return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def test_stock_detail_api_returns_bounded_indicator_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_server, "_active_csv_manager", lambda: LongStockManager())
+    monkeypatch.setattr(web_server, "_load_stock_names", lambda: {"000001": "平安银行"})
+    monkeypatch.setattr(web_server, "_tushare_ext_store", lambda: TushareExtStore(tmp_path / "extended"), raising=False)
+
+    response = web_server.app.test_client().get(
+        "/api/stock/000001?period=daily&limit=260&indicator_lookback=200"
+    )
+    payload = response.get_json()
+
+    assert payload["success"] is True
+    assert len(payload["data"]) == 260
+    assert len(payload["calculation_data"]) == 459
+    assert payload["calculation_data"][0]["date"] == payload["data"][0]["date"]
+    assert payload["calculation_data"][259]["date"] == payload["data"][259]["date"]
+
+
 def test_stock_detail_api_adds_extension_payload(monkeypatch, tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     store.upsert_rows(

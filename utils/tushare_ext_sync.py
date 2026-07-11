@@ -11,6 +11,8 @@ from utils.tushare_ext_store import TushareExtStore
 
 
 DEFAULT_INDEX_SYMBOLS = ("000001.SH", "399001.SZ", "399006.SZ", "000688.SH", "000300.SH")
+INDEX_CACHE_HISTORY_DAYS = 2200
+INDEX_CACHE_MIN_ROWS = 1300
 BASIC_ENDPOINTS = {
     "stock_basic": {
         "method": "stock_basic",
@@ -159,10 +161,17 @@ class TushareExtSync:
             if halt_checker and halt_checker():
                 raise InterruptedError("用户已停止此次更新")
             latest = self.store.latest_trade_date("index_daily", ts_code=symbol)
-            if latest:
+            target_start = self._date_text(today - timedelta(days=INDEX_CACHE_HISTORY_DAYS))
+            cached_rows = self.store.query_rows(
+                "index_daily",
+                ts_code=symbol,
+                limit=INDEX_CACHE_MIN_ROWS,
+                descending=False,
+            )
+            if len(cached_rows) >= INDEX_CACHE_MIN_ROWS and latest:
                 start_date = self._date_text(pd.to_datetime(latest) + pd.Timedelta(days=1))
             else:
-                start_date = self._date_text(today - timedelta(days=420))
+                start_date = target_start
             result = self._call_dataset(
                 "index_daily",
                 "index_daily",

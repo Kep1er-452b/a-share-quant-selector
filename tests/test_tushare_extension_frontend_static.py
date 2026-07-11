@@ -39,6 +39,21 @@ def test_frontend_uses_adjusted_data_indicator_settings_and_chinese_tooltips():
     assert "right: 48" in js
     assert "quantShowSequenceMarkers" in js
     assert "showSequenceMarkers ? buildSequenceMarks" in js
+    assert "quantKlinePreferences" in js
+    assert "calculation_data" in js
+    assert "calculation_candles" in js
+    assert "indicator_lookback" in js
+
+
+def test_frontend_preserves_global_kline_controls_and_missing_trading_values():
+    js = (ROOT / "web/static/js/app.js").read_text(encoding="utf-8")
+
+    assert "loadKlinePreferences" in js
+    assert "saveKlinePreferences" in js
+    assert "period: state.currentStockPeriod" in js
+    assert "indexMonths: state.indexMonths" in js
+    assert "value === null || value === undefined || value === ''" in js
+    assert "截至 ${formatTradingAsOfDate(item.as_of_date)}" in js
 
 
 def test_stock_info_panels_keep_empty_extension_sections_visible():

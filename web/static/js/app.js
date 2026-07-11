@@ -23,6 +23,19 @@ const STOCK_PERIOD_LABELS = {
 };
 const STOCK_CHART_LIMIT_OPTIONS = ['260', '520', '1000', 'all'];
 const STOCKS_PAGE_SIZE = 6000;
+const KLINE_PREFERENCES_KEY = 'quantKlinePreferences';
+const DEFAULT_KLINE_PREFERENCES = {
+    version: 1,
+    period: 'daily',
+    limit: '260',
+    movingAverages: [
+        { window: 50, color: '#ffd700', enabled: true },
+        { window: 200, color: '#a855f7', enabled: true },
+    ],
+    sequenceEnabled: true,
+    macd: { fast: 12, slow: 26, signal: 9, enabled: true },
+    indexMonths: 3,
+};
 
 function loadJsonSetting(key, fallback) {
     try {
@@ -45,6 +58,46 @@ function normalizeStockChartLimit(value) {
     const text = String(value ?? '').trim().toLowerCase();
     return STOCK_CHART_LIMIT_OPTIONS.includes(text) ? text : '260';
 }
+
+function normalizeKlinePreferences(value = {}) {
+    const source = value && typeof value === 'object' ? value : {};
+    const movingAverages = Array.isArray(source.movingAverages)
+        ? source.movingAverages.map(item => ({
+            window: Math.max(2, Math.min(300, Number(item?.window) || 0)),
+            color: /^#[0-9a-f]{6}$/i.test(String(item?.color || '')) ? item.color : '#ffd700',
+            enabled: item?.enabled !== false,
+        })).filter(item => item.window >= 2)
+        : DEFAULT_KLINE_PREFERENCES.movingAverages.map(item => ({ ...item }));
+    const fast = Math.max(2, Math.min(60, Number(source.macd?.fast) || 12));
+    const slow = Math.max(fast + 1, Math.min(120, Number(source.macd?.slow) || 26));
+    const signal = Math.max(2, Math.min(60, Number(source.macd?.signal) || 9));
+    return {
+        version: 1,
+        period: STOCK_PERIOD_LABELS[source.period] ? source.period : 'daily',
+        limit: normalizeStockChartLimit(source.limit),
+        movingAverages,
+        sequenceEnabled: source.sequenceEnabled !== false,
+        macd: { fast, slow, signal, enabled: source.macd?.enabled !== false },
+        indexMonths: Math.max(3, Math.min(6, Number(source.indexMonths) || 3)),
+    };
+}
+
+function loadKlinePreferences() {
+    const stored = loadJsonSetting(KLINE_PREFERENCES_KEY, null);
+    if (stored) {
+        return normalizeKlinePreferences(stored);
+    }
+    return normalizeKlinePreferences({
+        period: 'daily',
+        limit: loadJsonSetting('quantStockChartLimit', '260'),
+        movingAverages: loadJsonSetting('quantMaSettings', DEFAULT_KLINE_PREFERENCES.movingAverages),
+        sequenceEnabled: loadJsonSetting('quantShowSequenceMarkers', true) !== false,
+        macd: loadJsonSetting('quantMacdSettings', DEFAULT_KLINE_PREFERENCES.macd),
+        indexMonths: 3,
+    });
+}
+
+const initialKlinePreferences = loadKlinePreferences();
 
 const state = {
     currentPage: 'dashboard',
@@ -78,13 +131,10 @@ const state = {
     currentUpdateJob: null,
     indexKlineChart: null,
     currentIndexSymbol: 'sh000001',
-    indexMonths: 3,
-    maSettings: loadJsonSetting('quantMaSettings', [
-        { window: 50, color: '#ffd700' },
-        { window: 200, color: '#a855f7' },
-    ]),
-    macdSettings: loadJsonSetting('quantMacdSettings', { fast: 12, slow: 26, signal: 9 }),
-    showSequenceMarkers: loadJsonSetting('quantShowSequenceMarkers', true) !== false,
+    indexMonths: initialKlinePreferences.indexMonths,
+    maSettings: initialKlinePreferences.movingAverages,
+    macdSettings: initialKlinePreferences.macd,
+    showSequenceMarkers: initialKlinePreferences.sequenceEnabled,
     localProgressTimer: null,
     jobStartTime: null,
     serverElapsedBase: 0,
@@ -110,8 +160,8 @@ const state = {
     providerSwitching: false,
     globalTickerText: '',
     currentStockDetail: null,
-    currentStockPeriod: 'daily',
-    currentStockLimit: normalizeStockChartLimit(loadJsonSetting('quantStockChartLimit', '260')),
+    currentStockPeriod: initialKlinePreferences.period,
+    currentStockLimit: initialKlinePreferences.limit,
     currentStockChartData: [],
     currentStockChartPeriod: 'daily',
     currentStockChartDetail: {},
@@ -216,6 +266,9 @@ function formatNumber(value) {
 }
 
 function formatTradingValue(value, unit = '') {
+    if (value === null || value === undefined || value === '') {
+        return '--';
+    }
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) {
         return '--';
@@ -911,11 +964,19 @@ function renderPulseDistribution(distribution) {
 }
 
 function formatTradingDelta(value, unit = '') {
+    if (value === null || value === undefined || value === '') {
+        return '较前值 --';
+    }
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) {
-        return '较昨日 --';
+        return '较前值 --';
     }
-    return `较昨日 ${numeric >= 0 ? '+' : ''}${formatTradingValue(numeric, unit)}`;
+    return `较前值 ${numeric >= 0 ? '+' : ''}${formatTradingValue(numeric, unit)}`;
+}
+
+function formatTradingAsOfDate(value) {
+    const text = String(value || '');
+    return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text.slice(5) : '--';
 }
 
 function renderMarketTradingCards(summary) {
@@ -937,7 +998,7 @@ function renderMarketTradingCards(summary) {
                     <div class="pulse-card pulse-trading-card">
                         <div class="pulse-label">${escapeHtml(item.label || key)}</div>
                         <div class="pulse-value ${signedClass(item.value)}">${formatTradingValue(item.value, item.unit || '')}</div>
-                        <div class="pulse-sub">${escapeHtml(formatTradingDelta(item.delta, item.unit || ''))}</div>
+                        <div class="pulse-sub">${item.as_of_date ? `截至 ${formatTradingAsOfDate(item.as_of_date)} · ` : ''}${escapeHtml(formatTradingDelta(item.delta, item.unit || ''))}</div>
                     </div>
                 `;
             }).join('')}
@@ -1393,7 +1454,7 @@ async function openDashboardIndexDetail(period = 'daily') {
     const symbol = state.currentIndexSymbol || 'sh000001';
     const resolvedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
     try {
-        const result = await apiFetch(`/api/index-detail/${encodeURIComponent(symbol)}?period=${encodeURIComponent(resolvedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}`);
+        const result = await apiFetch(`/api/index-detail/${encodeURIComponent(symbol)}?period=${encodeURIComponent(resolvedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}&indicator_lookback=${encodeURIComponent(indicatorLookback())}`);
         if (!result.success) {
             throw new Error(result.error || '指数详情加载失败');
         }
@@ -1419,6 +1480,9 @@ async function openDashboardIndexDetail(period = 'daily') {
             meta: { industry: '指数', market: payload.source, exchange: payload.ts_code },
             valuation: {},
             financial: {},
+            calculation_data: Array.isArray(payload.calculation_candles)
+                ? [...payload.calculation_candles].reverse()
+                : candles,
         });
     } catch (error) {
         toast(`指数详情加载失败: ${error.message}`, 'error');
@@ -2107,8 +2171,26 @@ function normalizeMaSettings(settings) {
         .map(item => ({
             window: Math.max(2, Math.min(300, Number(item.window) || 0)),
             color: /^#[0-9a-f]{6}$/i.test(String(item.color || '')) ? item.color : '#ffd700',
+            enabled: item.enabled !== false,
         }))
         .filter(item => item.window >= 2);
+}
+
+function saveKlinePreferences() {
+    saveJsonSetting(KLINE_PREFERENCES_KEY, normalizeKlinePreferences({
+        period: state.currentStockPeriod,
+        limit: state.currentStockLimit,
+        movingAverages: state.maSettings,
+        sequenceEnabled: state.showSequenceMarkers,
+        macd: state.macdSettings,
+        indexMonths: state.indexMonths,
+    }));
+}
+
+function indicatorLookback() {
+    const longestMa = Math.max(2, ...normalizeMaSettings(state.maSettings).map(item => item.window));
+    const macdWarmup = Math.max(120, Number(state.macdSettings.slow || 26) * 5);
+    return Math.min(600, Math.max(longestMa, macdWarmup));
 }
 
 function renderMaSettings() {
@@ -2131,7 +2213,7 @@ function applyMacdInputs() {
     const slow = Math.max(fast + 1, Number(document.getElementById('stock-macd-slow')?.value) || 26);
     const signal = Math.max(2, Number(document.getElementById('stock-macd-signal')?.value) || 9);
     state.macdSettings = { fast, slow, signal };
-    saveJsonSetting('quantMacdSettings', state.macdSettings);
+    saveKlinePreferences();
 }
 
 function syncIndicatorControls() {
@@ -2175,7 +2257,7 @@ function rerenderCurrentStockChart() {
 
 function toggleSequenceMarkers() {
     state.showSequenceMarkers = state.showSequenceMarkers === false;
-    saveJsonSetting('quantShowSequenceMarkers', state.showSequenceMarkers);
+    saveKlinePreferences();
     syncIndicatorControls();
     rerenderCurrentStockChart();
 }
@@ -2184,7 +2266,7 @@ function addMovingAverageFromControls() {
     const windowValue = Math.max(2, Math.min(300, Number(document.getElementById('stock-ma-window')?.value) || 50));
     const color = document.getElementById('stock-ma-color')?.value || '#ffd700';
     state.maSettings = normalizeMaSettings([...state.maSettings, { window: windowValue, color }]);
-    saveJsonSetting('quantMaSettings', state.maSettings);
+    saveKlinePreferences();
     renderMaSettings();
     refreshCurrentStockChart();
 }
@@ -2275,7 +2357,7 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
     document.getElementById('stock-modal').classList.add('active');
 
     try {
-        const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}`);
+        const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}&indicator_lookback=${encodeURIComponent(indicatorLookback())}`);
         if (!result.success) {
             throw new Error(result.error || '个股详情加载失败');
         }
@@ -2314,6 +2396,10 @@ function renderStockChart(data, period = 'daily', detail = {}) {
     state.currentStockChartDetail = detail;
 
     const reversed = [...data].reverse();
+    const calculationNewestFirst = Array.isArray(detail.calculation_data) && detail.calculation_data.length
+        ? detail.calculation_data
+        : data;
+    const calculationReversed = [...calculationNewestFirst].reverse();
     const labelInterval = period === 'monthly' ? 2 : (period === 'weekly' ? 6 : 12);
     const dates = reversed.map(item => item.date);
     const candleValues = reversed.map(item => [
@@ -2322,14 +2408,19 @@ function renderStockChart(data, period = 'daily', detail = {}) {
         Number(item.low),
         Number(item.high),
     ]);
-    const closeValues = reversed.map(item => Number(item.close));
+    const calculationCloseValues = calculationReversed.map(item => Number(item.close));
     const maSeries = normalizeMaSettings(state.maSettings).map(item => ({
         name: `MA${item.window}`,
         window: item.window,
         color: item.color,
-        values: calculateMovingAverage(closeValues, item.window),
+        values: calculateMovingAverage(calculationCloseValues, item.window).slice(-reversed.length),
     }));
-    const macdValues = calculateMacd(closeValues, state.macdSettings);
+    const calculatedMacdValues = calculateMacd(calculationCloseValues, state.macdSettings);
+    const macdValues = {
+        dif: calculatedMacdValues.dif.slice(-reversed.length),
+        dea: calculatedMacdValues.dea.slice(-reversed.length),
+        macd: calculatedMacdValues.macd.slice(-reversed.length),
+    };
     const macdBars = macdValues.macd.map(value => ({
         value,
         itemStyle: { color: Number(value) >= 0 ? '#ff3131' : '#00c853' },
@@ -5455,6 +5546,7 @@ function bindEvents() {
         syncIndexMonthsLabel();
     });
     document.getElementById('dashboard-index-months').addEventListener('change', () => {
+        saveKlinePreferences();
         loadDashboardIndexKline(state.currentIndexSymbol || 'sh000001');
     });
     document.getElementById('dashboard-index-detail-btn').addEventListener('click', openDashboardIndexDetail);
@@ -5467,7 +5559,7 @@ function bindEvents() {
         }
         const index = Number(button.dataset.maRemove);
         state.maSettings = state.maSettings.filter((_, itemIndex) => itemIndex !== index);
-        saveJsonSetting('quantMaSettings', state.maSettings);
+        saveKlinePreferences();
         renderMaSettings();
         refreshCurrentStockChart();
     });
@@ -5624,7 +5716,7 @@ function bindEvents() {
         const rangeButton = event.target.closest('[data-limit]');
         if (rangeButton && state.currentStockDetail) {
             state.currentStockLimit = normalizeStockChartLimit(rangeButton.dataset.limit);
-            saveJsonSetting('quantStockChartLimit', state.currentStockLimit);
+            saveKlinePreferences();
             renderStockPeriodControls();
             refreshCurrentStockChart();
             return;
@@ -5634,9 +5726,13 @@ function bindEvents() {
             return;
         }
         if (state.currentStockDetail.type === 'index') {
+            state.currentStockPeriod = button.dataset.period;
+            saveKlinePreferences();
             openDashboardIndexDetail(button.dataset.period);
             return;
         }
+        state.currentStockPeriod = button.dataset.period;
+        saveKlinePreferences();
         viewStockDetail(
             state.currentStockDetail.code,
             state.currentStockDetail.name || '',
