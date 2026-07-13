@@ -17,7 +17,13 @@ def load_system_prompt() -> str:
     return "你是专业的威科夫行情图分析师。只输出 JSON，不输出 Markdown。"
 
 
-def build_messages(symbol: str, stock_name: str, df) -> list[dict[str, str]]:
+def build_messages(
+    symbol: str,
+    stock_name: str,
+    df,
+    *,
+    market_context: dict | None = None,
+) -> list[dict[str, str]]:
     latest_date = df["date"].iloc[-1].strftime("%Y-%m-%d") if len(df) else ""
     csv_payload = compact_csv(df)
     latest = df.iloc[-1]
@@ -41,6 +47,14 @@ def build_messages(symbol: str, stock_name: str, df) -> list[dict[str, str]]:
             "recent_60_close_max": round(float(recent_60["close"].max()), 4),
         },
     }
+    if market_context:
+        payload.update(
+            {
+                key: str(market_context.get(key) or "").strip()
+                for key in ("market", "currency", "source")
+                if market_context.get(key)
+            }
+        )
     adjustment_repairs = getattr(df, "attrs", {}).get("adjustment_repairs") or []
     if adjustment_repairs:
         payload["data_quality"] = {

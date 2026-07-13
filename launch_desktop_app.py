@@ -20,6 +20,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from utils.platform_paths import runtime_paths
+
 try:
     import yaml
 except Exception:  # pragma: no cover - surfaced in runtime validation
@@ -32,11 +34,15 @@ APP_ICON = PROJECT_ROOT / "assets" / "app_icon.icns"
 APP_BUNDLE_ENV = "A_SHARE_QUANT_APP_BUNDLE"
 RUNTIME_ICON_NAME = "runtime_icon.png"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
-LOG_DIR = PROJECT_ROOT / "logs"
-LOG_FILE = LOG_DIR / "desktop_app_launcher.log"
-INCIDENT_DIR = LOG_DIR / "incidents"
 LOCAL_PROXY_BYPASS = "127.0.0.1,localhost,::1"
-DESKTOP_STORAGE_DIR = Path.home() / "Library" / "Application Support" / "A股量化选股系统" / "webview"
+
+
+def launcher_log_paths() -> tuple[Path, Path, Path]:
+    log_dir = runtime_paths().logs_root
+    return log_dir, log_dir / "desktop_app_launcher.log", log_dir / "incidents"
+
+
+LOG_DIR, LOG_FILE, INCIDENT_DIR = launcher_log_paths()
 
 
 def configure_local_proxy_bypass() -> None:
@@ -61,16 +67,18 @@ def runtime_icon_path() -> Path | None:
 
 def desktop_storage_path() -> Path:
     """Return the stable pywebview profile used for persisted UI preferences."""
-    return DESKTOP_STORAGE_DIR
+    return runtime_paths().webview_root
 
 
 def setup_logging() -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    runtime_paths().ensure_writable_roots()
+    log_dir, log_file, _incident_dir = launcher_log_paths()
+    log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.FileHandler(log_file, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )
@@ -86,17 +94,18 @@ def append_system_log(event: str, message: str, detail: dict | None = None) -> N
 
 
 def write_startup_incident(error_detail: str) -> Path:
-    INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+    _log_dir, log_file, incident_dir = launcher_log_paths()
+    incident_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now()
     incident_id = timestamp.strftime("%Y%m%d-%H%M%S")
-    incident_path = INCIDENT_DIR / f"{incident_id}-desktop-startup.json"
+    incident_path = incident_dir / f"{incident_id}-desktop-startup.json"
     payload = {
         "incident_id": incident_id,
         "type": "desktop_startup_failure",
         "created_at": timestamp.isoformat(timespec="seconds"),
         "pid": os.getpid(),
         "project_root": str(PROJECT_ROOT),
-        "log_file": str(LOG_FILE),
+        "log_file": str(log_file),
         "system_proxy": urllib.request.getproxies(),
         "local_proxy_bypass": os.environ.get("NO_PROXY", ""),
         "error": error_detail,
@@ -112,11 +121,11 @@ def write_startup_incident(error_detail: str) -> Path:
 
 
 def load_config() -> dict:
-    if yaml is None or not DEFAULT_CONFIG.exists():
+    if yaml is None:
         return {}
     from utils.local_config import load_config_file
 
-    return load_config_file(DEFAULT_CONFIG)
+    return load_config_file()
 
 
 def validate_environment(require_webview: bool = False) -> list[str]:
@@ -127,7 +136,10 @@ def validate_environment(require_webview: bool = False) -> list[str]:
         (PROJECT_ROOT / "web_server.py", "web_server.py 不存在"),
         (PROJECT_ROOT / "web" / "templates" / "index.html", "Web 首页模板不存在"),
         (APP_ICON, "App 图标不存在"),
-        (DEFAULT_CONFIG, "config/config.yaml 不存在"),
+        (
+            runtime_paths().resource_root / "config" / "config.yaml.template",
+            "config/config.yaml.template 不存在",
+        ),
     ]
     for path, message in checks:
         if not path.exists():
@@ -222,7 +234,7 @@ def resolve_web_url() -> tuple[str, int, str]:
     os.chdir(PROJECT_ROOT)
     from web_server import _load_config, _resolve_web_address
 
-    config = _load_config(str(DEFAULT_CONFIG))
+    config = _load_config()
     host, port = _resolve_web_address(config=config)
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     return host, int(port), f"http://{display_host}:{int(port)}"
@@ -253,7 +265,9 @@ def launch_backend() -> tuple[str, threading.Thread]:
     server_thread.start()
 
     if not wait_for_server(url, timeout=35):
-        raise RuntimeError(f"Web 服务未在预期时间内就绪: {url}\n日志文件: {LOG_FILE}")
+        raise RuntimeError(
+            f"Web 服务未在预期时间内就绪: {url}\n日志文件: {launcher_log_paths()[1]}"
+        )
 
     return url, server_thread
 

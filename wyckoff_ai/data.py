@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from utils.price_adjustment import DEFAULT_GAP_THRESHOLD, repair_adjustment_gaps
+from market_data.hong_kong import canonical_hk_symbol
 
 
 COLUMN_ALIASES = {
@@ -28,6 +29,60 @@ ADJUSTMENT_GAP_THRESHOLD = DEFAULT_GAP_THRESHOLD
 
 class WyckoffDataError(ValueError):
     """Raised when a CSV cannot support Wyckoff analysis."""
+
+
+def _canonical_market_symbol(market: str, symbol: object) -> str:
+    market_id = str(market or "").strip()
+    if market_id == "hong_kong":
+        return canonical_hk_symbol(symbol)
+    if market_id == "a_share":
+        text = str(symbol or "").strip().upper()
+        code = text.split(".", 1)[0]
+        if len(code) != 6 or not code.isdigit():
+            raise WyckoffDataError("A 股代码必须为 6 位数字")
+        suffix = "BJ" if code.startswith(("4", "8")) else ("SH" if code.startswith("6") else "SZ")
+        return f"{code}.{suffix}"
+    raise WyckoffDataError(f"不支持的股票市场: {market_id}")
+
+
+def build_wyckoff_input(
+    symbol: object,
+    *,
+    market: str,
+    reader,
+    min_rows: int = MIN_REQUIRED_ROWS,
+) -> dict:
+    """Build a market-explicit Wyckoff input without implicit storage fallback."""
+
+    if reader is None:
+        raise WyckoffDataError("market-aware Wyckoff input requires an explicit reader")
+    market_id = str(market or "").strip()
+    canonical = _canonical_market_symbol(market_id, symbol)
+    try:
+        metadata = dict(reader.instrument_metadata(canonical) or {})
+        raw = reader.read_analysis_frame(canonical)
+    except Exception as exc:
+        raise WyckoffDataError(f"无法从 {market_id} reader 读取行情: {exc}") from exc
+    frame = normalize_ohlcv(raw, min_rows=min_rows)
+    canonical = _canonical_market_symbol(
+        market_id, metadata.get("symbol") or canonical
+    )
+    currency = str(
+        metadata.get("currency")
+        or ("HKD" if market_id == "hong_kong" else "CNY")
+    ).strip()
+    source = str(
+        metadata.get("source")
+        or ("hong_kong_domain_store" if market_id == "hong_kong" else "a_share_provider_csv")
+    ).strip()
+    return {
+        "market": market_id,
+        "symbol": canonical,
+        "currency": currency,
+        "source": source,
+        "metadata": {**metadata, "symbol": canonical, "currency": currency, "source": source},
+        "frame": frame,
+    }
 
 
 def _find_column(columns: Iterable[str], aliases: list[str]) -> str | None:

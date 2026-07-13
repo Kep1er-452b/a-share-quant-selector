@@ -1,20 +1,36 @@
 'use strict';
 
 const PAGE_TITLES = {
-    dashboard: '系统概览',
+    dashboard: '股票总览',
     heatmap: '市场云图',
     stocks: '股票列表',
     selection: '执行选股',
     strategies: '策略配置',
     watchlist: '自选股票',
     wyckoff: '威科夫分析',
+    futures: '期货市场',
+    macro: '宏观经济',
+    industry: '行业研究',
+    system: '系统运维',
+};
+
+const quantDomainWorkspaces = {
+    futures: window.quantFuturesWorkspace,
+    macro: window.quantMacroWorkspace,
+    industry: window.quantIndustryWorkspace,
+    system: window.quantSystemWorkspace || null,
 };
 
 const BOARD_LABELS = {
     main: '主板',
     chinext: '创业板',
     star: '科创板',
+    hong_kong: '港股',
 };
+
+function currentEquityMarket() {
+    return window.quantMarketContext?.currentMarket?.() || 'a_share';
+}
 
 const STOCK_PERIOD_LABELS = {
     daily: '日K',
@@ -706,13 +722,82 @@ async function apiFetch(url, fetchOptions = {}, config = {}) {
     }
 }
 
-function switchPage(page) {
+const DOMAIN_WORKSPACE_PAGES = new Set(['futures', 'macro', 'industry', 'system']);
+
+function workspacePageFromLocation() {
+    return window.location.hash.match(/^#\/(futures|macro|industry|system)$/)?.[1] || null;
+}
+
+function equityMarketFromLocation() {
+    return window.quantEquityRouter?.parseMarketRoute?.() || null;
+}
+
+function syncWorkspaceLocation(page) {
+    const currentWorkspace = workspacePageFromLocation();
+    if (DOMAIN_WORKSPACE_PAGES.has(page)) {
+        const route = `#/${page}`;
+        if (window.location.hash !== route) {
+            window.history.pushState({ page }, '', route);
+        }
+        return;
+    }
+    const marketRoute = window.quantEquityRouter?.marketRouteFor?.(currentEquityMarket());
+    if (marketRoute && window.location.hash !== marketRoute) {
+        window.history.pushState({ page, market: currentEquityMarket() }, '', marketRoute);
+    } else if (currentWorkspace) {
+        window.history.pushState({ page }, '', `${window.location.pathname}${window.location.search}`);
+    }
+}
+
+async function activateInstrumentRoute(route) {
+    if (!route?.market || !route?.symbol) return;
+    const detailSymbol = route.market === 'a_share'
+        ? String(route.symbol).split('.', 1)[0]
+        : String(route.symbol).toUpperCase();
+    const routeKey = `${route.market}:${detailSymbol}`;
+    if (state.activeInstrumentRouteKey === routeKey && document.getElementById('stock-modal')?.classList.contains('active')) {
+        return;
+    }
+    if (currentEquityMarket() !== route.market) {
+        window.quantMarketContext.setMarket(route.market, { silent: true });
+        resetEquityMarketCaches();
+    }
+    state.activeInstrumentRouteKey = routeKey;
+    switchPage('stocks', { syncRoute: false });
+    await viewStockDetail(detailSymbol);
+}
+
+function returnFromInstrumentRoute() {
+    if (!document.getElementById('stock-modal')?.classList.contains('active')) return;
+    closeModal({ fromHistory: true });
+    state.activeInstrumentRouteKey = null;
+    const source = window.quantEquityRouter?.restoreSourceState?.();
+    if (!source) return;
+    if (source.page && source.page !== state.currentPage) {
+        switchPage(source.page, { syncRoute: false });
+    }
+    window.setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('quant:return-to-source', { detail: source }));
+    }, 0);
+}
+
+function switchPage(page, { syncRoute = true } = {}) {
     if (state.systemHalted) {
         return;
     }
 
+    if (syncRoute) {
+        syncWorkspaceLocation(page);
+    }
+
     if (page !== 'heatmap') {
         exitHeatmapFullscreenIfNeeded().catch(() => {});
+    }
+
+    const previousPage = state.currentPage;
+    const previousController = quantDomainWorkspaces[previousPage];
+    if (previousPage !== page && previousController?.deactivate) {
+        previousController.deactivate();
     }
 
     state.currentPage = page;
@@ -720,6 +805,15 @@ function switchPage(page) {
     document.querySelectorAll('.nav-item').forEach(item => {
         item.classList.toggle('active', item.dataset.page === page);
     });
+
+    const activeWorkspace = DOMAIN_WORKSPACE_PAGES.has(page) ? page : 'equities';
+    document.querySelectorAll('.workspace-nav-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.workspace === activeWorkspace);
+    });
+    document.querySelector('.shell')?.classList.toggle(
+        'domain-workspace-active',
+        DOMAIN_WORKSPACE_PAGES.has(page),
+    );
 
     document.querySelectorAll('.page').forEach(pageEl => {
         pageEl.classList.toggle('active', pageEl.id === `${page}-page`);
@@ -733,6 +827,7 @@ function switchPage(page) {
         loadStats();
     }
     if (page === 'heatmap') {
+        prepareHeatmapForMarket();
         loadHeatmapMeta();
         loadHeatmap();
     }
@@ -752,6 +847,100 @@ function switchPage(page) {
     if (page === 'wyckoff') {
         loadWyckoffConfig();
     }
+    const nextController = quantDomainWorkspaces[page];
+    if (nextController?.activate) {
+        Promise.resolve(nextController.activate()).catch(error => {
+            console.warn(`${page} workspace activation failed:`, error);
+            setCommandOutput(`${String(page).toUpperCase()} ERROR ${error.message || error}`, 'error');
+        });
+    }
+}
+
+function setDashboardText(id, value) {
+    const element = document.getElementById(id);
+    if (element) element.textContent = value;
+}
+
+function setDashboardIndexControlsVisible(visible) {
+    const selector = document.getElementById('dashboard-index-selector');
+    const range = document.querySelector('.quote-chart-toolbar .index-range-control');
+    if (selector) selector.hidden = !visible;
+    if (range) range.hidden = !visible;
+}
+
+function renderHongKongDashboard(data = {}) {
+    setDashboardText('hero-market-label', 'HONG KONG UNIVERSE');
+    setDashboardText('hero-market-symbol', 'HKEX EQUITIES');
+    setDashboardText('board-distribution-title', 'MARKET SEGMENTS');
+    setDashboardIndexControlsVisible(false);
+
+    const defaults = [
+        { name: 'MAIN', subtitle: '港股主板' },
+        { name: 'GEM', subtitle: '港股创业板' },
+        { name: 'OTHER', subtitle: '其他市场分组' },
+    ];
+    const segments = Array.isArray(data.market_segments) ? data.market_segments.slice(0, 3) : [];
+    const slots = [
+        ['board-label-main', 'board-count-main', 'board-sub-main'],
+        ['board-label-secondary', 'board-count-chinext', 'board-sub-secondary'],
+        ['board-label-tertiary', 'board-count-star', 'board-sub-tertiary'],
+    ];
+    slots.forEach((ids, index) => {
+        const segment = segments[index];
+        const fallback = defaults[index];
+        setDashboardText(ids[0], String(segment?.name || fallback.name).toUpperCase());
+        setDashboardText(ids[1], segment ? formatNumber(segment.count || 0) : '--');
+        setDashboardText(ids[2], segment ? `${segment.name} STOCKS` : `${fallback.subtitle} STOCKS`);
+    });
+
+    setDashboardText('operator-note-1', '01  先执行港股本地同步，再从 STOCKS、HEATMAP 或 WATCHLIST 打开标的。');
+    setDashboardText('operator-note-2', '02  港股选股只展示明确声明支持 HONG KONG 或 MARKET NEUTRAL 的策略。');
+    setDashboardText('operator-note-3', '03  财务与技术面深链使用港股代码、港交所交易状态和 HKD 口径。');
+    setDashboardText('operator-note-4', '04  港股规则与 HKD 口径独立于 A 股制度；HALT 仍为全系统事故急停。');
+
+    if (state.indexKlineChart) {
+        state.indexKlineChart.dispose();
+        state.indexKlineChart = null;
+    }
+    const chart = document.getElementById('dashboard-sparkline');
+    if (chart) chart.innerHTML = '<div class="state-empty">港股总览不复用 A 股指数；同步后请从港股 STOCKS 打开个股 K 线。</div>';
+    setDashboardText('dashboard-index-meta', 'HKD / LOCAL');
+
+    const performance = data.performance || {};
+    const pulse = document.getElementById('dashboard-market-pulse');
+    if (pulse) {
+        pulse.innerHTML = `
+            <div class="health-card"><div class="pulse-label">ADVANCERS</div><div class="pulse-value price-up">${formatNumber(performance.advancers || 0)}</div><div class="pulse-sub">港股上涨</div></div>
+            <div class="health-card"><div class="pulse-label">DECLINERS</div><div class="pulse-value price-down">${formatNumber(performance.decliners || 0)}</div><div class="pulse-sub">港股下跌</div></div>
+            <div class="health-card"><div class="pulse-label">UNCHANGED</div><div class="pulse-value">${formatNumber(performance.unchanged || 0)}</div><div class="pulse-sub">港股平盘</div></div>
+        `;
+    }
+    const health = document.getElementById('dashboard-market-health');
+    if (health) {
+        health.innerHTML = `
+            <div class="health-card"><div class="pulse-label">LOCAL STORE</div><div class="pulse-value">${formatNumber(data.instrument_count || 0)}</div><div class="pulse-sub">港股标的</div></div>
+            <div class="health-card"><div class="pulse-label">CURRENCY</div><div class="pulse-value status-ok">HKD</div><div class="pulse-sub">港股独立币种</div></div>
+            <div class="health-card"><div class="pulse-label">GROUPING</div><div class="pulse-value">${escapeHtml(String(data.grouping_mode || 'EMPTY').toUpperCase())}</div><div class="pulse-sub">不复用 A 股行业映射</div></div>
+            <div class="health-card"><div class="pulse-label">ACTION</div><div class="pulse-value ${data.instrument_count ? 'status-ok' : 'status-warn'}">${data.instrument_count ? 'READY' : 'SYNC'}</div><div class="pulse-sub">${data.instrument_count ? '可进入港股工作流' : '使用右上角 SYNC 建仓'}</div></div>
+        `;
+    }
+}
+
+function restoreAShareDashboardShell() {
+    setDashboardText('hero-market-label', 'A-SHARE UNIVERSE');
+    setDashboardText('hero-market-symbol', 'ALL BOARDS');
+    setDashboardText('board-distribution-title', 'BOARD DISTRIBUTION');
+    setDashboardText('board-label-main', 'MAIN');
+    setDashboardText('board-sub-main', '主板 STOCKS');
+    setDashboardText('board-label-secondary', 'CHINEXT');
+    setDashboardText('board-sub-secondary', '创业板 STOCKS');
+    setDashboardText('board-label-tertiary', 'STAR');
+    setDashboardText('board-sub-tertiary', '科创板 STOCKS');
+    setDashboardText('operator-note-1', '01  先进入 SELECTION 页面勾选板块与策略，再执行扫描。');
+    setDashboardText('operator-note-2', '02  顶部 RUN 会沿用当前筛选快照，适合重复执行同一轮扫描。');
+    setDashboardText('operator-note-3', '03  HEATMAP 面板用于快速观察行业与个股分布，点击即可打开细节。');
+    setDashboardText('operator-note-4', '04  HALT 为事故急停指令，会记录现场、停止任务并退出系统。');
+    setDashboardIndexControlsVisible(true);
 }
 
 async function loadStats() {
@@ -760,6 +949,22 @@ async function loadStats() {
     }
 
     try {
+        if (currentEquityMarket() === 'hong_kong') {
+            const data = await apiFetch('/api/equities/hong_kong/overview');
+            renderHongKongDashboard(data);
+            const total = data.instrument_count || 0;
+            updateTextWithFlash('stat-stocks', formatNumber(total));
+            updateTextWithFlash('stat-date', '--');
+            updateTextWithFlash('stat-strategies', '0');
+            updateTextWithFlash('hero-strategy-count', '0');
+            updateTextWithFlash('hero-latest-date', '--');
+            updateTextWithFlash('stocks-total-label', `当前本地港股池 ${formatNumber(total)} 只`);
+            updateTextWithFlash('hero-universe', 'HONG KONG');
+            updateTextWithFlash('sidebar-universe-text', 'HONG KONG');
+            updateGlobalTicker(`HONG KONG  ${formatNumber(total)} INSTRUMENTS  HKD  LOCAL STORE`);
+            return;
+        }
+        restoreAShareDashboardShell();
         const result = await apiFetch('/api/stats');
         if (!result.success) {
             return;
@@ -798,6 +1003,12 @@ async function loadHeatmapMeta(forceReload = false) {
     if (state.systemHalted) {
         return;
     }
+    if (currentEquityMarket() === 'hong_kong') {
+        prepareHeatmapForMarket();
+        state.heatmapMetaLoaded = true;
+        state.heatmapMarkets = [];
+        return;
+    }
     if (state.heatmapMetaLoaded && !forceReload) {
         renderHeatmapFilters();
         return;
@@ -829,6 +1040,39 @@ async function loadHeatmapMeta(forceReload = false) {
     } catch (error) {
         document.getElementById('heatmap-cache-note').textContent = `元数据加载失败: ${error.message}`;
     }
+}
+
+function prepareHeatmapForMarket() {
+    const isHongKong = currentEquityMarket() === 'hong_kong';
+    const panelTitle = document.getElementById('heatmap-panel-title');
+    const marketContainer = document.getElementById('heatmap-market-filter');
+    const metricContainer = document.getElementById('heatmap-metric-filter');
+    const cacheNote = document.getElementById('heatmap-cache-note');
+    const scopeLabel = document.getElementById('heatmap-scope-label');
+    const metricLabel = document.getElementById('heatmap-metric-label');
+
+    if (panelTitle) panelTitle.textContent = isHongKong ? 'HONG KONG HEATMAP' : 'A-SHARE HEATMAP';
+    if (marketContainer) {
+        marketContainer.innerHTML = isHongKong
+            ? '<button class="heatmap-filter-btn active" type="button" disabled>全部港股</button>'
+            : '';
+    }
+    if (metricContainer) {
+        metricContainer.innerHTML = isHongKong
+            ? '<button class="heatmap-filter-btn active" type="button" disabled>最新交易日</button>'
+            : ['daily:日线', 'weekly:本周以来', 'monthly:本月以来', 'five_day:最近五个交易日']
+                .map(item => {
+                    const [metric, label] = item.split(':');
+                    return `<button class="heatmap-filter-btn ${state.heatmapMetric === metric ? 'active' : ''}" data-metric="${metric}" type="button">${label}</button>`;
+                }).join('');
+    }
+    if (cacheNote) {
+        cacheNote.textContent = isHongKong
+            ? '读取独立港股本地仓库；板块与缓存口径均为港股专用'
+            : '正在读取 A 股市场云图元数据...';
+    }
+    if (scopeLabel) scopeLabel.textContent = isHongKong ? '全部港股' : heatmapScopeLabel(state.heatmapScope);
+    if (metricLabel) metricLabel.textContent = isHongKong ? '最新交易日' : heatmapMetricLabel(state.heatmapMetric);
 }
 
 async function loadHeatmapHealth(forceReload = false) {
@@ -1952,6 +2196,48 @@ async function loadHeatmap(forceReload = false) {
     setHeatmapLoading(true, forceReload ? '正在刷新市场云图...' : '正在生成市场云图...');
 
     try {
+        if (currentEquityMarket() === 'hong_kong') {
+            const data = await apiFetch('/api/equities/hong_kong/heatmap');
+            const groups = (data.groups || []).map(group => {
+                const children = (group.items || []).map(item => ({
+                    name: item.name,
+                    code: item.symbol,
+                    industry: item.segment || group.name,
+                    board: item.segment || group.name,
+                    latest_price: item.close,
+                    change_pct: item.change_pct,
+                    market_cap: 0,
+                    value: Math.max(Number(item.volume) || 0, 1),
+                }));
+                const comparable = children.filter(item => Number.isFinite(Number(item.change_pct)));
+                return {
+                    name: group.name,
+                    stock_count: group.count || children.length,
+                    change_pct: comparable.length
+                        ? comparable.reduce((sum, item) => sum + Number(item.change_pct), 0) / comparable.length
+                        : null,
+                    children,
+                };
+            });
+            const latestDate = (data.groups || [])
+                .flatMap(group => group.items || [])
+                .map(item => String(item.trade_date || ''))
+                .filter(Boolean)
+                .sort()
+                .pop() || '--';
+            document.getElementById('heatmap-latest-date').textContent = latestDate;
+            document.getElementById('heatmap-subtitle').textContent = data.grouping_mode === 'market_segment'
+                ? '港股按真实市场板块分组，面积映射成交量，颜色映射涨跌幅'
+                : '港股按涨跌表现分组，面积映射成交量，颜色映射涨跌幅';
+            document.getElementById('heatmap-scope-label').textContent = '全部港股';
+            document.getElementById('heatmap-metric-label').textContent = '最新交易日';
+            document.getElementById('heatmap-stock-count').textContent = `${formatNumber(data.total || 0)} 只股票`;
+            document.getElementById('heatmap-ticker-track').innerHTML = buildIndustryTickerLoopHtml(groups);
+            renderHeatmapIndices([]);
+            renderHeatmapChart(groups);
+            updateGlobalTicker(`HONG KONG HEATMAP   ${formatNumber(data.total || 0)} INSTRUMENTS   HKD`);
+            return;
+        }
         const health = await loadHeatmapHealth(forceReload);
         const key = heatmapCacheKey(health);
         if (!forceReload && state.heatmapPayloadCache.has(key)) {
@@ -2014,6 +2300,29 @@ async function loadStocks(forceReload = false) {
     tbody.innerHTML = '<tr><td colspan="8" class="state-loading state-table-message">正在载入股票列表...</td></tr>';
 
     state.stocksLoadingPromise = (async () => {
+        if (currentEquityMarket() === 'hong_kong') {
+            let offset = 0;
+            const pageSize = 200;
+            let total = 0;
+            const allStocks = [];
+            do {
+                const result = await apiFetch(`/api/equities/hong_kong/instruments?limit=${pageSize}&offset=${offset}`);
+                total = result.total || 0;
+                allStocks.push(...(result.items || []).map(item => ({
+                    ...item,
+                    code: item.symbol,
+                    board: 'hong_kong',
+                    latest_price: '--',
+                    latest_date: '--',
+                    market_cap: '--',
+                    data_count: '--',
+                })));
+                offset += pageSize;
+            } while (offset < total);
+            state.allStocksCache = allStocks;
+            state.stocksLoaded = true;
+            return;
+        }
         let page = 1;
         let totalPages = 1;
         let allStocks = [];
@@ -2083,6 +2392,10 @@ function renderStocks(stocks) {
 }
 
 async function searchStocks(keyword, limit = 20) {
+    if (currentEquityMarket() === 'hong_kong') {
+        const result = await apiFetch(`/api/equities/hong_kong/instruments?q=${encodeURIComponent(keyword)}&limit=${Math.min(limit, 200)}&offset=0`);
+        return (result.items || []).map(item => ({ ...item, code: item.symbol, board: 'hong_kong' }));
+    }
     const result = await apiFetch(`/api/stocks/search?q=${encodeURIComponent(keyword)}&limit=${limit}`);
     if (!result.success) {
         throw new Error(result.error || '股票搜索失败');
@@ -2357,6 +2670,18 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
     document.getElementById('stock-modal').classList.add('active');
 
     try {
+        if (currentEquityMarket() === 'hong_kong') {
+            const hongKongLimit = state.currentStockLimit === 'all' ? 1000 : state.currentStockLimit;
+            const payload = await apiFetch(`/api/equities/hong_kong/instrument/${encodeURIComponent(code)}?limit=${encodeURIComponent(hongKongLimit)}&adjustment=raw`);
+            const instrument = payload.instrument || {};
+            const kline = payload.kline || {};
+            const resolvedSymbol = kline.symbol || instrument.symbol || code;
+            state.currentStockDetail = { code: resolvedSymbol, name: instrument.name || name || '', period: 'daily', limit: state.currentStockLimit };
+            document.getElementById('modal-title').textContent = `${instrument.name || name || code} · 港股日K · HKD`;
+            document.getElementById('stock-info').innerHTML = `<div class="detail-section"><div class="detail-section-title">HONG KONG SECURITY</div><div class="detail-kv-grid"><span>代码</span><b>${escapeHtml(resolvedSymbol)}</b><span>市场</span><b>${escapeHtml(instrument.market || '--')}</b><span>币种</span><b>HKD</b></div></div>`;
+            renderStockChart([...(kline.items || [])].reverse(), 'daily', { currency: 'HKD', finance: payload.finance || {} });
+            return;
+        }
         const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}&indicator_lookback=${encodeURIComponent(indicatorLookback())}`);
         if (!result.success) {
             throw new Error(result.error || '个股详情加载失败');
@@ -2900,7 +3225,11 @@ async function exportCurrentStock(mode = 'check') {
     }
 }
 
-function closeModal() {
+function closeModal(options = {}) {
+    if (!options.fromHistory && window.quantEquityRouter?.parseInstrumentRoute?.()) {
+        window.history.back();
+        return;
+    }
     document.getElementById('stock-modal').classList.remove('active');
     setStockExportStatus('');
     closeExportConfirm();
@@ -2975,7 +3304,7 @@ function renderWatchlist(items) {
             </td>
             <td class="code-cell">${escapeHtml(stock.code)}</td>
             <td>${escapeHtml(stock.name || '未知')}</td>
-            <td>${boardBadge(stock.board || stock.code)}</td>
+            <td>${currentEquityMarket() === 'hong_kong' ? '<span class="board-badge">港股</span>' : boardBadge(stock.board || stock.code)}</td>
             <td class="mono">${escapeHtml(stock.latest_price ?? '--')}</td>
             <td class="mono">${escapeHtml(stock.latest_date ?? '--')}</td>
             <td class="mono">${escapeHtml(stock.market_cap ?? '--')}</td>
@@ -2990,7 +3319,8 @@ function renderWatchlist(items) {
                     </button>
                     <button class="btn btn-secondary export-watchlist-btn" type="button"
                         data-code="${escapeHtml(stock.code)}"
-                        data-name="${escapeHtml(stock.name || '')}">
+                        data-name="${escapeHtml(stock.name || '')}"
+                        ${currentEquityMarket() === 'hong_kong' ? 'disabled title="港股导出将在独立导出器中提供"' : ''}>
                         导出
                     </button>
                     <button class="btn btn-danger remove-watchlist-btn" type="button"
@@ -3029,11 +3359,12 @@ async function loadWatchlist(forceReload = false) {
     const tbody = document.getElementById('watchlist-tbody');
     tbody.innerHTML = '<tr><td colspan="10" class="state-loading">正在加载自选股...</td></tr>';
     try {
-        const result = await apiFetch('/api/watchlist');
-        if (!result.success) {
+        const isHongKong = currentEquityMarket() === 'hong_kong';
+        const result = await apiFetch(isHongKong ? '/api/equities/hong_kong/watchlist' : '/api/watchlist');
+        if (!isHongKong && !result.success) {
             throw new Error(result.error || '自选股加载失败');
         }
-        state.watchlistCache = result.data || [];
+        state.watchlistCache = (isHongKong ? result.items : result.data) || [];
         const availableCodes = new Set(state.watchlistCache.map(stock => stock.code));
         state.watchlistSelectedCodes.forEach(code => {
             if (!availableCodes.has(code)) {
@@ -3063,23 +3394,25 @@ async function addWatchlistItem() {
     }
 
     try {
-        const result = await apiFetch('/api/watchlist', {
+        const isHongKong = currentEquityMarket() === 'hong_kong';
+        const result = await apiFetch(isHongKong ? '/api/equities/hong_kong/watchlist' : '/api/watchlist', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ query, note }),
+            body: JSON.stringify(isHongKong ? { symbol: query, note } : { query, note }),
         });
-        if (!result.success) {
+        if (!isHongKong && !result.success) {
             throw new Error(result.error || '添加失败');
         }
+        const added = isHongKong ? result : result.data;
         queryInput.value = '';
         noteInput.value = '';
         state.watchlistLoaded = false;
         await loadWatchlist(true);
-        state.watchlistSelectedCodes.add(result.data.code);
+        state.watchlistSelectedCodes.add(added.code);
         filterWatchlist(document.getElementById('watchlist-query')?.value || '');
-        toast(`已加入自选: ${result.data.code} ${result.data.name || ''}`.trim(), 'success');
+        toast(`已加入自选: ${added.code} ${added.name || ''}`.trim(), 'success');
     } catch (error) {
         toast(`添加失败: ${error.message}`, 'error');
     }
@@ -3087,10 +3420,14 @@ async function addWatchlistItem() {
 
 async function removeWatchlistItem(code) {
     try {
-        const result = await apiFetch(`/api/watchlist/${encodeURIComponent(code)}`, {
-            method: 'DELETE',
-        });
-        if (!result.success) {
+        const isHongKong = currentEquityMarket() === 'hong_kong';
+        const result = await apiFetch(
+            isHongKong ? '/api/equities/hong_kong/watchlist' : `/api/watchlist/${encodeURIComponent(code)}`,
+            isHongKong
+                ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'remove', symbol: code }) }
+                : { method: 'DELETE' },
+        );
+        if (!isHongKong && !result.success) {
             throw new Error(result.error || '删除失败');
         }
         state.watchlistLoaded = false;
@@ -3131,20 +3468,28 @@ async function removeSelectedWatchlistItems() {
     }
 
     try {
-        const result = await apiFetch('/api/watchlist/batch', {
-            method: 'DELETE',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ codes: items.map(stock => stock.code) }),
-        });
-        if (!result.success) {
-            throw new Error(result.error || '批量删除失败');
+        const isHongKong = currentEquityMarket() === 'hong_kong';
+        let removedCodes;
+        if (isHongKong) {
+            await Promise.all(items.map(stock => apiFetch('/api/equities/hong_kong/watchlist', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'remove', symbol: stock.code }),
+            })));
+            removedCodes = items.map(stock => stock.code);
+        } else {
+            const result = await apiFetch('/api/watchlist/batch', {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ codes: items.map(stock => stock.code) }),
+            });
+            if (!result.success) throw new Error(result.error || '批量删除失败');
+            removedCodes = result.removed_codes || [];
         }
-        (result.removed_codes || []).forEach(code => state.watchlistSelectedCodes.delete(code));
+        removedCodes.forEach(code => state.watchlistSelectedCodes.delete(code));
         state.watchlistLoaded = false;
         await loadWatchlist(true);
-        toast(`已批量删除 ${formatNumber(result.removed_count || 0)} 只自选股`, 'success');
+        toast(`已批量删除 ${formatNumber(removedCodes.length)} 只自选股`, 'success');
     } catch (error) {
         toast(`批量删除失败: ${error.message}`, 'error');
     }
@@ -3233,11 +3578,14 @@ async function pollWyckoffJob() {
         return;
     }
     try {
-        const result = await apiFetch(`/api/wyckoff/status/${state.wyckoffJobId}`);
-        if (!result.success) {
+        const isHongKong = currentEquityMarket() === 'hong_kong';
+        const result = await apiFetch(isHongKong
+            ? `/api/equities/hong_kong/wyckoff/status/${state.wyckoffJobId}`
+            : `/api/wyckoff/status/${state.wyckoffJobId}`);
+        if (!isHongKong && !result.success) {
             throw new Error(result.error || '威科夫任务状态读取失败');
         }
-        const job = result.data || {};
+        const job = isHongKong ? result : (result.data || {});
         renderWyckoffProgress(job);
         if (job.status === 'done') {
             stopWyckoffProgress();
@@ -3274,6 +3622,22 @@ async function loadWyckoffConfig(forceReload = false) {
     if (state.systemHalted) {
         return;
     }
+    const isHongKong = currentEquityMarket() === 'hong_kong';
+    if (isHongKong) {
+        stopWyckoffProgress();
+        state.currentWyckoffResult = null;
+        state.wyckoffConfigLoaded = false;
+        const chartImg = document.getElementById('wyckoff-chart-img');
+        chartImg.removeAttribute('src');
+        chartImg.style.display = 'none';
+        document.getElementById('wyckoff-chart-placeholder').style.display = 'flex';
+        document.getElementById('wyckoff-chart-placeholder').textContent = '等待港股本地日线与威科夫分析任务...';
+        document.getElementById('wyckoff-analysis-text').textContent = '港股分析将只读取独立港股仓库，币种为 HKD。';
+        document.getElementById('wyckoff-paths').innerHTML = '';
+        document.getElementById('wyckoff-latest-run').textContent = '--';
+        document.getElementById('wyckoff-run-btn').disabled = false;
+    }
+    document.getElementById('wyckoff-run-btn').disabled = false;
     if (state.wyckoffConfigLoaded && !forceReload) {
         return;
     }
@@ -3286,7 +3650,9 @@ async function loadWyckoffConfig(forceReload = false) {
         state.wyckoffConfigured = Boolean(result.data?.configured);
         state.wyckoffConfigLoaded = true;
         document.getElementById('wyckoff-model-label').textContent = result.data?.model || 'deepseek-v4-pro';
-        configStatus.textContent = state.wyckoffConfigured ? 'DeepSeek token 已配置，本地 CSV 分析可用' : '未配置 DeepSeek token';
+        configStatus.textContent = state.wyckoffConfigured
+            ? (isHongKong ? 'DeepSeek token 已配置，港股独立仓库分析可用' : 'DeepSeek token 已配置，本地 CSV 分析可用')
+            : '未配置 DeepSeek token';
         configStatus.classList.toggle('down', !state.wyckoffConfigured);
         configStatus.classList.toggle('highlight', state.wyckoffConfigured);
     } catch (error) {
@@ -3496,14 +3862,15 @@ function showWyckoffBatchResult(index) {
 }
 
 async function startWyckoffJob(query) {
-    const result = await apiFetch('/api/wyckoff/start', {
+    const isHongKong = currentEquityMarket() === 'hong_kong';
+    const result = await apiFetch(isHongKong ? '/api/equities/hong_kong/wyckoff/start' : '/api/wyckoff/start', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify(isHongKong ? { symbol: query } : { query }),
     });
-    if (!result.success) {
+    if (!isHongKong && !result.success) {
         throw new Error(result.error || '威科夫分析失败');
     }
     return result;
@@ -3514,11 +3881,14 @@ async function waitForWyckoffJob(jobId) {
         if (state.systemHalted) {
             throw new Error('系统已急停');
         }
-        const result = await apiFetch(`/api/wyckoff/status/${jobId}`);
-        if (!result.success) {
+        const isHongKong = currentEquityMarket() === 'hong_kong';
+        const result = await apiFetch(isHongKong
+            ? `/api/equities/hong_kong/wyckoff/status/${jobId}`
+            : `/api/wyckoff/status/${jobId}`);
+        if (!isHongKong && !result.success) {
             throw new Error(result.error || '威科夫任务状态读取失败');
         }
-        const job = result.data || {};
+        const job = isHongKong ? result : (result.data || {});
         renderWyckoffProgress(job);
         if (job.status === 'done') {
             return job.result;
@@ -3654,16 +4024,7 @@ async function runWyckoffAnalysis() {
     enqueueWyckoffTicker(`WYCKOFF 000%   START   已接收 ${query}，正在创建后端分析任务。`, true);
 
     try {
-        const result = await apiFetch('/api/wyckoff/start', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ query }),
-        });
-        if (!result.success) {
-            throw new Error(result.error || '威科夫分析失败');
-        }
+        const result = await startWyckoffJob(query);
         state.wyckoffJobId = result.job_id;
         renderWyckoffProgress(result.data || {});
         await pollWyckoffJob();
@@ -4436,6 +4797,19 @@ async function loadSelectionOptions(forceReload = false) {
     }
 
     try {
+        if (currentEquityMarket() === 'hong_kong') {
+            const result = await apiFetch('/api/equities/hong_kong/selection/options');
+            state.boardOptions = [];
+            state.boardCounts = {};
+            state.strategyGroups = [];
+            state.strategies = result.strategies || [];
+            state.selectionOptionsLoaded = true;
+            document.getElementById('board-filter').innerHTML = '<div class="state-empty">港股不使用 A 股主板/创业板/科创板过滤规则。</div>';
+            renderStrategyOptions(state.strategies, []);
+            if (!state.strategies.length) document.getElementById('strategy-filter').innerHTML = `<div class="state-empty">${escapeHtml(result.warning || '暂无已验证的港股策略')}</div>`;
+            updateSelectionSnapshot();
+            return;
+        }
         const result = await apiFetch('/api/selection/options');
         if (!result.success) {
             throw new Error(result.error || '选项加载失败');
@@ -4858,7 +5232,10 @@ async function runSelection() {
         stopSelectionPolling();
         state.currentSelectionJobId = null;
 
-        const result = await apiFetch('/api/select/start', {
+        const selectionEndpoint = currentEquityMarket() === 'hong_kong'
+            ? '/api/equities/hong_kong/selection/start'
+            : '/api/select/start';
+        const result = await apiFetch(selectionEndpoint, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -5099,9 +5476,25 @@ async function loadStrategies() {
     }
 
     const container = document.getElementById('strategies-config');
+    const isHongKong = currentEquityMarket() === 'hong_kong';
+    const title = document.getElementById('strategies-panel-title');
+    const subtitle = document.getElementById('strategies-panel-subtitle');
+    const saveButton = document.getElementById('save-config-btn');
+    if (title) title.textContent = isHongKong ? 'HONG KONG STRATEGIES' : 'STRATEGY PARAMETERS';
+    if (subtitle) {
+        subtitle.textContent = isHongKong
+            ? '仅列出明确声明支持港股或市场中性的策略'
+            : '支持嵌套参数编辑，保存后会即时重载策略注册表';
+    }
+    if (saveButton) saveButton.hidden = isHongKong;
     container.innerHTML = '<div class="state-loading">正在加载策略配置...</div>';
 
     try {
+        if (currentEquityMarket() === 'hong_kong') {
+            const result = await apiFetch('/api/equities/hong_kong/selection/options');
+            renderHongKongStrategies(result.strategies || [], result.warning);
+            return;
+        }
         const result = await apiFetch('/api/config');
         if (!result.success) {
             throw new Error(result.error || '配置加载失败');
@@ -5113,6 +5506,25 @@ async function loadStrategies() {
         }
         container.innerHTML = `<div class="state-empty">加载失败: ${escapeHtml(error.message)}</div>`;
     }
+}
+
+function renderHongKongStrategies(strategies, warning = '') {
+    const container = document.getElementById('strategies-config');
+    if (!Array.isArray(strategies) || !strategies.length) {
+        container.innerHTML = `<div class="state-empty">${escapeHtml(warning || '暂无已验证的港股策略')}</div>`;
+        return;
+    }
+    container.innerHTML = strategies.map(strategy => `
+        <section class="strategy-config-block">
+            <div class="strategy-config-header">
+                <div>
+                    <div class="strategy-config-name">${escapeHtml(strategy.display_name || strategy.name)}</div>
+                    <div class="panel-subtitle">${escapeHtml(strategy.description || '已明确支持港股市场')}</div>
+                </div>
+                <span class="strategy-option-meta">${escapeHtml(strategy.scope || 'hong_kong')}</span>
+            </div>
+        </section>
+    `).join('');
 }
 
 function parseInputValue(rawValue) {
@@ -5354,31 +5766,47 @@ function runTerminalCommand() {
     const command = raw.toUpperCase();
     input.value = '';
 
-    if (command === 'F1' || command === 'DASH' || command === 'HOME') {
+    if (command === 'F1' || command === 'E1' || command === 'EQUITIES' || command === 'DASH' || command === 'HOME') {
         switchPage('dashboard');
         return;
     }
-    if (command === 'F2' || command === 'HEAT' || command === 'MAP') {
+    if (command === 'F2' || command === 'FUTURES' || command === 'FUT') {
+        switchPage('futures');
+        return;
+    }
+    if (command === 'F3' || command === 'MACRO' || command === 'ECON') {
+        switchPage('macro');
+        return;
+    }
+    if (command === 'F4' || command === 'INDUSTRY' || command === 'IND') {
+        switchPage('industry');
+        return;
+    }
+    if (command === 'F5' || command === 'SYSTEM' || command === 'OPS') {
+        switchPage('system');
+        return;
+    }
+    if (command === 'E2' || command === 'HEAT' || command === 'MAP') {
         switchPage('heatmap');
         return;
     }
-    if (command === 'F3' || command === 'STOCK' || command === 'STOCKS' || command === 'POOL') {
+    if (command === 'E3' || command === 'STOCK' || command === 'STOCKS' || command === 'POOL') {
         switchPage('stocks');
         return;
     }
-    if (command === 'F4' || command === 'RUN' || command === 'SELECT') {
+    if (command === 'E4' || command === 'RUN' || command === 'SELECT') {
         runSelection();
         return;
     }
-    if (command === 'F5' || command === 'CFG' || command === 'STRAT') {
+    if (command === 'E5' || command === 'CFG' || command === 'STRAT') {
         switchPage('strategies');
         return;
     }
-    if (command === 'F6' || command === 'WATCH' || command === 'WATCHLIST' || command === 'ZX') {
+    if (command === 'E6' || command === 'WATCH' || command === 'WATCHLIST' || command === 'ZX') {
         switchPage('watchlist');
         return;
     }
-    if (command === 'F7' || command === 'WYCKOFF' || command === 'WK') {
+    if (command === 'E7' || command === 'WYCKOFF' || command === 'WK') {
         switchPage('wyckoff');
         return;
     }
@@ -5397,14 +5825,38 @@ function runTerminalCommand() {
     openStockByQuery(raw);
 }
 
+function resetEquityMarketCaches() {
+    abortActiveRequests();
+    state.allStocksCache = [];
+    state.stocksLoaded = false;
+    state.selectionOptionsLoaded = false;
+    state.watchlistLoaded = false;
+    state.heatmapMetaLoaded = false;
+    state.heatmapPayloadCache.clear();
+    state.heatmapHealth = null;
+}
+
 function bindEvents() {
-    document.getElementById('sidebar-nav').addEventListener('click', event => {
+    window.addEventListener('quant:open-instrument', event => {
+        activateInstrumentRoute(event.detail).catch(error => {
+            toast(`打开标的失败: ${error.message}`, 'error');
+        });
+    });
+    window.addEventListener('quant:market-change', () => {
+        resetEquityMarketCaches();
+        switchPage(state.currentPage);
+    });
+    const handleNavigationClick = event => {
         const item = event.target.closest('.nav-item');
-        if (!item) {
+        const workspaceItem = event.target.closest('.workspace-nav-item');
+        const target = item || workspaceItem;
+        if (!target) {
             return;
         }
-        switchPage(item.dataset.page);
-    });
+        switchPage(target.dataset.page);
+    };
+    document.getElementById('sidebar-nav').addEventListener('click', handleNavigationClick);
+    document.getElementById('workspace-nav').addEventListener('click', handleNavigationClick);
 
     document.getElementById('stock-search').addEventListener('input', event => {
         const keyword = event.target.value.trim();
@@ -5854,6 +6306,35 @@ async function init() {
     window.setInterval(updateClock, 1000);
 
     window.addEventListener('beforeunload', handleBeforeUnload);
+    const restoreWorkspaceRoute = () => {
+        const instrument = window.quantEquityRouter?.parseInstrumentRoute?.();
+        if (instrument) {
+            activateInstrumentRoute(instrument).catch(error => {
+                toast(`打开标的失败: ${error.message}`, 'error');
+            });
+            return;
+        }
+        const equityMarket = equityMarketFromLocation();
+        if (equityMarket) {
+            window.quantMarketContext.setMarket(equityMarket, { silent: true });
+            resetEquityMarketCaches();
+            const equityPage = DOMAIN_WORKSPACE_PAGES.has(state.currentPage)
+                ? 'dashboard'
+                : state.currentPage;
+            switchPage(equityPage, { syncRoute: false });
+            returnFromInstrumentRoute();
+            return;
+        }
+        const workspace = workspacePageFromLocation();
+        if (workspace && workspace !== state.currentPage) {
+            switchPage(workspace, { syncRoute: false });
+        } else if (!workspace && !window.location.hash && DOMAIN_WORKSPACE_PAGES.has(state.currentPage)) {
+            switchPage('dashboard', { syncRoute: false });
+        }
+        returnFromInstrumentRoute();
+    };
+    window.addEventListener('hashchange', restoreWorkspaceRoute);
+    window.addEventListener('popstate', restoreWorkspaceRoute);
     window.addEventListener('resize', () => resizeDashboardIndexChart());
     window.addEventListener('resize', () => {
         if (state.chartInstance && typeof state.chartInstance.resize === 'function') {
@@ -5875,6 +6356,19 @@ async function init() {
     }
 
     await restoreSelectionStateIfNeeded();
+    const instrumentRoute = window.quantEquityRouter?.parseInstrumentRoute?.();
+    const equityMarket = equityMarketFromLocation();
+    const workspaceRoute = workspacePageFromLocation();
+    if (instrumentRoute) {
+        await activateInstrumentRoute(instrumentRoute);
+    } else if (equityMarket) {
+        window.quantMarketContext.setMarket(equityMarket, { silent: true });
+        switchPage('dashboard', { syncRoute: false });
+    } else if (workspaceRoute) {
+        switchPage(workspaceRoute, { syncRoute: false });
+    } else {
+        switchPage('dashboard', { syncRoute: false });
+    }
     await Promise.all([loadStats(), loadSelectionOptions()]);
 }
 
@@ -5883,6 +6377,7 @@ function handleBeforeUnload() {
     stopSelectionPolling();
     stopUpdatePolling();
     stopLocalProgressTimer();
+    Object.values(quantDomainWorkspaces).forEach(controller => controller?.deactivate?.());
 
     if (state.currentSelectionJobId && (state.status === 'running')) {
         saveSelectionState();

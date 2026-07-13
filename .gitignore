@@ -39,6 +39,11 @@ stock-selected/
 
 # Logs
 *.log
+logs/
+logs/ops.sqlite*
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 outputs/
 
 # External projects kept outside this repository

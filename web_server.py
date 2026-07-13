@@ -1,7 +1,7 @@
 """
 Web 服务器 - A股量化选股系统前端
 """
-from flask import Flask, Response, render_template, jsonify, request, send_from_directory, has_request_context
+from flask import Flask, Response, g, render_template, jsonify, request, send_from_directory, has_request_context
 import json
 import sys
 import socket
@@ -16,7 +16,7 @@ import uuid
 from threading import Event, Lock, Thread, Timer
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import yaml
 import pandas as pd
@@ -53,6 +53,7 @@ from utils.provider_router import (
     warehouse_summary,
 )
 from utils.runtime_paths import selection_results_dir, wyckoff_results_dir
+from utils.market_watchlist import MarketWatchlistStore, canonical_equity_symbol
 from utils.selection_worker import (
     build_worker_context,
     initialize_selection_worker,
@@ -92,10 +93,33 @@ import strategy.strategy_registry as strategy_registry_module
 from strategy.strategy_registry import StrategyRegistry
 from strategy.formula_strategy import FORMULA_DISPLAY_NAME, FORMULA_STRATEGY_NAME, build_formula_params
 from utils.formula_engine import FormulaError
+from web_api.markets import markets_blueprint
+from web_api.domain_data import domain_data_blueprint
+from web_api.domain_data import (
+    _store as _domain_store,
+    sync_cancel as cancel_domain_sync_job,
+    configure_sync_event_observer,
+    domain_service,
+    sync_jobs_snapshot,
+)
+from web_api.equities import create_equities_blueprint
+from market_data.equity_policy import HongKongEquityReader
+from market_data.store import configure_store_performance_observer
+from web_api.ops import OpsServiceContainer, create_ops_blueprint
+from ops.diagnostics import DiagnosticExporter
+from ops.health import HealthService
+from ops.events import RetentionPolicy
+from ops.logging import EventLogger
+from ops.performance import PerformanceRecorder
+from ops.store import OpsRetentionMaintenance, OpsStore
+from ops.tasks import TaskRegistry
+from utils.platform_paths import runtime_paths as platform_runtime_paths
 
 app = Flask(__name__, 
             template_folder='web/templates',
             static_folder='web/static')
+app.register_blueprint(markets_blueprint)
+app.register_blueprint(domain_data_blueprint)
 
 # 全局状态
 halt_event = Event()
@@ -103,17 +127,20 @@ shutdown_event = Event()
 WEB_SESSION_TOKEN = secrets.token_urlsafe(32)
 selection_jobs = {}
 selection_jobs_lock = Lock()
+selection_cancel_events = {}
 update_jobs = {}
 update_jobs_lock = Lock()
 update_cancel_events = {}
 diagnostic_jobs = {}
 diagnostic_jobs_lock = Lock()
+diagnostic_cancel_events = {}
 job_admission_lock = Lock()
 sync_selection_active = False
 wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
+wyckoff_cancel_events = {}
 watchlist_lock = Lock()
-ACTIVE_JOB_STATUSES = {'queued', 'running'}
+ACTIVE_JOB_STATUSES = {'queued', 'running', 'cancelling'}
 MAX_RETAINED_TERMINAL_JOBS = 50
 
 INDEX_KLINE_TARGETS = {
@@ -123,13 +150,230 @@ INDEX_KLINE_TARGETS = {
     'sh000688': {'symbol': 'sh000688', 'name': '科创50'},
 }
 INDEX_KLINE_CACHE_TTL_SECONDS = 15 * 60
-LOG_DIR = project_root / "logs"
+LOG_DIR = platform_runtime_paths().logs_root
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
 EMERGENCY_EXIT_DELAY_SECONDS = 1.2
 UPDATE_FAILURE_MIN_COVERAGE = 0.98
 UPDATE_CACHE_REFRESH_MIN_COVERAGE = 0.98
 UPDATE_COVERAGE_GUARD_MIN_TARGETS = 100
+
+
+class _LazyDomainStore:
+    def __init__(self, domain):
+        self.domain = domain
+
+    def health(self, **kwargs):
+        return _domain_store(self.domain).health(**kwargs)
+
+    def get_sync_state(self, dataset, scope="default"):
+        return _domain_store(self.domain).get_sync_state(dataset, scope)
+
+
+ops_store = OpsStore(platform_runtime_paths().ops_store_path())
+ops_logger = EventLogger(ops_store, platform_runtime_paths().logs_root / "ops-events.jsonl")
+ops_tasks = TaskRegistry({
+    "selection": lambda: selection_jobs,
+    "update": lambda: update_jobs,
+    "diagnostic": lambda: diagnostic_jobs,
+    "wyckoff": lambda: wyckoff_jobs,
+    "domain_sync": sync_jobs_snapshot,
+})
+
+
+def _active_ops_job_ids():
+    payload = ops_tasks.snapshot(limit=500)
+    if payload.get('source_errors'):
+        raise RuntimeError('task registry snapshot incomplete')
+    return {
+        str(item.get('job_id'))
+        for item in payload.get('items', [])
+        if item.get('status') in {'queued', 'running', 'cancelling'} and item.get('job_id')
+    }
+
+
+def _ops_disk_health():
+    root = platform_runtime_paths().data_root
+    target = root if root.exists() else root.parent
+    usage = shutil.disk_usage(target)
+    free_ratio = usage.free / max(usage.total, 1)
+    status = 'critical' if free_ratio < 0.05 else ('warning' if free_ratio < 0.15 else 'ready')
+    return {
+        'status': status,
+        'total_bytes': usage.total,
+        'used_bytes': usage.used,
+        'free_bytes': usage.free,
+        'free_ratio': round(free_ratio, 4),
+    }
+
+
+def _ops_task_health():
+    payload = ops_tasks.snapshot(limit=500)
+    active = [
+        item for item in payload.get('items', [])
+        if item.get('status') in {'queued', 'running', 'cancelling'}
+    ]
+    counts = {}
+    for item in active:
+        task_type = str(item.get('task_type') or 'unknown')
+        counts[task_type] = counts.get(task_type, 0) + 1
+    exclusive_active = sum(counts.get(name, 0) for name in ('update', 'selection', 'diagnostic'))
+    domains = [str(item.get('domain')) for item in active if item.get('task_type') == 'domain_sync' and item.get('domain')]
+    conflict_detected = exclusive_active > 1 or len(domains) != len(set(domains))
+    return {
+        'status': 'warning' if conflict_detected or payload.get('source_errors') else 'ready',
+        'active_count': len(active),
+        'queue_depth': sum(item.get('status') == 'queued' for item in active),
+        'conflict_detected': conflict_detected,
+        'active_by_type': counts,
+        'source_error_count': len(payload.get('source_errors') or []),
+    }
+
+
+def _ops_a_share_cache_health():
+    data_root = _data_root_dir()
+    provider = get_active_provider_name(data_root)
+    cache = market_cache_health(data_dir=routed_active_data_dir(data_root))
+    allowed = (
+        'local_latest_date', 'local_stock_count', 'snapshot_latest_date',
+        'snapshot_stock_count', 'snapshot_updated_at', 'snapshot_stale',
+        'industry_ready', 'indices_ready', 'heatmap_payloads_ready',
+        'refresh_pending', 'market_cap_anomaly_count',
+    )
+    return {
+        'status': 'warning' if cache.get('refresh_pending') else 'ready',
+        'active_provider': provider,
+        **{key: cache.get(key) for key in allowed},
+    }
+
+
+def _ops_api_circuit_health():
+    providers = {}
+    any_open = False
+    for summary in list_provider_statuses(_data_root_dir()):
+        diagnostics = summary.get('runtime_diagnostics') or {}
+        policy = diagnostics.get('network_policy') or {}
+        evidence = None
+        circuit_open = None
+        if isinstance(policy.get('network_circuit_open'), bool):
+            circuit_open = policy.get('network_circuit_open')
+            evidence = 'network_policy.network_circuit_open'
+        elif isinstance(diagnostics.get('tencent_fallback_blocked'), bool):
+            circuit_open = diagnostics.get('tencent_fallback_blocked')
+            evidence = 'runtime_diagnostics.tencent_fallback_blocked'
+        state = 'unknown' if circuit_open is None else ('open' if circuit_open else 'closed')
+        any_open = any_open or state == 'open'
+        providers[str(summary.get('provider'))] = {
+            'state': state,
+            'evidence': evidence,
+            'updated_at': summary.get('updated_at'),
+            'consecutive_failures': policy.get('network_consecutive_failures'),
+            'window_samples': policy.get('network_window_samples'),
+        }
+    return {'status': 'warning' if any_open else 'ready', 'providers': providers}
+
+
+ops_health = HealthService(
+    stores={name: _LazyDomainStore(name) for name in ("hong_kong", "futures", "macro", "industry")},
+    datasets={
+        "hk_daily": {"store": "hong_kong", "frequency": "daily"},
+        "fut_daily": {"store": "futures", "frequency": "daily"},
+        "cn_gdp": {"store": "macro", "frequency": "quarterly"},
+        "cn_cpi": {"store": "macro", "frequency": "monthly"},
+        "cn_ppi": {"store": "macro", "frequency": "monthly"},
+        "cn_pmi": {"store": "macro", "frequency": "monthly"},
+        "index_classify": {"store": "industry", "frequency": "irregular"},
+    },
+    checks={
+        'disk': _ops_disk_health,
+        'tasks': _ops_task_health,
+        'a_share_cache': _ops_a_share_cache_health,
+        'api_circuits': _ops_api_circuit_health,
+    },
+)
+ops_performance = PerformanceRecorder()
+ops_performance.register_gauge(
+    'retained_task_count',
+    lambda: ops_tasks.snapshot(limit=500).get('total', 0),
+)
+ops_performance.register_gauge(
+    'retained_event_count',
+    lambda: ops_store.query(limit=1).get('total', 0),
+)
+ops_performance.mark_unavailable(
+    'cache_hit_rate',
+    'no generic cache observer',
+)
+configure_store_performance_observer(
+    lambda metric, value, labels: ops_performance.record(metric, value, labels=labels)
+)
+ops_retention = OpsRetentionMaintenance(
+    ops_store,
+    active_job_ids=_active_ops_job_ids,
+    policy=RetentionPolicy(task_days=30, performance_days=7),
+    interval_seconds=3600,
+)
+
+
+def _record_domain_sync_event(job_id, domain, event):
+    phase = str(event.get('phase') or 'sync')
+    status = str(event.get('status') or 'running')
+    if phase not in {'preflight', 'quality', 'terminal'} and status not in {
+        'warning', 'failed', 'error', 'cancelled', 'completed_with_warnings'
+    }:
+        return
+    severity = 'error' if status in {'failed', 'error'} else (
+        'warning' if status in {'warning', 'cancelled', 'completed_with_warnings'} else 'info'
+    )
+    ops_logger.emit(
+        message=str(event.get('message') or f'{domain} sync {phase} {status}'),
+        severity=severity,
+        event_type='domain_sync',
+        module='market_data.sync_engine',
+        job_id=str(job_id),
+        domain=domain,
+        market='hong_kong' if domain == 'hong_kong' else None,
+        dataset=event.get('dataset') or event.get('dataset_id'),
+        error_code=event.get('error_code'),
+        details=event,
+    )
+    rows_written = event.get('rows_written')
+    if rows_written is not None:
+        try:
+            ops_performance.record(
+                'domain_sync_rows_written',
+                rows_written,
+                labels={'domain': domain, 'status': status},
+            )
+        except (TypeError, ValueError):
+            pass
+
+
+configure_sync_event_observer(_record_domain_sync_event)
+ops_diagnostics = DiagnosticExporter(
+    output_dir=platform_runtime_paths().logs_root / "diagnostics",
+    tasks=ops_tasks,
+    events=ops_store,
+    health=ops_health,
+    performance=ops_performance,
+)
+app.register_blueprint(create_ops_blueprint(
+    OpsServiceContainer(
+        tasks=ops_tasks,
+        events=ops_store,
+        health=ops_health,
+        performance=ops_performance,
+        diagnostics=ops_diagnostics,
+        task_cancellers={
+            'selection': lambda job_id: cancel_selection_job(job_id),
+            'update': lambda job_id: cancel_update_job(job_id),
+            'diagnostic': lambda job_id: cancel_diagnostic_job(job_id),
+            'wyckoff': lambda job_id: cancel_wyckoff_job(job_id),
+            'domain_sync': lambda job_id: cancel_domain_sync_job(job_id),
+        },
+    ),
+    session_token=WEB_SESSION_TOKEN,
+))
 
 
 def _reload_registry():
@@ -791,28 +1035,61 @@ def _watchlist_path():
     return _data_root_dir() / 'watchlist.json'
 
 
-def _load_watchlist():
-    path = _watchlist_path()
-    if not path.exists():
-        return {'items': {}}
-    try:
-        with open(path, 'r', encoding='utf-8') as file:
-            payload = json.load(file) or {}
-        items = payload.get('items') if isinstance(payload, dict) else {}
-        if not isinstance(items, dict):
-            items = {}
-        return {'items': items}
-    except Exception:
-        return {'items': {}}
+def _market_watchlist_store():
+    return MarketWatchlistStore(_watchlist_path())
 
 
-def _save_watchlist(payload):
-    path = _watchlist_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix('.json.tmp')
-    with open(temp_path, 'w', encoding='utf-8') as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
-    temp_path.replace(path)
+def _market_watchlist_rows(market, service=None):
+    rows = _market_watchlist_store().list_all(market)
+    if market == 'a_share':
+        stock_names = _load_stock_names()
+        enriched = []
+        for item in rows:
+            code = CSVManager.validate_stock_code(item['code'])
+            row = _stock_table_row(code, stock_names)
+            row.update(item)
+            row['market'] = 'a_share'
+            row['symbol'] = canonical_equity_symbol('a_share', code)
+            enriched.append(row)
+        return enriched
+
+    enriched = []
+    for item in rows:
+        current = {}
+        if service is not None:
+            page = service.search(item['symbol'], 1, 0)
+            current = dict((page.get('items') or [{}])[0])
+        enriched.append({**current, **item, 'market': market, 'currency': 'HKD'})
+    return enriched
+
+
+def _update_market_watchlist(market, payload, service=None):
+    action = str(payload.get('action') or 'upsert').strip().lower()
+    query = _bounded_text(
+        payload.get('symbol') or payload.get('query') or payload.get('code'),
+        '股票查询',
+        max_length=80,
+    )
+    if not query:
+        raise ValueError('请输入股票代码或名称')
+    if market == 'hong_kong':
+        page = service.search(query, 1, 0) if service is not None else {'items': []}
+        match = dict((page.get('items') or [{}])[0])
+        symbol = canonical_equity_symbol('hong_kong', match.get('symbol') or query)
+        name = match.get('name') or symbol
+    else:
+        match = resolve_stock_query(query, data_dir=str(_active_data_dir()))
+        if not match:
+            raise ValueError(f'未找到匹配股票: {query}')
+        symbol = canonical_equity_symbol('a_share', match['code'])
+        name = match.get('name') or fallback_stock_name(match['code'])
+    store = _market_watchlist_store()
+    if action == 'remove':
+        return {'removed': store.remove(market, symbol), 'market': market, 'symbol': symbol}
+    if action not in {'add', 'upsert', 'update'}:
+        raise ValueError('watchlist action 必须为 upsert 或 remove')
+    note = _bounded_text(payload.get('note'), '备注', max_length=200)
+    return store.add(market, symbol, name=name, note=note, metadata=match)
 
 
 def _stock_display_name(code, stock_names):
@@ -999,6 +1276,60 @@ def _job_timestamp():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _record_ops_task_event(task_type, job_id, job, *, message=None):
+    logger = globals().get('ops_logger')
+    performance = globals().get('ops_performance')
+    if logger is None or not isinstance(job, dict):
+        return
+    status = str(job.get('status') or 'unknown')
+    severity = 'error' if status in {'failed', 'error', 'halted'} else (
+        'warning' if status in {'cancelled', 'completed_with_warnings'} else 'info'
+    )
+    event_message = message or f'{task_type} task {status}'
+    current_stock = job.get('current_stock')
+    symbol = job.get('symbol')
+    if not symbol and isinstance(current_stock, dict):
+        symbol = current_stock.get('code')
+    try:
+        logger.emit(
+            message=event_message,
+            severity=severity,
+            event_type='task',
+            module='web_server',
+            job_id=str(job_id),
+            domain=job.get('domain'),
+            market=job.get('market'),
+            dataset=job.get('dataset'),
+            symbol=symbol,
+            error_code=job.get('error_code'),
+            details={
+                'task_type': task_type,
+                'status': status,
+                'progress_pct': job.get('progress_pct'),
+                'provider': job.get('provider'),
+                'error': job.get('error'),
+            },
+        )
+    except Exception:
+        pass
+    if performance is not None:
+        try:
+            if job.get('elapsed_seconds') is not None:
+                performance.record(
+                    'task_elapsed_seconds',
+                    job.get('elapsed_seconds') or 0,
+                    labels={'task_type': task_type, 'status': status},
+                )
+            if job.get('progress_pct') is not None:
+                performance.record(
+                    'task_progress_pct',
+                    job.get('progress_pct') or 0,
+                    labels={'task_type': task_type},
+                )
+        except (TypeError, ValueError):
+            pass
+
+
 def _elapsed_seconds(job):
     started_at = job.get('started_at_monotonic')
     if started_at is None:
@@ -1021,10 +1352,14 @@ def _update_job(job_id, **updates):
         job = selection_jobs.get(job_id)
         if not job:
             return None
+        previous_status = job.get('status')
         job.update(updates)
         job['updated_at'] = _job_timestamp()
         job['elapsed_seconds'] = _elapsed_seconds(job)
-        return job
+        snapshot = dict(job)
+    if snapshot.get('status') != previous_status:
+        _record_ops_task_event('selection', job_id, snapshot)
+    return job
 
 
 def _append_job_log_by_id(job_id, message):
@@ -1035,7 +1370,9 @@ def _append_job_log_by_id(job_id, message):
         _append_job_log(job, message)
         job['updated_at'] = _job_timestamp()
         job['elapsed_seconds'] = _elapsed_seconds(job)
-        return job
+        snapshot = dict(job)
+    _record_ops_task_event('selection', job_id, snapshot, message=message)
+    return job
 
 
 def _serialize_job(job):
@@ -1091,10 +1428,14 @@ def _update_update_job(job_id, **updates):
         job = update_jobs.get(job_id)
         if not job:
             return None
+        previous_status = job.get('status')
         job.update(updates)
         job['updated_at'] = _job_timestamp()
         job['elapsed_seconds'] = _elapsed_seconds(job)
-        return job
+        snapshot = dict(job)
+    if snapshot.get('status') != previous_status:
+        _record_ops_task_event('update', job_id, snapshot)
+    return job
 
 
 def _append_update_job_log(job_id, message):
@@ -1105,7 +1446,9 @@ def _append_update_job_log(job_id, message):
         _append_job_log(job, message)
         job['updated_at'] = _job_timestamp()
         job['elapsed_seconds'] = _elapsed_seconds(job)
-        return job
+        snapshot = dict(job)
+    _record_ops_task_event('update', job_id, snapshot, message=message)
+    return job
 
 
 def _find_running_update_job():
@@ -1200,6 +1543,7 @@ def _create_diagnostic_job(update_job, mode):
     diagnostic_id = uuid.uuid4().hex[:12]
     now = _job_timestamp()
     job = {
+        'job_id': diagnostic_id,
         'diagnostic_id': diagnostic_id,
         'update_job_id': update_job.get('job_id'),
         'status': 'queued',
@@ -1217,7 +1561,11 @@ def _create_diagnostic_job(update_job, mode):
     }
     with diagnostic_jobs_lock:
         diagnostic_jobs[diagnostic_id] = job
-        _prune_terminal_jobs(diagnostic_jobs)
+        diagnostic_cancel_events[diagnostic_id] = Event()
+        _prune_terminal_jobs(
+            diagnostic_jobs,
+            cleanup_callback=lambda removed_id: diagnostic_cancel_events.pop(removed_id, None),
+        )
     return diagnostic_id
 
 
@@ -1233,16 +1581,25 @@ def _update_diagnostic_job(diagnostic_id, **updates):
 
 
 def _run_update_diagnostic_job(diagnostic_id, report_path, mode, temporary_token):
+    with diagnostic_jobs_lock:
+        cancel_event = diagnostic_cancel_events.get(diagnostic_id)
+
+    def ensure_diagnostic_continues():
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError('diagnostic cancelled')
+
     def progress(payload):
+        ensure_diagnostic_continues()
         _update_diagnostic_job(diagnostic_id, **payload)
 
-    _update_diagnostic_job(
-        diagnostic_id,
-        status='running',
-        current_step='启动数据更新自检',
-        started_at=_job_timestamp(),
-    )
     try:
+        ensure_diagnostic_continues()
+        _update_diagnostic_job(
+            diagnostic_id,
+            status='running',
+            current_step='启动数据更新自检',
+            started_at=_job_timestamp(),
+        )
         result = run_update_diagnostics(
             report_path,
             mode=mode,
@@ -1251,12 +1608,20 @@ def _run_update_diagnostic_job(diagnostic_id, report_path, mode, temporary_token
             progress_callback=progress,
             trigger='web',
         )
+        ensure_diagnostic_continues()
         _update_diagnostic_job(
             diagnostic_id,
             status='completed',
             current_step='自检完成',
             summary=result.get('primary_diagnosis'),
             result_status=result.get('status'),
+            finished_at=_job_timestamp(),
+        )
+    except InterruptedError:
+        _update_diagnostic_job(
+            diagnostic_id,
+            status='cancelled',
+            current_step='自检已停止',
             finished_at=_job_timestamp(),
         )
     except Exception as exc:
@@ -1304,12 +1669,18 @@ def _create_selection_job(requested_boards, requested_strategies, formula_spec=N
     _append_job_log(job, '任务已创建，等待执行。')
     with selection_jobs_lock:
         selection_jobs[job_id] = job
-        _prune_terminal_jobs(selection_jobs)
+        selection_cancel_events[job_id] = Event()
+        _prune_terminal_jobs(
+            selection_jobs,
+            cleanup_callback=lambda removed_id: selection_cancel_events.pop(removed_id, None),
+        )
     return job_id
 
 
 @app.before_request
 def block_requests_after_halt():
+    if request.path.startswith('/api/'):
+        g.ops_request_started_at = time.perf_counter()
     if request.path.startswith('/api/') and request.method not in {'GET', 'HEAD', 'OPTIONS'}:
         token_error = _require_session_token()
         if token_error:
@@ -1334,8 +1705,63 @@ def block_requests_after_halt():
     return None
 
 
-def _run_selection_job(job_id, requested_boards, requested_strategies, formula_spec=None):
+@app.after_request
+def record_api_performance(response):
+    started_at = getattr(g, 'ops_request_started_at', None)
+    if started_at is None or not request.path.startswith('/api/'):
+        return response
     try:
+        route = str(request.url_rule.rule if request.url_rule is not None else 'unmatched')[:80]
+        labels = {
+            'method': request.method,
+            'route': route,
+            'status': f'{int(response.status_code) // 100}xx',
+        }
+        ops_performance.record('api_call_count', 1, labels=labels)
+        ops_performance.record(
+            'api_latency_ms',
+            max(0.0, (time.perf_counter() - started_at) * 1000),
+            labels=labels,
+        )
+        payload_size = response.calculate_content_length()
+        if payload_size is not None:
+            ops_performance.record('response_payload_bytes', payload_size, labels=labels)
+    except (TypeError, ValueError):
+        pass
+    return response
+
+
+@app.before_request
+def maintain_ops_retention():
+    """Best-effort hourly retention; active task events remain protected."""
+    try:
+        ops_retention.run_if_due()
+    except Exception:
+        # Operations maintenance must never make an application request fail.
+        pass
+    return None
+
+
+def _run_selection_job(job_id, requested_boards, requested_strategies, formula_spec=None):
+    with selection_jobs_lock:
+        cancel_event = selection_cancel_events.get(job_id)
+
+    def is_cancelled():
+        return bool(cancel_event and cancel_event.is_set())
+
+    def finish_cancelled():
+        _update_job(
+            job_id,
+            status='cancelled',
+            current_stock=None,
+            error=None,
+        )
+        _append_job_log_by_id(job_id, '用户请求停止此次选股；任务已安全结束。')
+
+    try:
+        if is_cancelled():
+            finish_cancelled()
+            return
         _update_job(
             job_id,
             status='running',
@@ -1354,6 +1780,9 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
         candidates = []
         invalid_name_count = 0
         for code in stock_codes:
+            if is_cancelled():
+                finish_cancelled()
+                return
             name = _stock_display_name(code, stock_names)
             if _is_invalid_stock_name(name):
                 invalid_name_count += 1
@@ -1441,6 +1870,10 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                     for chunk in candidate_chunks
                 ]
                 for future in as_completed(futures):
+                    if is_cancelled():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        finish_cancelled()
+                        return
                     if _is_halted():
                         executor.shutdown(wait=False, cancel_futures=True)
                         _update_job(job_id, status='halted', error='系统已急停')
@@ -1455,6 +1888,9 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                 runtime_strategy_params,
             )
             for chunk in candidate_chunks:
+                if is_cancelled():
+                    finish_cancelled()
+                    return
                 if _is_halted():
                     _update_job(job_id, status='halted', error='系统已急停')
                     _append_job_log_by_id(job_id, '任务因系统急停而终止。')
@@ -1463,6 +1899,10 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
 
         for strategy_name in results:
             results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
+
+        if is_cancelled():
+            finish_cancelled()
+            return
 
         result_time = _job_timestamp()
         report_meta = {
@@ -2666,11 +3106,17 @@ def _update_wyckoff_job(job_id, **updates):
         job = wyckoff_jobs.get(job_id)
         if not job:
             return
+        previous_status = job.get('status')
         job.update(updates)
         job['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        snapshot = dict(job)
+    if snapshot.get('status') != previous_status:
+        _record_ops_task_event('wyckoff', job_id, snapshot)
 
 
-def _run_wyckoff_job(job_id, query):
+def _run_wyckoff_job(job_id, query, market='a_share', reader=None):
+    with wyckoff_jobs_lock:
+        cancel_event = wyckoff_cancel_events.get(job_id)
     try:
         _update_wyckoff_job(
             job_id,
@@ -2681,16 +3127,21 @@ def _run_wyckoff_job(job_id, query):
         )
 
         def ensure_wyckoff_continues():
-            if _is_halted():
+            cancelled = bool(cancel_event and cancel_event.is_set())
+            if _is_halted() or cancelled:
+                halted = _is_halted()
                 _update_wyckoff_job(
                     job_id,
                     status='cancelled',
-                    current_step='系统已急停',
-                    message='系统已急停，威科夫分析已停止。',
+                    current_step='系统已急停' if halted else '分析已停止',
+                    message=(
+                        '系统已急停，威科夫分析已停止。'
+                        if halted else '用户请求停止此次威科夫分析；任务已安全结束。'
+                    ),
                     progress_pct=0,
-                    error='系统已急停',
+                    error='系统已急停' if halted else None,
                 )
-                raise InterruptedError('系统已急停')
+                raise InterruptedError('系统已急停' if halted else 'Wyckoff cancelled')
 
         ensure_wyckoff_continues()
 
@@ -2710,6 +3161,8 @@ def _run_wyckoff_job(job_id, query):
             config=config,
             data_dir=data_dir,
             output_dir=_wyckoff_outputs_root(),
+            market=market,
+            reader=reader,
         )
         result = pipeline.analyze_stock(query, progress_callback=progress_callback)
         ensure_wyckoff_continues()
@@ -2756,6 +3209,57 @@ def _run_wyckoff_job(job_id, query):
         )
 
 
+def _start_market_wyckoff_job(market, query, reader=None):
+    market_id = str(market or '').strip()
+    if market_id not in {'a_share', 'hong_kong'}:
+        raise ValueError(f'不支持的股票市场: {market_id}')
+    if market_id == 'hong_kong' and reader is None:
+        raise ValueError('港股威科夫分析必须使用显式 Hong Kong reader')
+    raw_query = str(query or '').strip()
+    if not raw_query:
+        raise ValueError('请输入股票代码、名称或拼音')
+    if market_id == 'hong_kong':
+        symbol = canonical_equity_symbol(market_id, raw_query)
+        job_query = symbol
+    else:
+        job_query = raw_query
+        try:
+            symbol = canonical_equity_symbol(market_id, raw_query)
+        except ValueError:
+            symbol = raw_query
+    job_id = str(uuid.uuid4())
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    job = {
+        'job_id': job_id,
+        'query': job_query,
+        'symbol': symbol,
+        'market': market_id,
+        'currency': 'HKD' if market_id == 'hong_kong' else 'CNY',
+        'status': 'queued',
+        'current_step': '排队',
+        'message': '威科夫任务已进入队列。',
+        'progress_pct': 0,
+        'created_at': now,
+        'updated_at': now,
+        'result': None,
+        'error': None,
+    }
+    with wyckoff_jobs_lock:
+        wyckoff_jobs[job_id] = job
+        wyckoff_cancel_events[job_id] = Event()
+        _prune_terminal_jobs(
+            wyckoff_jobs,
+            cleanup_callback=lambda removed_id: wyckoff_cancel_events.pop(removed_id, None),
+        )
+    thread = Thread(
+        target=_run_wyckoff_job,
+        args=(job_id, job_query, market_id, reader),
+        daemon=True,
+    )
+    thread.start()
+    return dict(job)
+
+
 @app.route('/api/wyckoff/start', methods=['POST'])
 def start_wyckoff_stock():
     """Start a single-stock Wyckoff AI analysis job."""
@@ -2768,25 +3272,8 @@ def start_wyckoff_stock():
         if not query:
             return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音'}), 400
 
-        job_id = str(uuid.uuid4())
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with wyckoff_jobs_lock:
-            wyckoff_jobs[job_id] = {
-                'job_id': job_id,
-                'query': query,
-                'status': 'queued',
-                'current_step': '排队',
-                'message': '威科夫任务已进入队列。',
-                'progress_pct': 0,
-                'created_at': now,
-                'updated_at': now,
-                'result': None,
-                'error': None,
-            }
-            _prune_terminal_jobs(wyckoff_jobs)
-        thread = Thread(target=_run_wyckoff_job, args=(job_id, query), daemon=True)
-        thread.start()
-        return jsonify({'success': True, 'job_id': job_id, 'data': wyckoff_jobs[job_id]})
+        job = _start_market_wyckoff_job('a_share', query)
+        return jsonify({'success': True, 'job_id': job['job_id'], 'data': job})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -3711,6 +4198,86 @@ def get_update_diagnostic_status(diagnostic_id):
         return jsonify({'success': True, 'data': _serialize_job(job)})
 
 
+def _request_job_cancel(task_type, job_id, jobs, cancel_events, lock, current_step):
+    with lock:
+        job = jobs.get(job_id)
+        if not job:
+            return None, False
+        status = str(job.get('status') or '').lower()
+        if status not in ACTIVE_JOB_STATUSES:
+            return _serialize_job(job), False
+        cancel_event = cancel_events.get(job_id)
+        if cancel_event is None:
+            cancel_event = Event()
+            cancel_events[job_id] = cancel_event
+        cancel_event.set()
+        job['status'] = 'cancelling'
+        job['cancel_requested'] = True
+        job['current_step'] = current_step
+        job['updated_at'] = _job_timestamp()
+        job['elapsed_seconds'] = _elapsed_seconds(job)
+        snapshot = dict(job)
+    _record_ops_task_event(task_type, job_id, snapshot, message=f'{task_type} cancellation requested')
+    return _serialize_job(snapshot), True
+
+
+@app.route('/api/select/cancel/<job_id>', methods=['POST'])
+def cancel_selection_job(job_id):
+    try:
+        job_id = _validate_job_id(job_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    job, requested = _request_job_cancel(
+        'selection', job_id, selection_jobs, selection_cancel_events,
+        selection_jobs_lock, '正在停止此次选股',
+    )
+    if job is None:
+        return jsonify({'success': False, 'error': '任务不存在'}), 404
+    return jsonify({
+        'success': True,
+        'message': '停止请求已提交。' if requested else '任务已结束。',
+        'data': job,
+    })
+
+
+@app.route('/api/update/diagnostics/cancel/<diagnostic_id>', methods=['POST'])
+def cancel_diagnostic_job(diagnostic_id):
+    try:
+        diagnostic_id = _validate_job_id(diagnostic_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    job, requested = _request_job_cancel(
+        'diagnostic', diagnostic_id, diagnostic_jobs, diagnostic_cancel_events,
+        diagnostic_jobs_lock, '正在停止此次自检',
+    )
+    if job is None:
+        return jsonify({'success': False, 'error': '自检任务不存在'}), 404
+    return jsonify({
+        'success': True,
+        'message': '停止请求已提交。' if requested else '任务已结束。',
+        'data': job,
+    })
+
+
+@app.route('/api/wyckoff/cancel/<job_id>', methods=['POST'])
+def cancel_wyckoff_job(job_id):
+    try:
+        job_id = _validate_job_id(job_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    job, requested = _request_job_cancel(
+        'wyckoff', job_id, wyckoff_jobs, wyckoff_cancel_events,
+        wyckoff_jobs_lock, '正在停止此次分析',
+    )
+    if job is None:
+        return jsonify({'success': False, 'error': '威科夫任务不存在'}), 404
+    return jsonify({
+        'success': True,
+        'message': '停止请求已提交。' if requested else '任务已结束。',
+        'data': job,
+    })
+
+
 @app.route('/api/update/cancel/<job_id>', methods=['POST'])
 def cancel_update_job(job_id):
     """停止单个更新任务，不触发全局急停并保留任务日志。"""
@@ -3760,32 +4327,8 @@ def cancel_update_job(job_id):
 def get_watchlist():
     """获取自选股列表。"""
     try:
-        stock_names = _load_stock_names()
         with watchlist_lock:
-            payload = _load_watchlist()
-            items = payload.get('items', {})
-
-        rows = []
-        changed = False
-        for code, meta in sorted(items.items(), key=lambda entry: entry[1].get('created_at', '')):
-            try:
-                code = CSVManager.validate_stock_code(code)
-            except ValueError:
-                continue
-            row = _stock_table_row(code, stock_names)
-            stored_name = str(meta.get('name') or '').strip()
-            if row.get('name') and (not stored_name or _is_fallback_stock_name(code, stored_name)):
-                meta['name'] = row['name']
-                meta['updated_at'] = meta.get('updated_at') or _job_timestamp()
-                changed = True
-            row.update({
-                'note': str(meta.get('note') or ''),
-                'created_at': meta.get('created_at'),
-                'updated_at': meta.get('updated_at'),
-            })
-            rows.append(row)
-        if changed:
-            _save_watchlist(payload)
+            rows = _market_watchlist_rows('a_share')
 
         return jsonify({'success': True, 'data': rows})
     except Exception as e:
@@ -3805,33 +4348,15 @@ def add_watchlist_item():
         if not query:
             return jsonify({'success': False, 'error': '请输入股票代码、名称或拼音首字母'}), 400
 
-        data_dir = str(_active_data_dir())
-        match = resolve_stock_query(query, data_dir=data_dir)
-        if not match:
-            return jsonify({'success': False, 'error': f'未找到匹配股票: {query}'}), 404
-
-        code = CSVManager.validate_stock_code(match['code'])
-        now = _job_timestamp()
         with watchlist_lock:
-            watchlist = _load_watchlist()
-            items = watchlist.setdefault('items', {})
-            existing = items.get(code, {})
-            items[code] = {
-                'code': code,
-                'name': match.get('name') or fallback_stock_name(code),
-                'note': note if note else existing.get('note', ''),
-                'created_at': existing.get('created_at') or now,
-                'updated_at': now,
-            }
-            _save_watchlist(watchlist)
-
-        stock_names = _load_stock_names()
-        row = _stock_table_row(code, stock_names)
-        row.update({
-            'note': items[code].get('note', ''),
-            'created_at': items[code].get('created_at'),
-            'updated_at': items[code].get('updated_at'),
-        })
+            item = _update_market_watchlist(
+                'a_share', {'query': query, 'note': note}
+            )
+            row = next(
+                current
+                for current in _market_watchlist_rows('a_share')
+                if current['symbol'] == item['symbol']
+            )
         return jsonify({'success': True, 'data': row})
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -3864,12 +4389,9 @@ def remove_watchlist_items():
 
         removed_codes = []
         with watchlist_lock:
-            watchlist = _load_watchlist()
-            items = watchlist.setdefault('items', {})
             for code in codes:
-                if items.pop(code, None) is not None:
+                if _market_watchlist_store().remove('a_share', code):
                     removed_codes.append(code)
-            _save_watchlist(watchlist)
 
         return jsonify({
             'success': True,
@@ -3889,12 +4411,10 @@ def remove_watchlist_item(code):
 
         code = CSVManager.validate_stock_code(code)
         with watchlist_lock:
-            watchlist = _load_watchlist()
-            removed = watchlist.setdefault('items', {}).pop(code, None)
-            _save_watchlist(watchlist)
+            removed = _market_watchlist_store().remove('a_share', code)
         return jsonify({
             'success': True,
-            'removed': bool(removed),
+            'removed': removed,
             'code': code,
         })
     except Exception as e:
@@ -4043,6 +4563,124 @@ def system_shutdown():
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'message': '系统正在退出，Web 服务进程即将关闭'
     })
+
+
+def _response_payload(result):
+    response = result[0] if isinstance(result, tuple) else result
+    payload = response.get_json() if hasattr(response, 'get_json') else response
+    if not isinstance(payload, dict):
+        raise ValueError('invalid legacy API response')
+    if payload.get('success') is False:
+        raise ValueError(payload.get('error') or 'legacy API failed')
+    return payload.get('data', payload)
+
+
+class _AShareEquityWebAdapter:
+    @staticmethod
+    def overview():
+        return _response_payload(get_stats())
+
+    @staticmethod
+    def list_instruments(query='', limit=50, offset=0):
+        names = _load_stock_names()
+        needle = str(query or '').strip().casefold()
+        items = []
+        for code in _active_csv_manager().list_all_stocks():
+            name = _stock_display_name(code, names)
+            if needle and needle not in code.casefold() and needle not in name.casefold():
+                continue
+            suffix = 'SH' if code.startswith('6') else ('BJ' if code.startswith(('4', '8')) else 'SZ')
+            items.append({'symbol': f'{code}.{suffix}', 'code': code, 'name': name, 'currency': 'CNY'})
+        items.sort(key=lambda item: item['code'])
+        return {'items': items[offset:offset + limit], 'total': len(items), 'limit': limit, 'offset': offset}
+
+    @staticmethod
+    def instrument_detail(symbol, *, limit=260, adjustment='raw'):
+        code = str(symbol).split('.', 1)[0]
+        payload = _response_payload(get_stock_detail(code))
+        payload['currency'] = 'CNY'
+        return payload
+
+    @staticmethod
+    def heatmap():
+        return _response_payload(get_heatmap())
+
+    @staticmethod
+    def selection_options():
+        return {
+            'strategies': [
+                {'name': name, 'scope': 'a_share_only'}
+                for name in registry.strategies
+                if name != FORMULA_STRATEGY_NAME
+            ]
+        }
+
+    @staticmethod
+    def watchlist():
+        with watchlist_lock:
+            return {'items': _market_watchlist_rows('a_share')}
+
+    @staticmethod
+    def update_watchlist(payload):
+        with watchlist_lock:
+            return _update_market_watchlist('a_share', payload)
+
+
+class _HongKongEquityWebAdapter:
+    @property
+    def service(self):
+        return domain_service('hong_kong')
+
+    def overview(self):
+        return self.service.overview()
+
+    def list_instruments(self, query='', limit=50, offset=0):
+        return self.service.search(query, limit, offset)
+
+    def instrument_detail(self, symbol, *, limit=260, adjustment='raw'):
+        page = self.service.search(symbol, 1, 0)
+        return {
+            'instrument': (page.get('items') or [{}])[0],
+            'kline': self.service.kline(symbol, limit, adjustment),
+            'finance': self.service.finance(symbol),
+        }
+
+    def heatmap(self):
+        return self.service.heatmap()
+
+    @staticmethod
+    def selection_options():
+        return {'strategies': [], 'warning': '港股策略需显式声明 hong_kong 或 market_neutral scope'}
+
+    def watchlist(self):
+        with watchlist_lock:
+            return {'items': _market_watchlist_rows('hong_kong', self.service)}
+
+    def update_watchlist(self, payload):
+        with watchlist_lock:
+            return _update_market_watchlist('hong_kong', payload, self.service)
+
+    def start_wyckoff(self, payload):
+        query = payload.get('symbol') or payload.get('query')
+        symbol = canonical_equity_symbol('hong_kong', query)
+        job = _start_market_wyckoff_job(
+            'hong_kong', symbol, HongKongEquityReader(self.service)
+        )
+        return {**job, 'market': 'hong_kong', 'symbol': symbol, 'currency': 'HKD'}
+
+    @staticmethod
+    def wyckoff_status(job_id):
+        with wyckoff_jobs_lock:
+            job = dict(wyckoff_jobs.get(job_id) or {})
+        if not job or job.get('market') != 'hong_kong':
+            raise KeyError('港股威科夫任务不存在或已过期')
+        return job
+
+
+app.register_blueprint(create_equities_blueprint(services={
+    'a_share': _AShareEquityWebAdapter(),
+    'hong_kong': _HongKongEquityWebAdapter(),
+}))
 
 
 def run_web_server(host=None, port=None, debug=False, config=None, auto_port=None):

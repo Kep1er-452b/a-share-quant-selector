@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `4c0709b`
-  (`Document K-line preferences and margin fix design`, 2026-07-11).
+  `a45a43f`
+  (`Persist K-line preferences and fix indicator context`, 2026-07-11).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -69,6 +69,9 @@ Its major capabilities are:
   `scripts/build_quant_core.py`.
 - Desktop wrapper/build: pywebview, `launch_desktop_app.py`,
   `build_macos_app.py`.
+- Cross-platform writable locations use `platformdirs`; source mode retains the
+  repository-local warehouses while packaged macOS/Windows builds use the
+  user's application-data directory.
 - AI analysis: DeepSeek-compatible OpenAI client under `wyckoff_ai/`.
 
 Dependency declarations live in `requirements.txt`. Local secrets belong in
@@ -85,6 +88,13 @@ environment variables or ignored local config files, never in committed docs.
 - `utils/provider_router.py`: provider warehouse paths and active-provider state.
 - `utils/csv_manager.py`: validated, locked, atomic CSV reads and writes.
 - `utils/runtime_paths.py`: repository-external selection and Wyckoff output paths.
+- `utils/platform_paths.py`: source/package-aware data, log, output, and WebView
+  roots for macOS and Windows, with environment-variable overrides.
+- `market_data/`: independent Hong Kong, futures, macro, and industry catalogs,
+  SQLite stores, read models, capabilities, Tushare client, and sync engine.
+- `web_api/`: market-explicit equity, domain-data, and operations blueprints.
+- `ops/`: structured events, bounded task registry, health, performance, and
+  sanitized diagnostic exports.
 - `utils/technical.py`: Tongdaxin-style indicators and shared feature preparation.
 - `utils/market_overview.py`: snapshots, heatmap data, cache health and rebuilds.
 - `utils/tushare_ext_store.py`: SQLite repository for the Tushare extension
@@ -99,6 +109,10 @@ environment variables or ignored local config files, never in committed docs.
   trading summaries.
 - `web/templates/index.html`: application shell.
 - `web/static/js/app.js`: frontend state and all page interactions.
+- `web/static/js/market_context.js` and `equity_router.js`: versioned A-share /
+  Hong Kong context plus market-explicit instrument deep links.
+- `web/static/js/*_workspace.js`: independent futures, macro, industry, and
+  system workspace controllers with abortable lifecycles.
 - `web/static/css/style.css`: frontend styling.
 
 CLI commands currently include:
@@ -196,6 +210,26 @@ Critical rules:
   the source trading datasets and visible market-turnover inputs; keep this
   cache out of its own source signature.
 
+### Independent Domain Warehouses
+
+- Hong Kong, futures, macro, and industry data use separate SQLite files under
+  the runtime data root's `domains/` directory. They must not be merged into
+  the A-share provider CSV warehouse or the Tushare extension database.
+- `market_data.store.DomainStore` owns versioned schema checks, WAL mode,
+  indexed row/state access, JSON composite keys, and lightweight/deep health.
+- `market_data.sync_engine.SyncEngine` runs explicit preflight, plan, fetch,
+  normalize, write, cache-refresh, quality, and terminal stages. Optional
+  permission failures become warnings; core failures remain terminal.
+- Domain sync requests and query limits are bounded. Completed Web sync jobs
+  retain only the newest terminal entries, while active jobs remain preserved.
+- Tushare tokens are resolved in memory from `TUSHARE_TOKEN` or ignored local
+  configuration. Never call global `tushare.set_token()` or serialize a token
+  into diagnostics, task state, package resources, or API responses.
+- A-share and Hong Kong capabilities and policy filters are explicitly
+  registered. A-share price-limit/ST/board/listing rules must never run under
+  the Hong Kong context; reusable technical calculations require an explicit
+  market-neutral declaration.
+
 ## 7. Strategy Architecture
 
 - Strategies inherit `strategy.base_strategy.BaseStrategy`.
@@ -243,8 +277,15 @@ Do not hardcode a second independent grouping table in the frontend.
 ## 9. Web Architecture And Safety
 
 - The frontend is a single-page vanilla JavaScript application.
-- Pages include dashboard, heatmap, stocks, selection, strategies, watchlist,
-  and Wyckoff analysis.
+- Equity pages include dashboard, heatmap, stocks, selection, strategies,
+  watchlist, and Wyckoff analysis, all driven by the active A-share/Hong Kong
+  market context. Futures, macro, industry, and system operations are separate
+  top-level workspaces and hash-addressable routes.
+- Industry members and financial highlights use market-explicit instrument
+  deep links. A Hong Kong capability that is not implemented must show an
+  explicit unavailable state and must never fall back to an A-share endpoint.
+- Domain workspace controllers must abort requests and release listeners,
+  timers, and chart instances on deactivation.
 - Side-effect APIs must use appropriate HTTP methods and session-token checks.
 - Validate payload shape, bounded string lengths, stock codes, job IDs, strategy
   names, and file paths at API boundaries.
@@ -259,12 +300,18 @@ Do not hardcode a second independent grouping table in the frontend.
 ## 10. Configuration And Secrets
 
 - Committed templates:
-  `config/config.yaml.template`, `config/github.yaml.template`.
+  `config/config.yaml.template`, `config/config_local.yaml.template`,
+  `config/github.yaml.template`.
 - Ignored local files:
   `config/config.yaml`, `config/config_local.yaml`, `config/github.yaml`.
 - Prefer environment variables for tokens:
   `TUSHARE_TOKEN`, `DEEPSEEK_API_KEY`, and other provider credentials.
 - Never place tokens, webhooks, private logs, or personal data in this file.
+- Packaged artifacts are code/resource-only: no `data/`, `logs/`, `outputs/`,
+  local configuration, CSV/SQLite/JSONL runtime files, or credential-shaped
+  values. `utils/package_manifest.py` and the post-build app-bundle scan enforce
+  this invariant. A new installation starts with empty writable warehouses and
+  refetches data locally.
 - Strategy parameters are intentionally committed in
   `config/strategy_params.yaml`.
 
@@ -297,6 +344,14 @@ lifecycle/extension-workflow/technical-performance fixes atop `380a77f`, passed:
 
 ```text
 171 passed
+```
+
+The uncommitted multi-market workspace batch atop `a45a43f` passed Python
+compilation, JavaScript syntax checks for every controller, `git diff --check`,
+live route/API/browser checks, and the full suite:
+
+```text
+389 passed in 7.69s
 ```
 
 Useful runtime checks:
@@ -335,10 +390,49 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `380a77f` on branch
+Baseline commit: `a45a43f` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
+
+- The current uncommitted multi-market batch adds independent Hong Kong,
+  futures, macro, industry, and operations data/services/APIs/workspaces. Equity
+  navigation is market-context driven, with explicit A-share/Hong Kong policy
+  isolation and instrument deep links. Domain sync, task/event retention,
+  health, performance, and diagnostics are bounded and locally persisted.
+- Domain synchronization uses explicit full/incremental request planners with
+  paginated stable cursors, resumable progress, same-domain admission control,
+  cancellation/retry, and a global two-domain concurrency ceiling. Sync
+  controls are visible in the relevant empty/data workspace without starting
+  a network update at application startup.
+- The System workspace exposes structured event filters, sanitized diagnostics,
+  health checks for disk/tasks/A-share caches/provider circuits, bounded
+  retention, and per-job cancellation for selection, update diagnostics,
+  Wyckoff, provider updates, and domain synchronization. Performance signals
+  cover API call count/latency, response size, domain-store query duration, and
+  retained task/event counts; unavailable generic cache-hit evidence is labeled
+  unavailable instead of fabricated.
+- Equity navigation now has two levels: EQUITIES/FUTURES/MACRO/INDUSTRY/SYSTEM
+  at the workspace level, then OVERVIEW/HEATMAP/STOCKS/SELECTION/STRATEGIES /
+  WATCHLIST/WYCKOFF plus the persistent A-share/Hong Kong switch. Direct
+  `#/equities/<market>` and instrument routes restore the correct market.
+  Hong Kong overview copy, market segments, HKD metrics, selection scopes,
+  watchlists, K-lines, and Wyckoff inputs do not reuse A-share board, limit,
+  calendar, or industry assumptions.
+- The terminal UI now uses a pure-black Bloomberg-style industrial canvas,
+  `#FF6900` navigation emphasis, `#FF3131` up, and `#00FF41` down. Futures,
+  macro, industry, and system are separate hash-routed pages; empty/loading
+  states remain black instead of filling the canvas with gray-blue panels.
+- Packaging preparation now supports writable macOS Application Support and
+  Windows LocalAppData roots, an empty local-token template, and a manifest /
+  bundle scan that rejects market data, runtime logs, local configs, and
+  credentials. Source mode keeps the existing repository warehouses unchanged.
+- Verification for this batch passed: changed-Python compilation, syntax checks
+  for all eight JavaScript entry/controllers, focused API/frontend/domain/ops /
+  packaging tests, `git diff --check`, live API status checks, real Edge route
+  and layout checks, and the full suite (`389 passed in 7.69s`). Per user
+  instruction, do not stage, commit, push, or open a PR; leave the changes for
+  manual review.
 
 - Uncommitted K-line and Market Pulse fixes on top of `4c0709b` separate the
   visible chart window from a bounded indicator calculation context. Stock and

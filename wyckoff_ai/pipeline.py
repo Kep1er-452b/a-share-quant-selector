@@ -7,12 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+import pandas as pd
+
 from utils.csv_manager import CSVManager
 from utils.runtime_paths import wyckoff_results_dir
 from utils.stock_exporter import resolve_stock_query
 
 from .client import DEEPSEEK_MODEL, DeepSeekWyckoffClient, resolve_deepseek_api_key
-from .data import load_stock_csv, model_frame
+from .data import build_wyckoff_input, load_stock_csv, model_frame
 from .naming import build_wyckoff_output_paths, get_latest_data_date
 from .prompt import build_messages
 from .renderer import render_chart
@@ -33,13 +35,47 @@ class WyckoffPipeline:
         config: dict | None = None,
         data_dir: str = "data",
         output_dir: str | Path | None = None,
+        *,
+        market: str = "a_share",
+        reader=None,
     ):
         self.config = config or {}
         self.data_dir = data_dir
         self.output_dir = Path(output_dir) if output_dir is not None else wyckoff_results_dir()
-        self.csv_manager = CSVManager(data_dir)
+        self.market = str(market or "a_share").strip()
+        self.reader = reader
+        if self.market not in {"a_share", "hong_kong"}:
+            raise WyckoffPipelineError(f"不支持的股票市场: {self.market}")
+        if self.market != "a_share" and self.reader is None:
+            raise WyckoffPipelineError(
+                f"{self.market} 威科夫分析必须提供显式市场 reader"
+            )
+        self.csv_manager = (
+            CSVManager(data_dir)
+            if self.market == "a_share" and self.reader is None
+            else None
+        )
 
     def _resolve_stock(self, query: str) -> dict[str, Any]:
+        if self.reader is not None:
+            try:
+                payload = build_wyckoff_input(
+                    query, market=self.market, reader=self.reader
+                )
+            except Exception as exc:
+                raise WyckoffPipelineError(str(exc)) from exc
+            metadata = dict(payload["metadata"])
+            symbol = payload["symbol"]
+            return {
+                **metadata,
+                "code": symbol if self.market == "hong_kong" else symbol.split(".", 1)[0],
+                "symbol": symbol,
+                "market": self.market,
+                "currency": payload["currency"],
+                "source": payload["source"],
+                "frame": payload["frame"],
+                "csv_path": None,
+            }
         match = resolve_stock_query(query, data_dir=self.data_dir)
         if not match:
             raise WyckoffPipelineError(f"未找到匹配股票: {query}")
@@ -47,7 +83,16 @@ class WyckoffPipeline:
         csv_path = self.csv_manager.get_stock_path(code, create_dirs=False)
         if not csv_path.exists():
             raise WyckoffPipelineError(f"本地 CSV 不存在: {code}")
-        return {**match, "code": code, "csv_path": csv_path}
+        suffix = "BJ" if code.startswith(("4", "8")) else ("SH" if code.startswith("6") else "SZ")
+        return {
+            **match,
+            "code": code,
+            "symbol": f"{code}.{suffix}",
+            "market": "a_share",
+            "currency": "CNY",
+            "source": "a_share_provider_csv",
+            "csv_path": csv_path,
+        }
 
     def analyze_stock(self, query: str, progress_callback: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         def emit(step: str, message: str, progress_pct: int) -> None:
@@ -64,8 +109,10 @@ class WyckoffPipeline:
 
         emit("resolve", "正在解析股票代码/名称，并定位本地 CSV。", 5)
         stock = self._resolve_stock(query)
-        emit("load_csv", f"已匹配 {stock['code']} {stock.get('name') or ''}，正在读取本地行情。", 12)
-        df = load_stock_csv(stock["csv_path"])
+        emit("load_csv", f"已匹配 {stock['symbol']} {stock.get('name') or ''}，正在读取本地行情。", 12)
+        df = stock.get("frame")
+        if df is None:
+            df = load_stock_csv(stock["csv_path"])
         emit("indicators", "正在标准化 OHLCV，并计算 MA50、MA200、成交量比率。", 22)
         recent = model_frame(df)
         data_date = get_latest_data_date(df)
@@ -73,7 +120,7 @@ class WyckoffPipeline:
         generated_at = run_started_at.strftime("%Y-%m-%d %H:%M:%S")
         emit("prepare_outputs", f"数据日期 {data_date}，正在准备输出文件路径。", 30)
         paths = build_wyckoff_output_paths(
-            symbol=stock["code"],
+            symbol=stock["symbol"],
             stock_name=stock.get("name"),
             data_date=data_date,
             output_dir=self.output_dir,
@@ -87,7 +134,16 @@ class WyckoffPipeline:
             raise WyckoffPipelineError("未配置 DeepSeek API Key，请在 config/config_local.yaml 或 DEEPSEEK_API_KEY 中配置")
 
         emit("build_prompt", f"正在压缩最近 {len(recent)} 根日线，构建威科夫分析上下文。", 38)
-        messages = build_messages(stock["code"], stock.get("name") or "", recent)
+        messages = build_messages(
+            stock["symbol"],
+            stock.get("name") or "",
+            recent,
+            market_context={
+                "market": stock["market"],
+                "currency": stock["currency"],
+                "source": stock["source"],
+            },
+        )
         timeout_seconds = float(self.config.get("wyckoff_ai", {}).get("timeout_seconds", 90))
         client = DeepSeekWyckoffClient(api_key=api_key, timeout_seconds=timeout_seconds)
         emit("deepseek", "DeepSeek 正在分析供需背景、阶段、关键事件与后续场景。", 48)
@@ -96,11 +152,18 @@ class WyckoffPipeline:
         analysis = validate_analysis(raw_payload, recent)
 
         title = (
-            f"{stock.get('name') or stock['code']}({stock['code']}) "
+            f"{stock.get('name') or stock['symbol']}({stock['symbol']}) "
             f"{data_date} 威科夫结构: {analysis.get('mode')} / {analysis.get('current_phase')}"
         )
         emit("render", "结构校验通过，正在调用本地可信渲染器生成 PNG 图表。", 86)
-        chart_path = render_chart(stock["csv_path"], analysis, paths["chart_path"], title)
+        render_source = stock.get("csv_path")
+        if render_source is None:
+            render_source = Path(paths["run_dir"]) / "source" / f"{stock['symbol']}-ohlcv.csv"
+            render_source.parent.mkdir(parents=True, exist_ok=True)
+            source_frame = df[["date", "open", "high", "low", "close", "volume"]].copy()
+            source_frame["date"] = pd.to_datetime(source_frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            source_frame.to_csv(render_source, index=False)
+        chart_path = render_chart(render_source, analysis, paths["chart_path"], title)
 
         result = {
             "success": True,
@@ -108,8 +171,12 @@ class WyckoffPipeline:
             "model": DEEPSEEK_MODEL,
             "stock": {
                 "code": stock["code"],
+                "symbol": stock["symbol"],
                 "name": stock.get("name") or "",
                 "board": stock.get("board") or "",
+                "market": stock["market"],
+                "currency": stock["currency"],
+                "source": stock["source"],
             },
             "data": {
                 "latest_date": data_date,
@@ -122,6 +189,7 @@ class WyckoffPipeline:
             "paths": {
                 **paths,
                 "chart_path": chart_path,
+                "source_path": str(render_source),
             },
         }
         emit("save", "正在保存分析 JSON、PNG 图表与调试记录。", 96)

@@ -9,9 +9,9 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from utils.platform_paths import runtime_paths
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = PROJECT_ROOT / "logs"
+LOG_DIR = runtime_paths().logs_root
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 ERROR_DIR = LOG_DIR / "errors"
 

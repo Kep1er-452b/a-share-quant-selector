@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#000000">
     <meta name="quant-session-token" content="{{ session_token }}">
-    <title>A股量化选股控制台</title>
+    <title>多市场量化终端</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
@@ -55,7 +55,7 @@
     <header class="topbar">
         <div class="topbar-brand">
             <span class="topbar-brand-code">BQS</span>
-            <span class="topbar-brand-name">A-SHARE QUANT SELECTOR</span>
+            <span class="topbar-brand-name">MULTI-MARKET QUANT TERMINAL</span>
         </div>
         <div class="topbar-center">
             <span class="topbar-kicker">ACTIVE FUNCTION</span>
@@ -71,42 +71,70 @@
         </div>
     </header>
 
-    <div class="menubar">
-        <ul class="sidebar-nav" id="sidebar-nav">
-            <li class="nav-item active" data-page="dashboard">
+    <div class="menubar" id="navigation-shell">
+        <ul class="workspace-nav" id="workspace-nav" aria-label="主工作区">
+            <li class="workspace-nav-item active" data-page="dashboard" data-workspace="equities">
                 <span class="nav-fn">F1</span>
+                <span class="nav-label">EQUITIES</span>
+            </li>
+            <li class="workspace-nav-item" data-page="futures" data-workspace="futures">
+                <span class="nav-fn">F2</span>
+                <span class="nav-label">FUTURES</span>
+            </li>
+            <li class="workspace-nav-item" data-page="macro" data-workspace="macro">
+                <span class="nav-fn">F3</span>
+                <span class="nav-label">MACRO</span>
+            </li>
+            <li class="workspace-nav-item" data-page="industry" data-workspace="industry">
+                <span class="nav-fn">F4</span>
+                <span class="nav-label">INDUSTRY</span>
+            </li>
+            <li class="workspace-nav-item" data-page="system" data-workspace="system">
+                <span class="nav-fn">F5</span>
                 <span class="nav-label">SYSTEM</span>
             </li>
-            <li class="nav-item" data-page="heatmap">
-                <span class="nav-fn">F2</span>
+        </ul>
+        <div class="equity-context-bar" id="equity-context-bar">
+        <ul class="sidebar-nav" id="sidebar-nav" aria-label="股票功能">
+            <li class="nav-item active" data-page="dashboard" data-equity-page="dashboard">
+                <span class="nav-fn">E1</span>
+                <span class="nav-label">OVERVIEW</span>
+            </li>
+            <li class="nav-item" data-page="heatmap" data-equity-page="heatmap">
+                <span class="nav-fn">E2</span>
                 <span class="nav-label">HEATMAP</span>
             </li>
-            <li class="nav-item" data-page="stocks">
-                <span class="nav-fn">F3</span>
+            <li class="nav-item" data-page="stocks" data-equity-page="stocks">
+                <span class="nav-fn">E3</span>
                 <span class="nav-label">STOCKS</span>
             </li>
-            <li class="nav-item" data-page="selection">
-                <span class="nav-fn">F4</span>
+            <li class="nav-item" data-page="selection" data-equity-page="selection">
+                <span class="nav-fn">E4</span>
                 <span class="nav-label">SELECTION</span>
             </li>
-            <li class="nav-item" data-page="strategies">
-                <span class="nav-fn">F5</span>
+            <li class="nav-item" data-page="strategies" data-equity-page="strategies">
+                <span class="nav-fn">E5</span>
                 <span class="nav-label">STRATEGIES</span>
             </li>
-            <li class="nav-item" data-page="watchlist">
-                <span class="nav-fn">F6</span>
+            <li class="nav-item" data-page="watchlist" data-equity-page="watchlist">
+                <span class="nav-fn">E6</span>
                 <span class="nav-label">WATCHLIST</span>
             </li>
-            <li class="nav-item" data-page="wyckoff">
-                <span class="nav-fn">F7</span>
+            <li class="nav-item" data-page="wyckoff" data-equity-page="wyckoff">
+                <span class="nav-fn">E7</span>
                 <span class="nav-label">WYCKOFF</span>
             </li>
         </ul>
-        <div class="asset-tabs" aria-hidden="true">
-            <span class="asset-tab active">EQ</span>
-            <span class="asset-tab">FX</span>
-            <span class="asset-tab">FI</span>
-            <span class="asset-tab">CMDTY</span>
+        <div class="asset-tabs equity-market-switch" id="equity-market-switch" aria-label="股票市场">
+            <button class="asset-tab active" data-market="a_share" type="button" aria-pressed="true">A 股</button>
+            <button class="asset-tab" data-market="hong_kong" type="button" aria-pressed="false">港股</button>
+            <div class="domain-sync-controls equity-domain-sync" data-sync-domain="hong_kong" hidden>
+                <span class="domain-sync-state">EMPTY</span>
+                <button class="btn btn-ghost domain-sync-start" type="button">SYNC</button>
+                <button class="btn btn-danger domain-sync-cancel" type="button" hidden>CANCEL</button>
+                <button class="btn btn-ghost domain-sync-retry" type="button" hidden>RETRY</button>
+            </div>
+        </div>
         </div>
     </div>
 
@@ -127,8 +155,8 @@
                         </div>
                         <div class="panel-body quote-panel-body">
                             <div class="quote-block">
-                                <div class="quote-label">A-SHARE UNIVERSE</div>
-                                <div class="quote-symbol">ALL BOARDS</div>
+                                <div class="quote-label" id="hero-market-label">A-SHARE UNIVERSE</div>
+                                <div class="quote-symbol" id="hero-market-symbol">ALL BOARDS</div>
                                 <div class="quote-price universe-count" id="stat-stocks">--</div>
                                 <div class="quote-change" id="hero-universe">ALL BOARDS</div>
                             </div>
@@ -175,25 +203,25 @@
 
                     <section class="panel">
                         <div class="panel-header">
-                            <span class="panel-title">BOARD DISTRIBUTION</span>
+                            <span class="panel-title" id="board-distribution-title">BOARD DISTRIBUTION</span>
                             <span class="panel-meta">UNIVERSE</span>
                         </div>
                         <div class="panel-body">
                             <div class="board-grid">
                                 <div class="board-card">
-                                    <div class="board-card-label">MAIN</div>
+                                    <div class="board-card-label" id="board-label-main">MAIN</div>
                                     <div class="board-card-value" id="board-count-main">--</div>
-                                    <div class="board-card-sub">主板 STOCKS</div>
+                                    <div class="board-card-sub" id="board-sub-main">主板 STOCKS</div>
                                 </div>
                                 <div class="board-card">
-                                    <div class="board-card-label">CHINEXT</div>
+                                    <div class="board-card-label" id="board-label-secondary">CHINEXT</div>
                                     <div class="board-card-value" id="board-count-chinext">--</div>
-                                    <div class="board-card-sub">创业板 STOCKS</div>
+                                    <div class="board-card-sub" id="board-sub-secondary">创业板 STOCKS</div>
                                 </div>
                                 <div class="board-card">
-                                    <div class="board-card-label">STAR</div>
+                                    <div class="board-card-label" id="board-label-tertiary">STAR</div>
                                     <div class="board-card-value" id="board-count-star">--</div>
-                                    <div class="board-card-sub">科创板 STOCKS</div>
+                                    <div class="board-card-sub" id="board-sub-tertiary">科创板 STOCKS</div>
                                 </div>
                             </div>
                         </div>
@@ -231,10 +259,10 @@
                             <span class="panel-meta">WORKFLOW</span>
                         </div>
                         <div class="panel-body terminal-list">
-                            <div class="terminal-row">01  先进入 SELECTION 页面勾选板块与策略，再执行扫描。</div>
-                            <div class="terminal-row">02  顶部 RUN 会沿用当前筛选快照，适合重复执行同一轮扫描。</div>
-                            <div class="terminal-row">03  HEATMAP 面板用于快速观察行业与个股分布，点击即可打开细节。</div>
-                            <div class="terminal-row">04  HALT 为事故急停指令，会记录现场、停止任务并退出系统。</div>
+                            <div class="terminal-row" id="operator-note-1">01  先进入 SELECTION 页面勾选板块与策略，再执行扫描。</div>
+                            <div class="terminal-row" id="operator-note-2">02  顶部 RUN 会沿用当前筛选快照，适合重复执行同一轮扫描。</div>
+                            <div class="terminal-row" id="operator-note-3">03  HEATMAP 面板用于快速观察行业与个股分布，点击即可打开细节。</div>
+                            <div class="terminal-row" id="operator-note-4">04  HALT 为事故急停指令，会记录现场、停止任务并退出系统。</div>
                         </div>
                     </section>
 
@@ -441,7 +469,7 @@
                                 <span class="heatmap-date-value" id="heatmap-latest-date">--</span>
                             </div>
 
-                            <div class="heatmap-filter-section">
+                            <div class="heatmap-filter-section" id="heatmap-scope-section">
                                 <div class="heatmap-filter-title">SCOPE</div>
                                 <div class="heatmap-filter-list" id="heatmap-market-filter">
                                     <button class="heatmap-filter-btn active" data-scope="all" type="button">A股全图</button>
@@ -452,7 +480,7 @@
                                 </div>
                             </div>
 
-                            <div class="heatmap-filter-section">
+                            <div class="heatmap-filter-section" id="heatmap-metric-section">
                                 <div class="heatmap-filter-title">METRIC</div>
                                 <div class="heatmap-filter-list metric" id="heatmap-metric-filter">
                                     <button class="heatmap-filter-btn active" data-metric="daily" type="button">日线</button>
@@ -490,7 +518,7 @@
                             <section class="panel heatmap-panel">
                                 <div class="panel-header panel-header-wrap">
                                     <div>
-                                        <span class="panel-title">A-SHARE HEATMAP</span>
+                                        <span class="panel-title" id="heatmap-panel-title">A-SHARE HEATMAP</span>
                                         <div class="panel-subtitle" id="heatmap-subtitle">按行业聚合，面积映射总市值，颜色映射最新口径涨跌幅</div>
                                     </div>
                                     <div class="heatmap-panel-actions">
@@ -618,14 +646,209 @@
                 <div class="panel">
                     <div class="panel-header panel-header-wrap">
                         <div>
-                            <span class="panel-title">STRATEGY PARAMETERS</span>
-                            <div class="panel-subtitle">支持嵌套参数编辑，保存后会即时重载策略注册表</div>
+                            <span class="panel-title" id="strategies-panel-title">STRATEGY PARAMETERS</span>
+                            <div class="panel-subtitle" id="strategies-panel-subtitle">支持嵌套参数编辑，保存后会即时重载策略注册表</div>
                         </div>
                         <button class="btn btn-primary" id="save-config-btn" type="button">保存配置</button>
                     </div>
                     <div class="panel-body" id="strategies-config">
                         <div class="state-loading">加载中...</div>
                     </div>
+                </div>
+            </section>
+
+            <section id="futures-page" class="page">
+                <div class="domain-workspace" id="futures-workspace-root">
+                    <header class="domain-workspace-bar">
+                        <div>
+                            <span class="panel-title">FUTURES MARKET</span>
+                            <span class="domain-workspace-sub">合约检索、本地日线与结算字段</span>
+                        </div>
+                        <div class="domain-workspace-actions">
+                            <span class="domain-status" id="futures-status">LOCAL STORE</span>
+                            <div class="domain-sync-controls" data-sync-domain="futures">
+                                <span class="domain-sync-state">EMPTY</span>
+                                <button class="btn btn-ghost domain-sync-start" type="button">SYNC</button>
+                                <button class="btn btn-danger domain-sync-cancel" type="button" hidden>CANCEL</button>
+                                <button class="btn btn-ghost domain-sync-retry" type="button" hidden>RETRY</button>
+                            </div>
+                            <button class="btn btn-ghost" id="futures-refresh" type="button">REFRESH</button>
+                        </div>
+                    </header>
+                    <div class="domain-split domain-split-narrow">
+                        <section class="domain-pane">
+                            <div class="domain-filter-grid">
+                                <label class="domain-field domain-field-wide">
+                                    <span>CONTRACT SEARCH</span>
+                                    <input id="futures-search" class="search-input" type="search" placeholder="IF2607 / AU / 合约名称">
+                                </label>
+                                <label class="domain-field">
+                                    <span>EXCHANGE</span>
+                                    <select id="futures-exchange">
+                                        <option value="">全部交易所</option>
+                                        <option value="CFFEX">CFFEX</option>
+                                        <option value="SHFE">SHFE</option>
+                                        <option value="DCE">DCE</option>
+                                        <option value="CZCE">CZCE</option>
+                                        <option value="INE">INE</option>
+                                        <option value="GFEX">GFEX</option>
+                                    </select>
+                                </label>
+                                <label class="domain-field">
+                                    <span>PRODUCT</span>
+                                    <input id="futures-product" class="search-input" type="text" placeholder="IF / AU">
+                                </label>
+                            </div>
+                            <div class="domain-table-shell">
+                                <table class="data-table domain-table">
+                                    <thead><tr><th>合约</th><th>品种</th><th>交易所</th><th>到期日</th></tr></thead>
+                                    <tbody id="futures-contracts-body">
+                                        <tr><td colspan="4" class="state-empty">等待读取本地合约仓库</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </section>
+                        <section class="domain-pane domain-chart-pane">
+                            <div class="domain-pane-head">
+                                <div>
+                                    <span class="panel-title" id="futures-chart-title">SELECT CONTRACT</span>
+                                    <span class="domain-workspace-sub" id="futures-chart-meta">OHLC / SETTLE / OI</span>
+                                </div>
+                            </div>
+                            <div class="domain-chart" id="futures-kline"></div>
+                        </section>
+                    </div>
+                </div>
+            </section>
+
+            <section id="macro-page" class="page">
+                <div class="domain-workspace" id="macro-workspace-root">
+                    <header class="domain-workspace-bar">
+                        <div>
+                            <span class="panel-title">MACRO ECONOMY</span>
+                            <span class="domain-workspace-sub">增长、通胀、货币、景气与利率序列</span>
+                        </div>
+                        <div class="domain-workspace-actions">
+                            <span class="domain-status" id="macro-status">LOCAL STORE</span>
+                            <div class="domain-sync-controls" data-sync-domain="macro">
+                                <span class="domain-sync-state">EMPTY</span>
+                                <button class="btn btn-ghost domain-sync-start" type="button">SYNC</button>
+                                <button class="btn btn-danger domain-sync-cancel" type="button" hidden>CANCEL</button>
+                                <button class="btn btn-ghost domain-sync-retry" type="button" hidden>RETRY</button>
+                            </div>
+                            <button class="btn btn-ghost" id="macro-refresh" type="button">REFRESH</button>
+                        </div>
+                    </header>
+                    <div class="domain-split domain-split-sidebar">
+                        <aside class="domain-pane macro-browser">
+                            <nav class="domain-tab-strip" id="macro-family-nav" aria-label="宏观类别"></nav>
+                            <div class="domain-series-list" id="macro-series-list">
+                                <div class="state-empty">等待读取序列目录</div>
+                            </div>
+                            <button class="btn btn-primary" id="macro-compare" type="button">COMPARE</button>
+                        </aside>
+                        <section class="domain-pane domain-chart-pane">
+                            <div class="domain-pane-head domain-pane-head-wrap">
+                                <div>
+                                    <span class="panel-title">SERIES COMPARISON</span>
+                                    <span class="domain-workspace-sub">图表抽样，表格保留返回的精确行</span>
+                                </div>
+                                <div class="domain-unit-legend" id="macro-unit-legend">UNIT --</div>
+                            </div>
+                            <div class="domain-chart macro-chart" id="macro-chart"></div>
+                            <div class="domain-table-shell macro-exact-table">
+                                <table class="data-table domain-table">
+                                    <thead id="macro-exact-head"><tr><th>期间</th><th>数值</th></tr></thead>
+                                    <tbody id="macro-exact-body">
+                                        <tr><td colspan="2" class="state-empty">选择序列后显示精确值</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </section>
+
+            <section id="industry-page" class="page">
+                <div class="domain-workspace" id="industry-workspace-root">
+                    <header class="domain-workspace-bar">
+                        <div>
+                            <span class="panel-title">INDUSTRY RESEARCH</span>
+                            <span class="domain-workspace-sub">市场行业与产业景气分层查看</span>
+                        </div>
+                        <div class="domain-workspace-actions">
+                            <span class="domain-status" id="industry-status">LOCAL STORE</span>
+                            <div class="domain-sync-controls" data-sync-domain="industry">
+                                <span class="domain-sync-state">EMPTY</span>
+                                <button class="btn btn-ghost domain-sync-start" type="button">SYNC</button>
+                                <button class="btn btn-danger domain-sync-cancel" type="button" hidden>CANCEL</button>
+                                <button class="btn btn-ghost domain-sync-retry" type="button" hidden>RETRY</button>
+                            </div>
+                            <button class="btn btn-ghost" id="industry-refresh" type="button">REFRESH</button>
+                        </div>
+                    </header>
+                    <div class="domain-tab-strip industry-mode-switch" aria-label="行业视图">
+                        <button class="domain-tab active" data-industry-mode="market" type="button">市场行业</button>
+                        <button class="domain-tab" data-industry-mode="cycle" type="button">产业景气</button>
+                    </div>
+                    <div id="industry-market-view" class="industry-mode-view active">
+                        <div class="domain-split domain-split-narrow">
+                            <section class="domain-pane">
+                                <div class="domain-pane-head">
+                                    <span class="panel-title">SW CLASSIFICATION</span>
+                                    <select id="industry-level"><option value="L1">一级行业</option><option value="L2">二级行业</option><option value="L3">三级行业</option></select>
+                                </div>
+                                <div class="domain-table-shell">
+                                    <table class="data-table domain-table">
+                                        <thead><tr><th>代码</th><th>行业</th><th>级别</th></tr></thead>
+                                        <tbody id="industry-classifications-body"><tr><td colspan="3" class="state-empty">等待读取行业分类</td></tr></tbody>
+                                    </table>
+                                </div>
+                            </section>
+                            <section class="domain-pane industry-detail-pane">
+                                <div class="domain-pane-head"><span class="panel-title" id="industry-detail-title">SELECT INDUSTRY</span><span class="domain-workspace-sub" id="industry-coverage">COVERAGE --</span></div>
+                                <div class="domain-chart industry-chart" id="industry-kline"></div>
+                                <div class="domain-table-shell industry-members-table">
+                                    <table class="data-table domain-table"><thead><tr><th>代码</th><th>成分股</th><th>纳入日期</th><th>技术面</th></tr></thead>
+                                        <tbody id="industry-members-body"><tr><td colspan="4" class="state-empty">选择行业后显示成分股</td></tr></tbody>
+                                    </table>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+                    <div id="industry-cycle-view" class="industry-mode-view">
+                        <section class="domain-pane industry-cycle-pane">
+                            <div class="domain-pane-head domain-pane-head-wrap">
+                                <div class="domain-series-inline" id="industry-cycle-series">
+                                    <label><input type="checkbox" value="cn_pmi.headline" checked> 制造业 PMI</label>
+                                    <label><input type="checkbox" value="cn_ppi.ppi_yoy" checked> PPI 同比</label>
+                                </div>
+                                <label class="domain-check"><input id="industry-cycle-normalize" type="checkbox"> 标准化对比</label>
+                            </div>
+                            <div class="domain-chart industry-cycle-chart" id="industry-cycle-chart"></div>
+                        </section>
+                    </div>
+                </div>
+            </section>
+
+            <section id="system-page" class="page">
+                <div class="domain-workspace" id="system-workspace-root">
+                    <header class="domain-workspace-bar"><div><span class="panel-title">SYSTEM OPERATIONS</span><span class="domain-workspace-sub">任务、事件、健康、性能与本地配置</span></div><div class="domain-workspace-actions"><span class="domain-status" id="ops-export-status">LOCAL ONLY</span><button class="btn btn-ghost" id="ops-diagnostics-export" type="button">EXPORT DIAGNOSTIC</button></div></header>
+                    <nav class="domain-tabbar" id="ops-tabbar" aria-label="系统运维视图">
+                        <button class="domain-tab active" data-ops-view="ops-tasks" type="button">任务</button>
+                        <button class="domain-tab" data-ops-view="ops-events" type="button">事件</button>
+                        <button class="domain-tab" data-ops-view="ops-health" type="button">健康</button>
+                        <button class="domain-tab" data-ops-view="ops-performance" type="button">性能</button>
+                        <button class="domain-tab" data-ops-view="ops-config" type="button">配置</button>
+                    </nav>
+                    <div class="domain-pane ops-view active" id="ops-tasks"><div class="state-loading">加载活动任务...</div></div>
+                    <div class="domain-pane ops-view" id="ops-events">
+                        <div class="domain-toolbar"><select id="ops-event-severity"><option value="">全部级别</option><option value="warning">警告</option><option value="error">错误</option><option value="info">信息</option></select><button class="btn btn-ghost" id="ops-events-refresh" type="button">刷新</button></div>
+                        <div id="ops-events-content" class="state-loading">加载结构化事件...</div>
+                    </div>
+                    <div class="domain-pane ops-view" id="ops-health"><div class="state-loading">检查仓库与数据新鲜度...</div></div>
+                    <div class="domain-pane ops-view" id="ops-performance"><div class="state-loading">加载性能指标...</div></div>
+                    <div class="domain-pane ops-view" id="ops-config"><div class="state-empty">Token 仅显示来源与是否存在，实际值只在本机环境变量或 config_local.yaml 中填写。</div></div>
                 </div>
             </section>
         </div>
@@ -917,6 +1140,13 @@
 
 <div class="toast" id="toast"></div>
 
+<script src="/static/js/market_context.js"></script>
+<script src="/static/js/equity_router.js"></script>
+<script src="/static/js/futures_workspace.js"></script>
+<script src="/static/js/macro_workspace.js"></script>
+<script src="/static/js/industry_workspace.js"></script>
+<script src="/static/js/system_workspace.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/domain_sync.js"></script>
 </body>
 </html>

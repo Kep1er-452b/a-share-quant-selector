@@ -1,20 +1,18 @@
-"""Runtime output paths that stay outside the Git repository."""
+"""Backward-compatible helpers for selection and Wyckoff output paths."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-
-OUTPUT_ROOT_ENV = "A_SHARE_QUANT_OUTPUT_ROOT"
-DEFAULT_OUTPUT_FOLDER = "A股量化选股系统数据"
+from utils.platform_paths import (
+    DEFAULT_OUTPUT_FOLDER,
+    OUTPUT_ROOT_ENV,
+    runtime_paths as resolve_runtime_paths,
+)
 
 
 def runtime_output_root() -> Path:
-    configured = str(os.environ.get(OUTPUT_ROOT_ENV) or "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / "DocumentsData" / DEFAULT_OUTPUT_FOLDER
+    return resolve_runtime_paths().outputs_root
 
 
 def selection_results_dir() -> Path:

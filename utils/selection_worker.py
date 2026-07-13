@@ -8,7 +8,9 @@ import io
 from strategy.strategy_registry import StrategyRegistry
 from strategy.formula_strategy import FORMULA_STRATEGY_NAME
 from utils.csv_manager import CSVManager
+from utils.market_watchlist import canonical_equity_symbol
 from utils.technical import prepare_selection_features, prepare_strategy_shared_features
+from market_data.equity_policy import equity_policy
 
 
 _WORKER_CONTEXT = None
@@ -26,7 +28,16 @@ def merge_indicator_frames(base_df, frames):
     return merged
 
 
-def build_worker_context(data_dir, strategy_names, params_file, runtime_strategy_params=None):
+def build_worker_context(
+    data_dir,
+    strategy_names,
+    params_file,
+    runtime_strategy_params=None,
+    *,
+    market_id="a_share",
+    reader=None,
+    strategy_scopes=None,
+):
     """构建批处理上下文。"""
     runtime_strategy_params = runtime_strategy_params or {}
     registry = StrategyRegistry(params_file)
@@ -48,9 +59,28 @@ def build_worker_context(data_dir, strategy_names, params_file, runtime_strategy
                 raise ValueError(f"未找到策略类: {strategy_name}")
         strategies[strategy_name] = strategy
 
+    scopes = dict(strategy_scopes or {})
+    for strategy_name, strategy in strategies.items():
+        scopes.setdefault(
+            strategy_name,
+            str(getattr(strategy, "market_scope", "") or "a_share_only"),
+        )
+    policy = equity_policy(market_id)
+    rejected = [
+        name
+        for name in strategies
+        if not policy.is_strategy_allowed(name, declared_scope=scopes.get(name))
+    ]
+    if rejected:
+        raise ValueError(
+            f"strategy {rejected[0]} is not supported for {market_id}"
+        )
     return {
-        "csv_manager": CSVManager(data_dir),
+        "market_id": market_id,
+        "csv_manager": CSVManager(data_dir) if reader is None else None,
+        "reader": reader,
         "strategies": strategies,
+        "strategy_scopes": scopes,
     }
 
 
@@ -67,8 +97,22 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     if worker_context is None:
         raise RuntimeError("selection worker 未初始化")
 
-    csv_manager = worker_context["csv_manager"]
+    market_id = str(worker_context.get("market_id") or "a_share")
+    csv_manager = worker_context.get("csv_manager")
+    reader = worker_context.get("reader")
     strategies = worker_context["strategies"]
+    strategy_scopes = dict(worker_context.get("strategy_scopes") or {})
+    policy = equity_policy(market_id)
+    for strategy_name, strategy in strategies.items():
+        scope = strategy_scopes.get(strategy_name) or getattr(
+            strategy, "market_scope", None
+        )
+        if not policy.is_strategy_allowed(strategy_name, declared_scope=scope):
+            raise ValueError(
+                f"strategy {strategy_name} is not supported for {market_id}"
+            )
+    if reader is None and csv_manager is None:
+        raise RuntimeError("selection worker 缺少行情 reader")
 
     results_by_strategy = {strategy_name: [] for strategy_name in strategies}
     indicators_dict = {}
@@ -82,9 +126,15 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     last_processed_name = None
 
     for code, name in candidates:
-        last_processed_code = code
+        canonical_symbol = canonical_equity_symbol(market_id, code)
+        result_code = canonical_symbol if market_id == "hong_kong" else canonical_symbol.split(".", 1)[0]
+        last_processed_code = result_code
         last_processed_name = name
-        df = csv_manager.read_stock_for_analysis(code)
+        df = (
+            reader.read_analysis_frame(canonical_symbol)
+            if reader is not None
+            else csv_manager.read_stock_for_analysis(result_code)
+        )
         if df.empty or len(df) < 60:
             skipped_count += 1
             continue
@@ -119,7 +169,9 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
 
             if filtered_signals:
                 results_by_strategy[strategy_name].append({
-                    "code": code,
+                    "market": market_id,
+                    "symbol": canonical_symbol,
+                    "code": result_code,
                     "name": name,
                     "signals": filtered_signals,
                 })
@@ -127,7 +179,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
                     indicator_frames.append(df_with_indicators)
 
         if return_data and indicator_frames:
-            indicators_dict[code] = merge_indicator_frames(prepared_df, indicator_frames)
+            indicators_dict[result_code] = merge_indicator_frames(prepared_df, indicator_frames)
 
     return {
         "processed_count": processed_count,

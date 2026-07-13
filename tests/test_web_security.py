@@ -426,6 +426,118 @@ def test_update_cancel_releases_failed_job_without_overwriting_error():
             web_server.update_cancel_events.pop(job_id, None)
 
 
+def test_ops_cancel_uses_per_job_events_for_selection_diagnostic_and_wyckoff():
+    assert hasattr(web_server, "selection_cancel_events")
+    assert hasattr(web_server, "diagnostic_cancel_events")
+    assert hasattr(web_server, "wyckoff_cancel_events")
+    client = web_server.app.test_client()
+    selection_id = web_server._create_selection_job(["main"], ["B1V242BStrategy"])
+    diagnostic_id = web_server._create_diagnostic_job(
+        {"job_id": "source-update", "error_report_path": "safe-report.json"},
+        "standard",
+    )
+    wyckoff_id = "00000000-0000-4000-8000-000000000001"
+    with web_server.wyckoff_jobs_lock:
+        web_server.wyckoff_jobs[wyckoff_id] = {
+            "job_id": wyckoff_id,
+            "status": "running",
+            "created_at": "2026-07-13 12:00:00",
+            "updated_at": "2026-07-13 12:00:00",
+        }
+        web_server.wyckoff_cancel_events[wyckoff_id] = web_server.Event()
+
+    try:
+        for task_type, job_id in (
+            ("selection", selection_id),
+            ("diagnostic", diagnostic_id),
+            ("wyckoff", wyckoff_id),
+        ):
+            assert client.post(f"/api/ops/tasks/{task_type}/{job_id}/cancel").status_code == 403
+            response = client.post(
+                f"/api/ops/tasks/{task_type}/{job_id}/cancel",
+                headers=_headers(),
+            )
+            assert response.status_code == 200
+            assert response.get_json()["data"]["status"] == "cancelling"
+
+        assert web_server.selection_cancel_events[selection_id].is_set()
+        assert web_server.diagnostic_cancel_events[diagnostic_id].is_set()
+        assert web_server.wyckoff_cancel_events[wyckoff_id].is_set()
+        assert web_server.halt_event.is_set() is False
+    finally:
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.pop(selection_id, None)
+            web_server.selection_cancel_events.pop(selection_id, None)
+        with web_server.diagnostic_jobs_lock:
+            web_server.diagnostic_jobs.pop(diagnostic_id, None)
+            web_server.diagnostic_cancel_events.pop(diagnostic_id, None)
+        with web_server.wyckoff_jobs_lock:
+            web_server.wyckoff_jobs.pop(wyckoff_id, None)
+            web_server.wyckoff_cancel_events.pop(wyckoff_id, None)
+
+
+def test_api_requests_record_bounded_performance_signals():
+    before = web_server.ops_performance.summary()
+    before_calls = before.get("signals", {}).get("api_call_count", {}).get("value", 0)
+
+    response = web_server.app.test_client().get("/api/system_status")
+
+    assert response.status_code == 200
+    payload = web_server.ops_performance.summary()
+    signals = payload["signals"]
+    assert signals["api_call_count"]["value"] >= before_calls + 1
+    assert signals["api_latency_ms"]["status"] == "available"
+    assert signals["response_payload_bytes"]["status"] == "available"
+    assert signals["retained_task_count"]["status"] == "available"
+    assert signals["retained_event_count"]["status"] == "available"
+    assert signals["cache_hit_rate"]["status"] in {"available", "unavailable"}
+
+
+def test_pre_cancelled_selection_diagnostic_and_wyckoff_do_not_start_work(monkeypatch):
+    assert hasattr(web_server, "selection_cancel_events")
+    selection_id = web_server._create_selection_job(["main"], ["B1V242BStrategy"])
+    diagnostic_id = web_server._create_diagnostic_job(
+        {"job_id": "source-update", "error_report_path": "safe-report.json"},
+        "standard",
+    )
+    wyckoff_id = "00000000-0000-4000-8000-000000000002"
+    now = "2026-07-13 12:00:00"
+    with web_server.wyckoff_jobs_lock:
+        web_server.wyckoff_jobs[wyckoff_id] = {
+            "job_id": wyckoff_id,
+            "query": "000001",
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+        }
+        web_server.wyckoff_cancel_events[wyckoff_id] = web_server.Event()
+    web_server.selection_cancel_events[selection_id].set()
+    web_server.diagnostic_cancel_events[diagnostic_id].set()
+    web_server.wyckoff_cancel_events[wyckoff_id].set()
+
+    monkeypatch.setattr(web_server, "_active_csv_manager", lambda: (_ for _ in ()).throw(AssertionError("selection work started")))
+    monkeypatch.setattr(web_server, "run_update_diagnostics", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("diagnostic work started")))
+    monkeypatch.setattr(web_server, "WyckoffPipeline", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Wyckoff work started")))
+    try:
+        web_server._run_selection_job(selection_id, ["main"], ["B1V242BStrategy"])
+        web_server._run_update_diagnostic_job(diagnostic_id, "safe-report.json", "standard", "")
+        web_server._run_wyckoff_job(wyckoff_id, "000001")
+
+        assert web_server.selection_jobs[selection_id]["status"] == "cancelled"
+        assert web_server.diagnostic_jobs[diagnostic_id]["status"] == "cancelled"
+        assert web_server.wyckoff_jobs[wyckoff_id]["status"] == "cancelled"
+    finally:
+        with web_server.selection_jobs_lock:
+            web_server.selection_jobs.pop(selection_id, None)
+            web_server.selection_cancel_events.pop(selection_id, None)
+        with web_server.diagnostic_jobs_lock:
+            web_server.diagnostic_jobs.pop(diagnostic_id, None)
+            web_server.diagnostic_cancel_events.pop(diagnostic_id, None)
+        with web_server.wyckoff_jobs_lock:
+            web_server.wyckoff_jobs.pop(wyckoff_id, None)
+            web_server.wyckoff_cancel_events.pop(wyckoff_id, None)
+
+
 def test_pre_cancelled_update_job_finishes_as_cancelled(monkeypatch, tmp_path):
     job_id = web_server._create_update_job("akshare")
     web_server.update_cancel_events[job_id].set()
