@@ -31,6 +31,9 @@ def service(tmp_path):
     store.upsert_rows(
         "cn_gdp",
         [
+            {"quarter": "2025Q1", "gdp": 300_000.0, "gdp_yoy": 5.3},
+            {"quarter": "2025Q2", "gdp": 650_000.0, "gdp_yoy": 5.2},
+            {"quarter": "2025Q3", "gdp": 1_000_000.0, "gdp_yoy": 5.1},
             {"quarter": "2025Q4", "gdp": 1_349_084.0, "gdp_yoy": 5.0},
             {"quarter": "2026Q1", "gdp": 335_000.0, "gdp_yoy": 5.2},
         ],
@@ -83,12 +86,13 @@ def test_economy_catalog_registers_verified_provider_datasets_and_keys():
     assert specs["cn_cpi"].key_fields == ("month",)
     assert specs["shibor"].key_fields == ("date",)
     assert specs["cn_pmi"].required is False
+    assert {spec.domain for spec in specs.values()} == {"macro"}
 
 
 def test_economy_full_plans_use_explicit_frequency_bounds(tmp_path):
     catalog = economy_catalog()
     store = DomainStore(tmp_path / "plan.sqlite")
-    request = SyncRequest(domain="economy")
+    request = SyncRequest(domain="macro")
 
     gdp = tuple(catalog.get("cn_gdp").request_planner(request, None, store))
     cpi = tuple(catalog.get("cn_cpi").request_planner(request, None, store))
@@ -113,6 +117,13 @@ def test_macro_series_always_declares_exact_field_unit_frequency_and_precision(s
     )
     assert by_id["cn_gdp.gdp"]["field"] == "gdp"
     assert by_id["cn_gdp.gdp"]["unit"] == "亿元"
+    assert by_id["cn_gdp.gdp"]["value_semantics"] == "ytd_flow"
+    assert by_id["cn_gdp.gdp"]["chart_type"] == "bar"
+    assert by_id["cn_gdp.gdp_quarterly"]["field"] == "gdp"
+    assert by_id["cn_gdp.gdp_quarterly"]["transform"] == "ytd_to_quarter"
+    assert by_id["cn_gdp.gdp_quarterly"]["value_semantics"] == "period_flow"
+    assert by_id["cn_gdp.gdp_quarterly"]["chart_type"] == "bar"
+    assert items[0]["series_id"] == "cn_gdp.gdp_quarterly"
     assert by_id["cn_cpi.nt_yoy"]["field"] == "nt_yoy"
     assert by_id["cn_ppi.ppi_yoy"]["frequency"] == "monthly"
     assert by_id["cn_m.m2"]["unit"] == "亿元"
@@ -170,6 +181,50 @@ def test_macro_series_compares_families_and_preserves_exact_stored_values(servic
     assert payload["axis_mode"] == "separate"
 
 
+def test_macro_gdp_single_quarter_series_differences_each_year_without_mutating_raw_values(service):
+    payload = service.series(
+        ["cn_gdp.gdp_quarterly", "cn_gdp.gdp"],
+        max_points=2000,
+    )
+    by_id = {item["series_id"]: item for item in payload["series"]}
+
+    assert by_id["cn_gdp.gdp_quarterly"]["points"] == [
+        {"period": "2025Q1", "value": 300_000.0},
+        {"period": "2025Q2", "value": 350_000.0},
+        {"period": "2025Q3", "value": 350_000.0},
+        {"period": "2025Q4", "value": 349_084.0},
+        {"period": "2026Q1", "value": 335_000.0},
+    ]
+    assert by_id["cn_gdp.gdp"]["points"] == [
+        {"period": "2025Q1", "value": 300_000.0},
+        {"period": "2025Q2", "value": 650_000.0},
+        {"period": "2025Q3", "value": 1_000_000.0},
+        {"period": "2025Q4", "value": 1_349_084.0},
+        {"period": "2026Q1", "value": 335_000.0},
+    ]
+
+
+def test_macro_gdp_single_quarter_series_skips_non_q1_values_without_prior_quarter(tmp_path):
+    store = DomainStore(tmp_path / "sparse.sqlite")
+    store.upsert_rows(
+        "cn_gdp",
+        [
+            {"quarter": "2024Q4", "gdp": 1_200_000.0},
+            {"quarter": "2025Q1", "gdp": 310_000.0},
+            {"quarter": "2025Q3", "gdp": 980_000.0},
+        ],
+        key_fields=("quarter",),
+        date_field="quarter",
+    )
+
+    points = EconomyService(store).series(
+        ["cn_gdp.gdp_quarterly"],
+        max_points=2000,
+    )["series"][0]["points"]
+
+    assert points == [{"period": "2025Q1", "value": 310_000.0}]
+
+
 def test_macro_catalog_cursors_overlap_latest_release_period():
     catalog = economy_catalog()
     monthly = catalog.get("cn_cpi").parameter_builder
@@ -178,17 +233,17 @@ def test_macro_catalog_cursors_overlap_latest_release_period():
     assert monthly is not None and quarterly is not None and daily is not None
 
     assert monthly(
-        SyncRequest(domain="economy"), {"cursor": "202606"}
+        SyncRequest(domain="macro"), {"cursor": "202606"}
     ) == {"start_m": "202606"}
     assert quarterly(
-        SyncRequest(domain="economy"), {"cursor": "2026Q1"}
+        SyncRequest(domain="macro"), {"cursor": "2026Q1"}
     ) == {"start_q": "2026Q1"}
     assert daily(
-        SyncRequest(domain="economy"), {"cursor": "20260710"}
+        SyncRequest(domain="macro"), {"cursor": "20260710"}
     ) == {"start_date": "20260710"}
     assert monthly(
         SyncRequest(
-            domain="economy",
+            domain="macro",
             params={"start_m": "202501", "end_m": "202512"},
         ),
         {"cursor": "202606"},

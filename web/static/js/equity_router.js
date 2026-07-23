@@ -29,7 +29,6 @@
     function openInstrument(market, symbol, sourceState = null) {
         const cleanSymbol = String(symbol || '').trim().toUpperCase();
         if (!cleanSymbol) throw new Error('Instrument symbol is required');
-        global.quantMarketContext.setMarket(market);
         if (sourceState) {
             global.sessionStorage.setItem(SOURCE_STATE_KEY, JSON.stringify(sourceState));
         }

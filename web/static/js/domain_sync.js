@@ -4,6 +4,12 @@
     const TERMINAL = new Set(['completed', 'completed_with_warnings', 'failed', 'error', 'cancelled']);
     const ACTIVE = new Set(['queued', 'running', 'cancelling']);
     const controls = new Map();
+    const PERMISSION_PATTERNS = [
+        /没有接口.+访问权限/i,
+        /权限.+访问/i,
+        /permission.+denied/i,
+        /insufficient.+permission/i,
+    ];
 
     async function requestJson(url, options = {}) {
         const method = String(options.method || 'GET').toUpperCase();
@@ -81,9 +87,20 @@
             rowsWritten: result.rows_written ?? latestEvent.rows_written ?? latestEvent.row_count,
             warning: latestEvent.warning || warnings.join('；') || (latestEvent.warning_count ? `${latestEvent.warning_count}` : ''),
             errorCode: latestEvent.error_code || result.error_code,
+            retryable: latestEvent.retryable ?? result.retryable,
             errorText: result.error || latestEvent.error,
             message,
         };
+    }
+
+    function isPermissionDenied(...values) {
+        const text = values.filter(Boolean).join(' ');
+        return PERMISSION_PATTERNS.some(pattern => pattern.test(text));
+    }
+
+    function permissionMessage(detail = {}) {
+        const dataset = detail.dataset ? `数据集 ${detail.dataset}` : '该数据集';
+        return `${dataset} 不在当前 Tushare 权限内；保留并刷新本地缓存，不再提供无意义的重试。`;
     }
 
     function setState(control, status, message = '', detail = {}) {
@@ -94,15 +111,24 @@
         renderDetails(control, { ...detail, message: detail.message || message });
         const active = ACTIVE.has(status);
         const failed = ['failed', 'error', 'cancelled', 'token_missing'].includes(status);
-        control.start.hidden = active;
+        const permissionDenied = status === 'permission_denied';
+        const canRetry = failed && (status === 'cancelled' || detail.retryable !== false);
+        control.start.hidden = active || permissionDenied;
         control.start.disabled = active;
         control.cancel.hidden = !active;
-        control.retry.hidden = !failed;
+        control.retry.hidden = !canRetry || permissionDenied;
     }
 
     function stopPolling(control) {
         if (control.pollTimer) global.clearTimeout(control.pollTimer);
         control.pollTimer = null;
+    }
+
+    function defaultRequest(domain) {
+        if (domain === 'futures') {
+            return { datasets: ['fut_basic'], scope: 'metadata' };
+        }
+        return {};
     }
 
     function refreshWorkspace(domain) {
@@ -121,11 +147,23 @@
             const job = await requestJson(`/api/sync/status/${encodeURIComponent(control.jobId)}`);
             const result = job.result || {};
             const latestEvent = (job.events || []).at(-1) || {};
-            const message = result.error || latestEvent.message || latestEvent.phase || '';
-            setState(control, job.status || 'running', message, jobDetail(control, job, latestEvent, message));
+            const rawMessage = result.error || latestEvent.message || latestEvent.phase || '';
+            const detail = jobDetail(control, job, latestEvent, rawMessage);
+            const permissionDenied = ['failed', 'error'].includes(job.status)
+                && isPermissionDenied(
+                    result.error_code,
+                    latestEvent.error_code,
+                    result.error,
+                    latestEvent.error,
+                    latestEvent.message,
+                    latestEvent.warning,
+                );
+            const displayStatus = permissionDenied ? 'permission_denied' : (job.status || 'running');
+            const message = permissionDenied ? permissionMessage(detail) : rawMessage;
+            setState(control, displayStatus, message, { ...detail, message });
             if (TERMINAL.has(job.status)) {
                 stopPolling(control);
-                if (job.status === 'completed' || job.status === 'completed_with_warnings') {
+                if (job.status !== 'cancelled') {
                     refreshWorkspace(control.domain);
                 }
                 return;
@@ -142,14 +180,21 @@
         control.pollTimer = global.setTimeout(() => poll(control), 1000);
     }
 
-    async function start(control, force = false) {
+    async function start(control, options = {}) {
+        if (!control) return;
         stopPolling(control);
         setState(control, 'queued', '正在创建本地同步任务');
+        const request = {
+            ...defaultRequest(control.domain),
+            ...(options || {}),
+            domain: control.domain,
+        };
+        control.lastRequest = request;
         try {
             const payload = await requestJson('/api/sync/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ domain: control.domain, force }),
+                body: JSON.stringify(request),
             });
             control.jobId = payload.job_id;
             setState(control, payload.status || 'queued', '', { jobId: control.jobId, phase: 'queued' });
@@ -227,8 +272,11 @@
                 status: 'empty',
             };
             controls.set(domain, control);
-            control.start?.addEventListener('click', () => start(control, false));
-            control.retry?.addEventListener('click', () => start(control, true));
+            control.start?.addEventListener('click', () => start(control));
+            control.retry?.addEventListener('click', () => start(control, {
+                ...(control.lastRequest || {}),
+                force: true,
+            }));
             control.cancel?.addEventListener('click', () => cancel(control));
             control.root.addEventListener('click', openDiagnostics);
             inspect(control);
@@ -240,5 +288,7 @@
     }
 
     document.addEventListener('DOMContentLoaded', mount);
-    global.quantDomainSync = Object.freeze({ start: domain => start(controls.get(domain), false) });
+    global.quantDomainSync = Object.freeze({
+        start: (domain, options = {}) => start(controls.get(domain), options),
+    });
 })(window);

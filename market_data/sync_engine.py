@@ -9,6 +9,7 @@ from typing import Any
 
 from market_data.catalog import DatasetCatalog
 from market_data.models import DatasetSpec, DatasetSyncResult, FetchPage, SyncRequest, SyncResult
+from market_data.tushare_client import classify_provider_error
 
 
 @dataclass(frozen=True)
@@ -720,7 +721,8 @@ class SyncEngine:
         plan_cursor,
         page_offset,
     ) -> _PlannedOutcome:
-        message = self._message(exc)
+        provider_issue = classify_provider_error(exc)
+        message = provider_issue.message or self._message(exc)
         status = "failed" if spec.required else "warning"
         warning = None if spec.required else f"{spec.dataset_id}: {message}"
         state_error = self._safe_set_state(
@@ -736,6 +738,8 @@ class SyncEngine:
                 "plan_cursor": plan_cursor,
                 "page_offset": page_offset,
                 "page_complete": False,
+                "error_code": provider_issue.code,
+                "retryable": provider_issue.retryable,
             },
         )
         if state_error:
@@ -750,12 +754,15 @@ class SyncEngine:
                 cursor=cursor,
                 warning=warning,
                 error=message if status == "failed" else None,
+                error_code=provider_issue.code,
+                retryable=provider_issue.retryable,
             ),
             None if status == "warning" else "failed",
         )
 
     def _record_endpoint_issue(self, spec, request, state, exc) -> DatasetSyncResult:
-        message = self._message(exc)
+        provider_issue = classify_provider_error(exc)
+        message = provider_issue.message or self._message(exc)
         if spec.required:
             state_error = self._safe_set_state(
                 spec,
@@ -764,10 +771,21 @@ class SyncEngine:
                 cursor=(state or {}).get("cursor"),
                 error=message,
                 row_count=0,
+                details={
+                    "method": spec.method,
+                    "error_code": provider_issue.code,
+                    "retryable": provider_issue.retryable,
+                },
             )
             if state_error:
                 message = f"{message}; sync state write failed: {state_error}"
-            return DatasetSyncResult(spec.dataset_id, "failed", error=message)
+            return DatasetSyncResult(
+                spec.dataset_id,
+                "failed",
+                error=message,
+                error_code=provider_issue.code,
+                retryable=provider_issue.retryable,
+            )
 
         warning = f"{spec.dataset_id}: {message}"
         state_error = self._safe_set_state(
@@ -777,11 +795,28 @@ class SyncEngine:
             cursor=(state or {}).get("cursor"),
             warning=warning,
             row_count=0,
+            details={
+                "method": spec.method,
+                "error_code": provider_issue.code,
+                "retryable": provider_issue.retryable,
+            },
         )
         if state_error:
             message = f"sync state write failed: {state_error}"
-            return DatasetSyncResult(spec.dataset_id, "failed", error=message)
-        return DatasetSyncResult(spec.dataset_id, "warning", warning=warning)
+            return DatasetSyncResult(
+                spec.dataset_id,
+                "failed",
+                error=message,
+                error_code="UNKNOWN",
+                retryable=False,
+            )
+        return DatasetSyncResult(
+            spec.dataset_id,
+            "warning",
+            warning=warning,
+            error_code=provider_issue.code,
+            retryable=provider_issue.retryable,
+        )
 
     def _safe_set_state(self, spec, request, **values) -> str | None:
         try:
@@ -802,6 +837,8 @@ class SyncEngine:
             if request.datasets
             else self.catalog.for_domain(request.domain)
         )
+        if not specs:
+            raise ValueError(f"no datasets registered for domain {request.domain}")
         for spec in specs:
             if spec.domain != request.domain:
                 raise ValueError(
@@ -824,7 +861,7 @@ class SyncEngine:
         if payload is None:
             return [], None
         if isinstance(payload, Mapping) and "rows" in payload:
-            explicit_cursor = payload.get("cursor")
+            explicit_cursor = SyncEngine._clean_scalar(payload.get("cursor"))
             payload = payload.get("rows") or []
         elif hasattr(payload, "to_dict"):
             if bool(getattr(payload, "empty", False)):
@@ -838,8 +875,34 @@ class SyncEngine:
         for row in payload:
             if not isinstance(row, Mapping):
                 raise ValueError("provider rows must be mappings")
-            rows.append(dict(row))
+            rows.append(
+                {
+                    SyncEngine._normalize_field_name(key): SyncEngine._clean_scalar(value)
+                    for key, value in row.items()
+                }
+            )
         return rows, explicit_cursor
+
+    @staticmethod
+    def _normalize_field_name(value):
+        """Tushare macro endpoints may return uppercase column labels."""
+
+        return value.lower() if isinstance(value, str) else value
+
+    @staticmethod
+    def _clean_scalar(value):
+        """Normalize provider missing scalars without stringifying NaN or NaT."""
+
+        if value is None:
+            return None
+        try:
+            if bool(value != value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if type(value).__name__ in {"NAType", "NaTType"}:
+            return None
+        return value
 
     def _write_rows(self, spec, rows, cancel_event) -> _WriteOutcome:
         written = 0
@@ -939,6 +1002,24 @@ class SyncEngine:
         warnings,
         error=None,
     ) -> SyncResult:
+        structured_issue = next(
+            (
+                result
+                for result in reversed(tuple(results.values()))
+                if result.error_code
+            ),
+            None,
+        )
+        if structured_issue is not None:
+            error_code = structured_issue.error_code
+            retryable = structured_issue.retryable
+        elif error:
+            classified = classify_provider_error(RuntimeError(error))
+            error_code = classified.code
+            retryable = classified.retryable
+        else:
+            error_code = None
+            retryable = False
         self._emit(
             emitter,
             request,
@@ -947,6 +1028,8 @@ class SyncEngine:
             row_count=rows_written,
             warning_count=len(warnings),
             error=error,
+            error_code=error_code,
+            retryable=retryable,
         )
         return SyncResult(
             domain=request.domain,
@@ -955,4 +1038,6 @@ class SyncEngine:
             rows_written=rows_written,
             warnings=tuple(warnings),
             error=error,
+            error_code=error_code,
+            retryable=retryable,
         )

@@ -84,6 +84,14 @@ def test_client_refuses_to_fall_back_to_sdk_token_storage(monkeypatch):
     ("error", "code", "category", "retryable"),
     [
         (RuntimeError("没有访问该接口的权限"), "PERMISSION_DENIED", "permission", False),
+        (
+            RuntimeError(
+                "抱歉，您没有接口(sw_daily)访问权限，权限的具体详情访问：https://tushare.pro/document/1?doc_id=108。"
+            ),
+            "PERMISSION_DENIED",
+            "permission",
+            False,
+        ),
         (RuntimeError("invalid token"), "TOKEN_INVALID", "authentication", False),
         (RuntimeError("未找到 Tushare Token"), "TOKEN_MISSING", "authentication", False),
         (RuntimeError("每分钟最多访问该接口 200 次"), "RATE_LIMITED", "rate_limit", True),

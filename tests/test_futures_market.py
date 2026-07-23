@@ -142,6 +142,42 @@ def test_futures_mapping_plan_does_not_request_future_calendar_ranges(tmp_path):
     assert all(page.params["end_date"] == date.today().strftime("%Y%m%d") for page in pages)
 
 
+def test_futures_daily_plan_uses_contract_lifetime_and_completed_cursor(tmp_path):
+    catalog = futures_catalog()
+    store = DomainStore(tmp_path / "daily-plan.sqlite")
+    store.upsert_rows(
+        "fut_basic",
+        [
+            {
+                "ts_code": "IF2607.CFX",
+                "list_date": "20250721",
+                "delist_date": "20260717",
+            },
+            {
+                "ts_code": "IF1001.CFX",
+                "list_date": "20090101",
+                "delist_date": "20100115",
+            },
+        ],
+        key_fields=("ts_code",),
+    )
+
+    pages = tuple(
+        catalog.get("fut_daily").request_planner(
+            SyncRequest(domain="futures"),
+            {"status": "failed", "cursor": "20260101"},
+            store,
+        )
+    )
+
+    assert [page.params["ts_code"] for page in pages] == ["IF2607.CFX"]
+    assert pages[0].params == {
+        "ts_code": "IF2607.CFX",
+        "start_date": "20260101",
+        "end_date": min("20260717", date.today().strftime("%Y%m%d")),
+    }
+
+
 def test_futures_normalization_keeps_domain_specific_contract_fields():
     row = normalize_fut_basic(
         pd.DataFrame(
@@ -173,6 +209,27 @@ def test_active_contracts_exclude_expired_and_page_after_filtering(service):
     assert contracts["total"] == 1
     assert [row["symbol"] for row in contracts["items"]] == ["IF2607.CFX"]
     assert all(row["active_to"] >= "20260713" for row in contracts["items"])
+
+
+def test_contract_search_reads_beyond_first_sqlite_page(tmp_path):
+    store = DomainStore(tmp_path / "many-contracts.sqlite")
+    rows = [
+        {
+            "ts_code": f"T{index:04d}.DCE",
+            "name": f"测试合约 {index}",
+            "fut_code": "T",
+            "exchange": "DCE",
+            "list_date": "20260101",
+            "delist_date": "20261231",
+        }
+        for index in range(2_005)
+    ]
+    store.upsert_rows("fut_basic", rows, key_fields=("ts_code",))
+
+    payload = FuturesService(store).contracts(query="测试合约 2004", limit=10)
+
+    assert payload["total"] == 1
+    assert payload["items"][0]["symbol"] == "T2004.DCE"
 
 
 def test_continuous_symbols_returns_latest_verified_contract_mapping(service):

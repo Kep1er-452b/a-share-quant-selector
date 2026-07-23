@@ -16,12 +16,12 @@ from market_data.models import DatasetSpec
 from market_data.store import MAX_QUERY_LIMIT
 
 
-DOMAIN = "economy"
+DOMAIN = "macro"
 
 
 @dataclass(frozen=True)
 class MacroSeriesSpec:
-    """One display series mapped to one exact Tushare response field."""
+    """One display series backed by one exact Tushare response field."""
 
     series_id: str
     dataset: str
@@ -33,6 +33,10 @@ class MacroSeriesSpec:
     precision: int
     period_field: str
     reference_value: float | None = None
+    value_semantics: str = "level"
+    transform: str | None = None
+    chart_type: str = "line"
+    display_note: str = ""
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,28 +65,73 @@ def _series(
             precision=precision,
             period_field=period_field,
             reference_value=reference_value,
+            value_semantics="rate" if unit == "%" else "level",
         )
         for field, label, unit, precision in fields
     )
 
 
+def _gdp_series() -> tuple[MacroSeriesSpec, ...]:
+    """Expose both provider-exact YTD values and derived single-quarter flows."""
+
+    items: list[MacroSeriesSpec] = []
+    for field, label, yoy_field, yoy_label in (
+        ("gdp", "国内生产总值", "gdp_yoy", "国内生产总值当季同比"),
+        ("pi", "第一产业", "pi_yoy", "第一产业同比"),
+        ("si", "第二产业", "si_yoy", "第二产业同比"),
+        ("ti", "第三产业", "ti_yoy", "第三产业同比"),
+    ):
+        items.extend(
+            (
+                MacroSeriesSpec(
+                    series_id=f"cn_gdp.{field}_quarterly",
+                    dataset="cn_gdp",
+                    field=field,
+                    label=f"{label}单季度值",
+                    unit="亿元",
+                    frequency="quarterly",
+                    family="growth",
+                    precision=2,
+                    period_field="quarter",
+                    value_semantics="period_flow",
+                    transform="ytd_to_quarter",
+                    chart_type="bar",
+                    display_note=f"由 {field} 年内累计值差分计算",
+                ),
+                MacroSeriesSpec(
+                    series_id=f"cn_gdp.{field}",
+                    dataset="cn_gdp",
+                    field=field,
+                    label=f"{label}累计值",
+                    unit="亿元",
+                    frequency="quarterly",
+                    family="growth",
+                    precision=2,
+                    period_field="quarter",
+                    value_semantics="ytd_flow",
+                    chart_type="bar",
+                    display_note="年内累计；柱形展示，不跨年度连线",
+                ),
+                MacroSeriesSpec(
+                    series_id=f"cn_gdp.{yoy_field}",
+                    dataset="cn_gdp",
+                    field=yoy_field,
+                    label=yoy_label,
+                    unit="%",
+                    frequency="quarterly",
+                    family="growth",
+                    precision=2,
+                    period_field="quarter",
+                    value_semantics="rate",
+                    display_note="Tushare 官方当季同比口径",
+                ),
+            )
+        )
+    return tuple(items)
+
+
 MACRO_SERIES: tuple[MacroSeriesSpec, ...] = (
-    *_series(
-        "cn_gdp",
-        "quarter",
-        "quarterly",
-        "growth",
-        (
-            ("gdp", "国内生产总值累计值", "亿元", 2),
-            ("gdp_yoy", "国内生产总值当季同比", "%", 2),
-            ("pi", "第一产业累计值", "亿元", 2),
-            ("pi_yoy", "第一产业同比", "%", 2),
-            ("si", "第二产业累计值", "亿元", 2),
-            ("si_yoy", "第二产业同比", "%", 2),
-            ("ti", "第三产业累计值", "亿元", 2),
-            ("ti_yoy", "第三产业同比", "%", 2),
-        ),
-    ),
+    *_gdp_series(),
     *_series(
         "cn_cpi",
         "month",
@@ -380,6 +429,52 @@ def _stable_bucket_sample(points: list[dict[str, Any]], limit: int) -> list[dict
     return [points[index] for index in indexes]
 
 
+def _series_points(
+    spec: MacroSeriesSpec,
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build exact or explicitly derived observations for one catalog series."""
+
+    ordered = sorted(
+        (
+            row
+            for row in rows
+            if spec.period_field in row and spec.field in row
+        ),
+        key=lambda row: str(row[spec.period_field]),
+    )
+    if spec.transform is None:
+        return [
+            {"period": str(row[spec.period_field]), "value": row.get(spec.field)}
+            for row in ordered
+        ]
+    if spec.transform != "ytd_to_quarter":  # pragma: no cover - static catalog invariant
+        raise ValueError(f"unsupported macro series transform: {spec.transform}")
+
+    points: list[dict[str, Any]] = []
+    cumulative_by_year: dict[str, dict[int, float]] = defaultdict(dict)
+    for row in ordered:
+        period = str(row[spec.period_field]).upper()
+        year, separator, quarter_text = period.partition("Q")
+        if separator != "Q" or len(year) != 4 or quarter_text not in {"1", "2", "3", "4"}:
+            continue
+        try:
+            cumulative = float(row.get(spec.field))
+        except (TypeError, ValueError):
+            continue
+        quarter = int(quarter_text)
+        cumulative_by_year[year][quarter] = cumulative
+        if quarter == 1:
+            value = cumulative
+        else:
+            previous = cumulative_by_year[year].get(quarter - 1)
+            if previous is None:
+                continue
+            value = cumulative - previous
+        points.append({"period": period, "value": round(value, spec.precision)})
+    return points
+
+
 class EconomyService:
     """Expose registered macro series without mutating provider data."""
 
@@ -459,11 +554,7 @@ class EconomyService:
 
         payload_series = []
         for spec in selected:
-            points = [
-                {"period": str(row[spec.period_field]), "value": row.get(spec.field)}
-                for row in raw_rows[spec.dataset]
-                if spec.period_field in row and spec.field in row
-            ]
+            points = _series_points(spec, raw_rows[spec.dataset])
             sampled = len(points) > point_limit
             shown = _stable_bucket_sample(points, point_limit)
             item = spec.public()

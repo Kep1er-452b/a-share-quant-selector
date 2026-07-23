@@ -47,7 +47,7 @@
         byId('macro-series-list').innerHTML = items.map(item => `
             <label class="domain-series-option">
                 <input type="checkbox" value="${escapeHtml(item.series_id)}" ${state.selected.has(item.series_id) ? 'checked' : ''}>
-                <span><b>${escapeHtml(item.label)}</b><small>${escapeHtml(item.frequency)} / ${escapeHtml(item.unit)} / ${escapeHtml(item.field)}</small></span>
+                <span><b>${escapeHtml(item.label)}</b><small>${escapeHtml(item.frequency)} / ${escapeHtml(item.unit)} / ${escapeHtml(item.display_note || item.field)}</small></span>
             </label>
         `).join('') || '<div class="state-empty">该类别暂无本地序列定义</div>';
     }
@@ -56,12 +56,45 @@
         const periods = [...new Set(series.flatMap(item => (item.points || []).map(point => point.period)))].sort();
         const values = new Map(series.map(item => [item.series_id, new Map((item.points || []).map(point => [point.period, point.value]))]));
         byId('macro-exact-head').innerHTML = `<tr><th>期间</th>${series.map(item => `<th>${escapeHtml(item.label)} (${escapeHtml(item.unit)})</th>`).join('')}</tr>`;
-        byId('macro-exact-body').innerHTML = periods.slice(-500).map(period => `<tr><td>${escapeHtml(period)}</td>${series.map(item => `<td>${escapeHtml(values.get(item.series_id)?.get(period) ?? '--')}</td>`).join('')}</tr>`).join('') || '<tr><td class="state-empty">当前选择暂无本地数据</td></tr>';
-        byId('macro-unit-legend').innerHTML = series.map(item => `<span>${escapeHtml(item.label)}: ${escapeHtml(item.unit)} / ${escapeHtml(item.frequency)}</span>`).join('');
+        byId('macro-exact-body').innerHTML = periods.slice(-500).map(period => `<tr><td>${escapeHtml(period)}</td>${series.map(item => `<td>${escapeHtml(values.get(item.series_id)?.get(period) ?? '--')}</td>`).join('')}</tr>`).join('')
+            || `<tr><td colspan="${Math.max(1, series.length + 1)}" class="state-empty">当前选择暂无本地数据，请先同步可用数据集</td></tr>`;
+        byId('macro-unit-legend').innerHTML = series.map(item => `
+            <span>${escapeHtml(item.label)}: ${escapeHtml(item.unit)} / ${escapeHtml(item.frequency)}${item.display_note ? ` / ${escapeHtml(item.display_note)}` : ''}</span>
+        `).join('');
+    }
+    function renderChartMessage(message) {
+        if (!global.echarts) return;
+        if (!lifecycle.chart) lifecycle.chart = global.echarts.init(byId('macro-chart'));
+        lifecycle.chart.clear();
+        lifecycle.chart.setOption({
+            animation: false,
+            backgroundColor: '#000000',
+            graphic: [{
+                type: 'text',
+                left: 'center',
+                top: 'middle',
+                style: {
+                    text: message,
+                    fill: '#8c8c8c',
+                    font: '11px monospace',
+                    textAlign: 'center',
+                },
+            }],
+        }, true);
+    }
+    function clearSeriesState(message) {
+        byId('macro-unit-legend').textContent = 'UNIT --';
+        byId('macro-exact-head').innerHTML = '<tr><th>期间</th><th>数值</th></tr>';
+        byId('macro-exact-body').innerHTML = `<tr><td colspan="2" class="state-empty">${escapeHtml(message)}</td></tr>`;
+        renderChartMessage(message);
     }
     function renderChart(payload) {
         const series = Array.isArray(payload.series) ? payload.series : [];
         const periods = [...new Set(series.flatMap(item => (item.points || []).map(point => point.period)))].sort();
+        if (!periods.length) {
+            renderChartMessage('当前选择暂无本地观测值');
+            return false;
+        }
         const units = payload.axis_mode === 'shared'
             ? [series[0]?.unit || 'value']
             : [...new Set(series.map(item => item.unit || 'value'))];
@@ -77,7 +110,7 @@
             axisLabel: { color: '#8c8c8c' },
             nameTextStyle: { color: '#b8b8b8' },
         }));
-        if (!global.echarts) return;
+        if (!global.echarts) return true;
         if (!lifecycle.chart) lifecycle.chart = global.echarts.init(byId('macro-chart'));
         lifecycle.chart.setOption({
             animation: false,
@@ -90,9 +123,19 @@
             yAxis: yAxes,
             series: series.map(item => {
                 const values = new Map((item.points || []).map(point => [point.period, point.value]));
-                return { name: `${item.label} (${item.unit})`, type: 'line', yAxisIndex: axisForUnit.get(item.unit || 'value') || 0, showSymbol: false, data: periods.map(period => values.get(period) ?? null) };
+                const chartType = item.chart_type === 'bar' ? 'bar' : 'line';
+                return {
+                    name: `${item.label} (${item.unit})`,
+                    type: chartType,
+                    yAxisIndex: axisForUnit.get(item.unit || 'value') || 0,
+                    showSymbol: false,
+                    connectNulls: false,
+                    barMaxWidth: chartType === 'bar' ? 18 : undefined,
+                    data: periods.map(period => values.get(period) ?? null),
+                };
             }),
         }, true);
+        return true;
     }
 
     const workspace = {
@@ -141,25 +184,42 @@
                 state.catalog = Array.isArray(payload.items) ? payload.items : [];
                 renderFamilies();
                 renderCatalog();
-                setStatus(`${state.catalog.length} SERIES`, 'ready');
+                if (!state.catalog.length) {
+                    clearSeriesState('本地没有可用的宏观序列定义');
+                    setStatus('NO SERIES DEFINITIONS', 'warning');
+                    return;
+                }
+                setStatus(`${state.catalog.length} SERIES DEFINITIONS`, 'ready');
                 await workspace.loadSeries();
             } catch (error) {
-                if (error.name !== 'AbortError') setStatus(error.message, 'error');
+                if (error.name !== 'AbortError') {
+                    clearSeriesState(`序列目录读取失败：${error.message}`);
+                    setStatus(error.message, 'error');
+                }
             }
         },
         async loadSeries() {
-            if (!lifecycle.active || !state.selected.size) return;
+            if (!lifecycle.active) return;
+            if (!state.selected.size) {
+                clearSeriesState('当前类别没有可选序列');
+                setStatus('NO SERIES SELECTED', 'warning');
+                return;
+            }
             const params = new URLSearchParams({ max_points: '2000' });
             [...state.selected].forEach(seriesId => params.append('series_id', seriesId));
+            clearSeriesState('正在读取本地宏观序列');
             setStatus('LOADING SERIES', 'warning');
             try {
                 const payload = await requestJson(`/api/macro/series?${params}`);
                 if (!lifecycle.active) return;
-                renderChart(payload);
+                const hasPoints = renderChart(payload);
                 renderExact(payload);
-                setStatus('SERIES READY', 'ready');
+                setStatus(hasPoints ? 'SERIES READY' : 'NO LOCAL SERIES DATA', hasPoints ? 'ready' : 'warning');
             } catch (error) {
-                if (error.name !== 'AbortError') setStatus(error.message, 'error');
+                if (error.name !== 'AbortError') {
+                    clearSeriesState(`宏观序列读取失败：${error.message}`);
+                    setStatus(error.message, 'error');
+                }
             }
         },
     };

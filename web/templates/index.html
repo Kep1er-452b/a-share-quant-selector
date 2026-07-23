@@ -714,6 +714,9 @@
                                     <span class="panel-title" id="futures-chart-title">SELECT CONTRACT</span>
                                     <span class="domain-workspace-sub" id="futures-chart-meta">OHLC / SETTLE / OI</span>
                                 </div>
+                                <button class="btn btn-ghost" id="futures-sync-contract" type="button" hidden>
+                                    SYNC CONTRACT
+                                </button>
                             </div>
                             <div class="domain-chart" id="futures-kline"></div>
                         </section>
@@ -726,7 +729,7 @@
                     <header class="domain-workspace-bar">
                         <div>
                             <span class="panel-title">MACRO ECONOMY</span>
-                            <span class="domain-workspace-sub">增长、通胀、货币、景气与利率序列</span>
+                            <span class="domain-workspace-sub">增长默认使用单季度值；累计口径保留原始数据</span>
                         </div>
                         <div class="domain-workspace-actions">
                             <span class="domain-status" id="macro-status">LOCAL STORE</span>
@@ -751,7 +754,7 @@
                             <div class="domain-pane-head domain-pane-head-wrap">
                                 <div>
                                     <span class="panel-title">SERIES COMPARISON</span>
-                                    <span class="domain-workspace-sub">图表抽样，表格保留返回的精确行</span>
+                                    <span class="domain-workspace-sub">累计值使用柱形，不跨年度误连；表格保留精确值</span>
                                 </div>
                                 <div class="domain-unit-legend" id="macro-unit-legend">UNIT --</div>
                             </div>

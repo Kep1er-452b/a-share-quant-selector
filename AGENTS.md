@@ -219,7 +219,24 @@ Critical rules:
   indexed row/state access, JSON composite keys, and lightweight/deep health.
 - `market_data.sync_engine.SyncEngine` runs explicit preflight, plan, fetch,
   normalize, write, cache-refresh, quality, and terminal stages. Optional
-  permission failures become warnings; core failures remain terminal.
+  permission failures become structured warnings with `PERMISSION_DENIED`;
+  core failures remain terminal. Empty dataset catalogs fail fast instead of
+  reporting a zero-row success.
+- The macro catalog's canonical domain id is `macro`. Provider field names are
+  normalized to lowercase before schema normalization because Tushare economy
+  endpoints may return uppercase columns.
+- GDP and first/second/third-industry source rows remain stored exactly as
+  Tushare year-to-date cumulative values. The macro read model additionally
+  exposes `*_quarterly` series derived by within-year sequential differences;
+  those single-quarter flows are the Growth workspace defaults. Cumulative
+  flows render as bars, never as a continuous cross-year line.
+- Futures metadata and daily history have separate user actions: the normal
+  futures sync refreshes metadata, while the selected-contract action fetches
+  only that contract's daily window. Full planners clamp requests to each
+  contract's listing and delisting dates.
+- Industry classification, members, PMI, and PPI remain usable when the
+  subscription does not include `sw_daily`; the missing industry-index K-line
+  is shown as an explicit partial-data state rather than failing the workspace.
 - Domain sync requests and query limits are bounded. Completed Web sync jobs
   retain only the newest terminal entries, while active jobs remain preserved.
 - Tushare tokens are resolved in memory from `TUSHARE_TOKEN` or ignored local
@@ -395,6 +412,36 @@ Baseline commit: `a45a43f` on branch
 
 State at handoff:
 
+- The macro GDP visualization now distinguishes provider-exact year-to-date
+  cumulative values from derived single-quarter flows. Growth defaults to
+  `cn_gdp.gdp_quarterly`; Q1 uses the provider cumulative value and Q2-Q4 use
+  consecutive within-year differences. Sparse years never subtract across a
+  missing quarter or across calendar years. Raw cumulative series remain
+  selectable and render as bars alongside official `gdp_yoy` line data.
+  Browser verification covered the default single-quarter chart, the raw
+  cumulative plus official YoY combination, exact tables, labels, and an empty
+  browser error log.
+- The current uncommitted domain-sync repair batch was tested with a fresh
+  Tushare token supplied only through a temporary process environment. Real
+  isolated syncs produced 6,595 macro rows, 11,119 futures metadata rows, 44
+  daily rows for `IF2607.CFX`, and 6,965 industry rows; a subsequent live Web
+  industry refresh wrote 7,075 rows. The account exposed every exercised core
+  endpoint except optional `sw_daily`, which now yields
+  `completed_with_warnings` while preserving classification, members, and
+  economy-series data.
+- Macro registration now uses the `macro` domain, empty catalogs fail fast,
+  Tushare permission errors are structured and retry-aware, provider columns
+  are case-normalized, and NaN/NaT values are removed before persistence.
+  Futures metadata pagination covers the full local catalog, daily planners use
+  contract-specific windows, and the UI adds an explicit selected-contract
+  sync action. Macro, futures, and industry workspaces clear stale charts and
+  distinguish empty, partial, permission, running, and terminal states.
+- A live Edge pass verified macro data rendering, futures metadata and selected
+  contract synchronization, industry partial-success messaging, industry
+  member deep links, and A-share market activation when opening an A-share
+  instrument from a previously active Hong Kong context. The focused regression
+  set passed (`104 passed`) and the full suite passed (`401 passed in 19.64s`).
+  These changes remain unstaged and uncommitted for manual review.
 - The current uncommitted multi-market batch adds independent Hong Kong,
   futures, macro, industry, and operations data/services/APIs/workspaces. Equity
   navigation is market-context driven, with explicit A-share/Hong Kong policy

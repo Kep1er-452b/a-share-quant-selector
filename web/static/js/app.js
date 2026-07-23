@@ -758,12 +758,16 @@ async function activateInstrumentRoute(route) {
     if (state.activeInstrumentRouteKey === routeKey && document.getElementById('stock-modal')?.classList.contains('active')) {
         return;
     }
-    if (currentEquityMarket() !== route.market) {
+    const marketChanged = currentEquityMarket() !== route.market;
+    if (marketChanged) {
         window.quantMarketContext.setMarket(route.market, { silent: true });
         resetEquityMarketCaches();
     }
     state.activeInstrumentRouteKey = routeKey;
     switchPage('stocks', { syncRoute: false });
+    if (marketChanged) {
+        await loadStats();
+    }
     await viewStockDetail(detailSymbol);
 }
 
@@ -949,7 +953,11 @@ async function loadStats() {
     }
 
     try {
-        if (currentEquityMarket() === 'hong_kong') {
+        const market = currentEquityMarket();
+        if (market === 'hong_kong') {
+            updateGlobalTicker('HONG KONG  LOADING  HKD  LOCAL STORE');
+            updateTextWithFlash('stocks-total-label', '正在载入港股本地仓库...');
+            updateTextWithFlash('sidebar-universe-text', 'HONG KONG');
             const data = await apiFetch('/api/equities/hong_kong/overview');
             renderHongKongDashboard(data);
             const total = data.instrument_count || 0;
@@ -965,6 +973,9 @@ async function loadStats() {
             return;
         }
         restoreAShareDashboardShell();
+        updateGlobalTicker('A-SHARE  LOADING  LOCAL STORE');
+        updateTextWithFlash('stocks-total-label', '正在载入 A 股本地仓库...');
+        updateTextWithFlash('sidebar-universe-text', 'ALL BOARDS');
         const result = await apiFetch('/api/stats');
         if (!result.success) {
             return;
@@ -5844,6 +5855,7 @@ function bindEvents() {
     });
     window.addEventListener('quant:market-change', () => {
         resetEquityMarketCaches();
+        loadStats();
         switchPage(state.currentPage);
     });
     const handleNavigationClick = event => {

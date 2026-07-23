@@ -83,8 +83,13 @@ def test_instrument_hash_routes_open_canonical_market_detail_and_restore_source(
     instrument_activation = app_js.split("async function activateInstrumentRoute", 1)[1].split(
         "function returnFromInstrumentRoute", 1
     )[0]
+    instrument_open = router_js.split("function openInstrument", 1)[1].split(
+        "function restoreSourceState", 1
+    )[0]
     assert "setMarket(route.market, { silent: true })" in instrument_activation
     assert "resetEquityMarketCaches()" in instrument_activation
+    assert "await loadStats()" in instrument_activation
+    assert "setMarket(" not in instrument_open
 
 
 def test_equity_market_hash_restores_market_context_and_workspace():

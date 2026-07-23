@@ -8,6 +8,7 @@
         searchTimer: null,
         listeners: [],
         chart: null,
+        selectedSymbol: null,
     };
 
     const byId = id => document.getElementById(id);
@@ -49,7 +50,7 @@
         const items = Array.isArray(payload.items) ? payload.items.slice(0, 300) : [];
         if (!items.length) {
             body.innerHTML = '<tr><td colspan="4" class="state-empty">本地仓库暂无匹配合约</td></tr>';
-            return;
+            return 0;
         }
         body.innerHTML = items.map(item => `
             <tr class="domain-click-row" data-futures-symbol="${escapeHtml(item.symbol)}">
@@ -59,6 +60,28 @@
                 <td>${escapeHtml(item.active_to || item.delist_date || '--')}</td>
             </tr>
         `).join('');
+        return items.length;
+    }
+
+    function renderChartMessage(message) {
+        if (!global.echarts) return;
+        if (!lifecycle.chart) lifecycle.chart = global.echarts.init(byId('futures-kline'));
+        lifecycle.chart.clear();
+        lifecycle.chart.setOption({
+            animation: false,
+            backgroundColor: '#000000',
+            graphic: [{
+                type: 'text',
+                left: 'center',
+                top: 'middle',
+                style: {
+                    text: message,
+                    fill: '#8c8c8c',
+                    font: '11px monospace',
+                    textAlign: 'center',
+                },
+            }],
+        }, true);
     }
 
     function renderKline(payload) {
@@ -67,7 +90,11 @@
         byId('futures-chart-meta').textContent = candles.length
             ? `${candles.length} BARS / SETTLE ${candles.at(-1).settle ?? '--'} / OI ${candles.at(-1).oi ?? '--'}`
             : 'NO LOCAL DAILY DATA';
-        if (!global.echarts) return;
+        if (!candles.length) {
+            renderChartMessage('该合约只有本地元数据，暂无日线数据');
+            return false;
+        }
+        if (!global.echarts) return true;
         if (!lifecycle.chart) lifecycle.chart = global.echarts.init(byId('futures-kline'));
         lifecycle.chart.setOption({
             animation: false,
@@ -82,6 +109,7 @@
                 itemStyle: { color: '#ff3131', color0: '#00ff41', borderColor: '#ff3131', borderColor0: '#00ff41' },
             }],
         }, true);
+        return true;
     }
 
     const workspace = {
@@ -97,6 +125,19 @@
             listen(byId('futures-contracts-body'), 'click', event => {
                 const row = event.target.closest('[data-futures-symbol]');
                 if (row) workspace.loadKline(row.dataset.futuresSymbol);
+            });
+            listen(byId('futures-sync-contract'), 'click', () => {
+                const symbol = lifecycle.selectedSymbol;
+                if (!symbol || !global.quantDomainSync) return;
+                global.quantDomainSync.start('futures', {
+                    datasets: ['fut_daily'],
+                    scope: `contract:${symbol}`,
+                    params: { ts_code: symbol },
+                });
+            });
+            listen(global, 'quant:domain-sync-complete', event => {
+                if (event.detail?.domain !== 'futures' || !lifecycle.selectedSymbol) return;
+                global.setTimeout(() => workspace.loadKline(lifecycle.selectedSymbol), 300);
             });
             lifecycle.mounted = true;
         },
@@ -121,6 +162,8 @@
             lifecycle.mounted = false;
             lifecycle.chart?.dispose();
             lifecycle.chart = null;
+            lifecycle.selectedSymbol = null;
+            if (byId('futures-sync-contract')) byId('futures-sync-contract').hidden = true;
         },
 
         async refresh() {
@@ -136,23 +179,41 @@
             try {
                 const payload = await requestJson(`/api/futures/contracts?${params}`);
                 if (!lifecycle.active) return;
-                renderContracts(payload);
-                setStatus(`${payload.total || 0} CONTRACTS`, 'ready');
+                const rendered = renderContracts(payload);
+                setStatus(
+                    rendered ? `${payload.total || rendered} CONTRACTS` : 'NO MATCHING CONTRACTS',
+                    rendered ? 'ready' : 'warning',
+                );
             } catch (error) {
-                if (error.name !== 'AbortError') setStatus(error.message, 'error');
+                if (error.name !== 'AbortError') {
+                    setStatus(`CACHED CONTRACT LIST: ${error.message}`, 'error');
+                }
             }
         },
 
         async loadKline(symbol) {
             if (!lifecycle.active || !symbol) return;
+            lifecycle.selectedSymbol = symbol;
+            const syncButton = byId('futures-sync-contract');
+            if (syncButton) {
+                syncButton.hidden = false;
+                syncButton.textContent = 'SYNC CONTRACT';
+            }
+            byId('futures-chart-title').textContent = symbol;
+            byId('futures-chart-meta').textContent = 'LOADING LOCAL DAILY DATA';
+            renderChartMessage(`正在读取 ${symbol}`);
             setStatus('LOADING KLINE', 'warning');
             try {
                 const payload = await requestJson(`/api/futures/kline/${encodeURIComponent(symbol)}?limit=520`);
                 if (!lifecycle.active) return;
-                renderKline(payload);
-                setStatus('KLINE READY', 'ready');
+                const hasCandles = renderKline(payload);
+                setStatus(hasCandles ? 'KLINE READY' : 'NO LOCAL DAILY DATA', hasCandles ? 'ready' : 'warning');
             } catch (error) {
-                if (error.name !== 'AbortError') setStatus(error.message, 'error');
+                if (error.name !== 'AbortError') {
+                    byId('futures-chart-meta').textContent = 'LOAD FAILED';
+                    renderChartMessage(`${symbol} 加载失败\n${error.message}`);
+                    setStatus(error.message, 'error');
+                }
             }
         },
     };

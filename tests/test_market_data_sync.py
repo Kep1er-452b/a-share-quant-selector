@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 from threading import Event
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -209,6 +210,12 @@ def test_optional_permission_error_becomes_warning_and_sync_continues():
     assert store.states[("hk_finance", "default")]["status"] == "warning"
     assert store.rows["hk_basic"][0]["name"] == "腾讯控股"
     assert events[-1]["status"] == "completed_with_warnings"
+    assert result.datasets["hk_finance"].error_code == "PERMISSION_DENIED"
+    assert result.datasets["hk_finance"].retryable is False
+    assert result.error_code == "PERMISSION_DENIED"
+    assert result.retryable is False
+    assert events[-1]["error_code"] == "PERMISSION_DENIED"
+    assert events[-1]["retryable"] is False
 
 
 def test_optional_non_permission_endpoint_error_also_becomes_warning():
@@ -252,6 +259,100 @@ def test_required_dataset_failure_stops_job_and_records_error():
     assert "hk_daily" not in store.rows
     assert [call[0] for call in client.calls] == ["hk_basic"]
     assert events[-1]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("error", "error_code"),
+    [
+        (TimeoutError("connection timed out"), "NETWORK_UNREACHABLE"),
+        (RuntimeError("每分钟最多访问该接口 200 次"), "RATE_LIMITED"),
+    ],
+)
+def test_required_retryable_provider_failure_exposes_structured_semantics(
+    error, error_code
+):
+    engine, store, events = engine_for(
+        FakeClient(hk_basic=error),
+        spec("hk_basic"),
+    )
+
+    result = engine.run(
+        SyncRequest(domain="hong_kong", datasets=("hk_basic",)),
+        cancel_event=Event(),
+        emit=events.append,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == error_code
+    assert result.retryable is True
+    assert result.datasets["hk_basic"].error_code == error_code
+    assert result.datasets["hk_basic"].retryable is True
+    assert events[-1]["error_code"] == error_code
+    assert events[-1]["retryable"] is True
+    assert store.states[("hk_basic", "default")]["details"]["error_code"] == error_code
+    assert store.states[("hk_basic", "default")]["details"]["retryable"] is True
+
+
+def test_dataframe_missing_scalars_are_normalized_before_write_and_cursor():
+    payload = pd.DataFrame(
+        [
+            {
+                "ts_code": "IF2607.CFX",
+                "list_date": pd.NaT,
+                "delist_date": float("nan"),
+            }
+        ]
+    )
+    engine, store, events = engine_for(
+        FakeClient(fut_basic=payload),
+        DatasetSpec(
+            dataset_id="fut_basic",
+            domain="futures",
+            method="fut_basic",
+            key_fields=("ts_code",),
+            date_field="list_date",
+        ),
+    )
+
+    result = engine.run(
+        SyncRequest(domain="futures", datasets=("fut_basic",)),
+        cancel_event=Event(),
+        emit=events.append,
+    )
+
+    assert result.status == "completed"
+    assert store.rows["fut_basic"] == [
+        {
+            "ts_code": "IF2607.CFX",
+            "list_date": None,
+            "delist_date": None,
+        }
+    ]
+    assert store.states[("fut_basic", "default")]["cursor"] is None
+
+
+def test_dataframe_uppercase_provider_fields_are_normalized_for_macro_keys():
+    payload = pd.DataFrame([{"MONTH": "202506", "PMI010000": 50.2}])
+    engine, store, events = engine_for(
+        FakeClient(cn_pmi=payload),
+        DatasetSpec(
+            dataset_id="cn_pmi",
+            domain="macro",
+            method="cn_pmi",
+            key_fields=("month",),
+            date_field="month",
+        ),
+    )
+
+    result = engine.run(
+        SyncRequest(domain="macro", datasets=("cn_pmi",)),
+        cancel_event=Event(),
+        emit=events.append,
+    )
+
+    assert result.status == "completed"
+    assert store.rows["cn_pmi"] == [{"month": "202506", "pmi010000": 50.2}]
+    assert store.states[("cn_pmi", "default")]["cursor"] == "202506"
 
 
 def test_sync_engine_does_not_fetch_or_write_when_already_cancelled():
@@ -553,6 +654,22 @@ def test_request_rejects_dataset_from_a_different_domain():
     assert result.status == "failed"
     assert "does not belong to domain" in result.error
     assert store.writes == []
+
+
+def test_sync_engine_rejects_domain_without_registered_datasets():
+    engine, store, events = engine_for(FakeClient())
+
+    result = engine.run(
+        SyncRequest(domain="macro"),
+        cancel_event=Event(),
+        emit=events.append,
+    )
+
+    assert result.status == "failed"
+    assert result.error == "no datasets registered for domain macro"
+    assert store.writes == []
+    assert [event["phase"] for event in events] == ["preflight", "terminal"]
+    assert events[-1]["status"] == "failed"
 
 
 def test_planned_full_sync_uses_explicit_bounds_and_provider_pagination():

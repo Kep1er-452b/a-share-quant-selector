@@ -127,6 +127,8 @@ class DatasetSyncResult:
     cursor: Any = None
     warning: str | None = None
     error: str | None = None
+    error_code: str | None = None
+    retryable: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,8 @@ class SyncResult:
     rows_written: int = 0
     warnings: tuple[str, ...] = ()
     error: str | None = None
+    error_code: str | None = None
+    retryable: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "datasets", MappingProxyType(dict(self.datasets)))

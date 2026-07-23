@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -76,6 +77,8 @@ def classify_provider_error(exc: BaseException) -> ProviderIssue:
 
     message = str(exc or "")
     combined = f"{type(exc).__name__} {message}".lower()
+    if re.search(r"没有接口\s*(?:\([^)]*\))?\s*访问权限", combined):
+        return ProviderIssue("PERMISSION_DENIED", "permission", False, message)
     rules = (
         (
             "TOKEN_MISSING",

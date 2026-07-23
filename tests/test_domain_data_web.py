@@ -5,6 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import web_server
 import web_api.domain_data as domain_data
+from market_data.catalog import DatasetCatalog
+from market_data.models import DatasetSpec, DatasetSyncResult, SyncResult
 from market_data.store import DomainStore
 
 
@@ -84,7 +86,85 @@ def test_domain_status_exposes_empty_local_state_without_invented_zeroes():
     payload = response.get_json()
     assert payload["domain"] == "hong_kong"
     assert payload["state"] == "empty"
+    assert payload["datasets"]
+    assert all(item["row_count"] == 0 for item in payload["datasets"].values())
     assert "token" not in str(payload).lower()
+
+
+def test_domain_status_reports_catalog_coverage_and_latest_sync_state(monkeypatch):
+    monkeypatch.setitem(
+        domain_data._CATALOGS,
+        "macro",
+        lambda: DatasetCatalog(
+            (
+                DatasetSpec(
+                    dataset_id="required_one",
+                    domain="macro",
+                    method="required_one",
+                    key_fields=("period",),
+                    date_field="period",
+                ),
+                DatasetSpec(
+                    dataset_id="required_two",
+                    domain="macro",
+                    method="required_two",
+                    key_fields=("period",),
+                    date_field="period",
+                ),
+                DatasetSpec(
+                    dataset_id="optional_one",
+                    domain="macro",
+                    method="optional_one",
+                    key_fields=("period",),
+                    date_field="period",
+                    required=False,
+                ),
+            )
+        ),
+    )
+    store = domain_data._store("macro")
+    store.upsert_rows(
+        "required_one",
+        [{"period": "2025Q4", "value": 1}],
+        key_fields=("period",),
+        date_field="period",
+    )
+    store.set_sync_state(
+        "required_one",
+        scope="older",
+        status="completed",
+        cursor="2025Q3",
+    )
+    store.set_sync_state(
+        "required_one",
+        scope="default",
+        status="failed",
+        cursor="2025Q4",
+        error="network unavailable",
+        details={"error_code": "NETWORK_UNREACHABLE", "retryable": True},
+    )
+
+    partial = web_server.app.test_client().get("/api/domain-status/macro").get_json()
+
+    assert partial["state"] == "partial"
+    assert partial["datasets"]["required_one"]["row_count"] == 1
+    assert partial["datasets"]["required_one"]["max_data_date"] == "2025Q4"
+    assert partial["datasets"]["required_one"]["max_updated_at"]
+    assert partial["datasets"]["required_one"]["required"] is True
+    assert partial["datasets"]["required_one"]["sync_state"]["scope"] == "default"
+    assert partial["datasets"]["required_one"]["sync_state"]["status"] == "failed"
+    assert partial["datasets"]["required_two"]["row_count"] == 0
+    assert partial["datasets"]["optional_one"]["required"] is False
+
+    store.upsert_rows(
+        "required_two",
+        [{"period": "2025Q4", "value": 2}],
+        key_fields=("period",),
+        date_field="period",
+    )
+    ready = web_server.app.test_client().get("/api/domain-status/macro").get_json()
+
+    assert ready["state"] == "ready"
 
 
 def test_sync_job_pruning_is_bounded_and_preserves_active_jobs():
@@ -193,3 +273,51 @@ def test_sync_terminal_cleanup_releases_domain_even_after_unexpected_failure(mon
 
         domain_data._SYNC_JOBS.clear()
         domain_data._SYNC_CANCEL.clear()
+
+
+def test_sync_job_result_serializes_dataset_error_semantics(monkeypatch):
+    job_id = "job-structured"
+    cancel = domain_data.Event()
+    with domain_data._SYNC_LOCK:
+        domain_data._SYNC_JOBS[job_id] = {
+            "job_id": job_id,
+            "domain": "industry",
+            "status": "queued",
+            "events": [],
+            "result": None,
+        }
+        domain_data._SYNC_CANCEL[job_id] = cancel
+        domain_data._ACTIVE_SYNC_DOMAINS["industry"] = job_id
+
+    result = SyncResult(
+        domain="industry",
+        status="failed",
+        datasets={
+            "sw_daily": DatasetSyncResult(
+                "sw_daily",
+                "failed",
+                error="没有接口(sw_daily)访问权限",
+                error_code="PERMISSION_DENIED",
+                retryable=False,
+            )
+        },
+        error="没有接口(sw_daily)访问权限",
+        error_code="PERMISSION_DENIED",
+        retryable=False,
+    )
+    monkeypatch.setattr(domain_data.SyncEngine, "run", lambda *_args, **_kwargs: result)
+
+    domain_data._run_sync_job(
+        job_id,
+        domain_data.SyncRequest(domain="industry"),
+        object(),
+        object(),
+        object(),
+        cancel,
+    )
+
+    payload = domain_data._SYNC_JOBS[job_id]["result"]
+    assert payload["error_code"] == "PERMISSION_DENIED"
+    assert payload["retryable"] is False
+    assert payload["datasets"]["sw_daily"]["error_code"] == "PERMISSION_DENIED"
+    assert payload["datasets"]["sw_daily"]["retryable"] is False

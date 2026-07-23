@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping
 from datetime import date
 from typing import Any
 
-from market_data.catalog import DatasetCatalog, partition_planner, symbol_calendar_planner
+from market_data.catalog import DatasetCatalog, partition_planner
 from market_data.models import DatasetSpec, FetchPage
 from market_data.store import MAX_QUERY_LIMIT
 
@@ -51,13 +51,7 @@ def futures_catalog() -> DatasetCatalog:
                 symbol_field="ts_code",
                 date_field="trade_date",
                 batch_size=1000,
-                request_planner=symbol_calendar_planner(
-                    source_dataset="fut_basic",
-                    source_field="ts_code",
-                    full_start="19900101",
-                    years_per_window=5,
-                    allowed=("trade_date",),
-                ),
+                request_planner=_futures_daily_planner,
                 fetch_page_size=2000,
                 max_fetch_pages=100_000,
             ),
@@ -75,6 +69,76 @@ def futures_catalog() -> DatasetCatalog:
             ),
         )
     )
+
+
+def _valid_day(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if len(text) == 8 and text.isdigit() else ""
+
+
+def _all_store_rows(store, dataset: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while offset < 100_000:
+        page = store.query_rows(dataset, limit=MAX_QUERY_LIMIT, offset=offset)
+        rows.extend(page)
+        if len(page) < MAX_QUERY_LIMIT:
+            return rows
+        offset += len(page)
+    raise ValueError(f"{dataset} exceeds the bounded futures metadata limit")
+
+
+def _futures_daily_planner(request, state, store):
+    """Use each contract's real lifetime instead of empty 1990-era windows."""
+
+    exact_date = _valid_day(request.params.get("trade_date"))
+    requested_symbol = _text(request.params.get("ts_code"))
+    if exact_date:
+        params = {"trade_date": exact_date}
+        if requested_symbol:
+            params["ts_code"] = requested_symbol
+        return (FetchPage(cursor=f"trade_date={exact_date}", params=params),)
+
+    rows = normalize_fut_basic(_all_store_rows(store, "fut_basic"))
+    if requested_symbol:
+        rows = [row for row in rows if row["ts_code"] == requested_symbol]
+        if not rows:
+            rows = [{"ts_code": requested_symbol, "active_from": "", "active_to": ""}]
+    if not rows:
+        raise ValueError("sync planning requires populated fut_basic metadata")
+
+    today = date.today().strftime("%Y%m%d")
+    supplied_start = _valid_day(request.params.get("start_date"))
+    supplied_end = _valid_day(request.params.get("end_date"))
+    stored_cursor = _valid_day((state or {}).get("cursor"))
+    pages = []
+    for row in sorted(rows, key=lambda item: item["ts_code"]):
+        symbol = row["ts_code"]
+        list_date = _valid_day(row.get("active_from") or row.get("list_date"))
+        delist_date = _valid_day(row.get("active_to") or row.get("delist_date"))
+        start_date = supplied_start or max(
+            (value for value in (stored_cursor, list_date, "19900101") if value),
+            default="19900101",
+        )
+        end_date = supplied_end or min(
+            (value for value in (delist_date, today) if value),
+            default=today,
+        )
+        if start_date > end_date:
+            continue
+        pages.append(
+            FetchPage(
+                cursor=f"{symbol}:{start_date}-{end_date}",
+                params={
+                    "ts_code": symbol,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            )
+        )
+    if not pages:
+        raise ValueError("no futures contracts overlap the requested date range")
+    return tuple(pages)
 
 
 def _futures_mapping_planner(request, state, store):
@@ -284,9 +348,7 @@ class FuturesService:
         exchange_key = _exchange("", exchange) if exchange else ""
         product_key = _text(product)
         active_date = _text(active_on)
-        rows = normalize_fut_basic(
-            self.store.query_rows("fut_basic", limit=MAX_QUERY_LIMIT)
-        )
+        rows = normalize_fut_basic(_all_store_rows(self.store, "fut_basic"))
         items = []
         for row in rows:
             searchable = " ".join(
@@ -318,11 +380,11 @@ class FuturesService:
         limit, offset = self._page(limit, offset)
         exchange_key = _exchange("", exchange) if exchange else ""
         active_date = _text(active_on)
-        rows = normalize_fut_mapping(
-            self.store.query_rows("fut_mapping", end_date=active_date or None, limit=MAX_QUERY_LIMIT)
-        )
+        rows = normalize_fut_mapping(_all_store_rows(self.store, "fut_mapping"))
         latest: dict[str, dict[str, Any]] = {}
         for row in rows:
+            if active_date and row["trade_date"] > active_date:
+                continue
             if exchange_key and row["exchange"] != exchange_key:
                 continue
             current = latest.get(row["continuous_symbol"])

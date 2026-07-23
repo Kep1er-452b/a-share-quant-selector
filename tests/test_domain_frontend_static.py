@@ -64,6 +64,24 @@ def test_domain_sync_renders_visible_structured_job_details_and_diagnostic_entry
     assert "replaceChildren" in js
 
 
+def test_domain_sync_button_visibility_and_permission_failures_have_explicit_contracts():
+    css = STYLE_CSS.read_text(encoding="utf-8")
+    js = DOMAIN_SYNC_JS.read_text(encoding="utf-8")
+
+    assert ".domain-sync-controls [hidden]" in css
+    assert "display: none !important" in css
+    assert "permission_denied" in js
+    assert "isPermissionDenied" in js
+    assert "control.start.hidden = active || permissionDenied" in js
+    assert "control.cancel.hidden = !active" in js
+    assert "detail.retryable !== false" in js
+    assert "control.retry.hidden = !canRetry || permissionDenied" in js
+    assert "job.status !== 'cancelled'" in js
+    assert "refreshWorkspace(control.domain)" in js
+    assert "datasets: ['fut_basic']" in js
+    assert "start: (domain, options = {})" in js
+
+
 def test_each_domain_controller_has_a_bounded_abortable_lifecycle():
     for path in (FUTURES_JS, MACRO_JS, INDUSTRY_JS):
         js = path.read_text(encoding="utf-8")
@@ -84,10 +102,17 @@ def test_futures_workspace_supports_contract_search_and_kline():
         "futures-product",
         "futures-contracts-body",
         "futures-kline",
+        "futures-sync-contract",
     ):
         assert f'id="{control}"' in html
     assert "/api/futures/contracts" in js
     assert "/api/futures/kline/" in js
+    assert "renderChartMessage" in js
+    assert "NO LOCAL DAILY DATA" in js
+    assert "CACHED CONTRACT LIST:" in js
+    assert "hasCandles ? 'KLINE READY' : 'NO LOCAL DAILY DATA'" in js
+    assert "datasets: ['fut_daily']" in js
+    assert "scope: `contract:${symbol}`" in js
 
 
 def test_macro_workspace_exposes_family_series_units_and_exact_table():
@@ -109,6 +134,15 @@ def test_macro_workspace_exposes_family_series_units_and_exact_table():
     assert "type: 'category'" in js
     assert "yAxisIndex" in js
     assert "payload.axis_mode" in js
+    assert "item.chart_type === 'bar'" in js
+    assert "connectNulls: false" in js
+    assert "item.display_note || item.field" in js
+    assert "clearSeriesState" in js
+    assert "NO LOCAL SERIES DATA" in js
+    assert "NO SERIES SELECTED" in js
+    assert "Math.max(1, series.length + 1)" in js
+    assert "增长默认使用单季度值" in html
+    assert "累计值使用柱形" in html
 
 
 def test_industry_workspace_has_two_layers_and_shared_instrument_deep_links():
@@ -124,6 +158,10 @@ def test_industry_workspace_has_two_layers_and_shared_instrument_deep_links():
     assert "quantEquityRouter.openInstrument" in js
     assert "yAxisIndex" in js
     assert "payload.axis_mode" in js
+    assert "clearIndustryDetail" in js
+    assert "PARTIAL LOCAL DETAIL" in js
+    assert "NO LOCAL CYCLE DATA" in js
+    assert "state.industryId = null" in js
 
 
 def test_application_shell_activates_and_deactivates_domain_controllers():

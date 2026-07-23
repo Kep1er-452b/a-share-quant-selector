@@ -254,6 +254,14 @@ select {
     display: none;
 }
 
+.domain-sync-controls [hidden] {
+    display: none !important;
+}
+
+.domain-pane-head [hidden] {
+    display: none !important;
+}
+
 .quote-chart-toolbar [hidden] {
     display: none !important;
 }
@@ -270,7 +278,8 @@ select {
 }
 
 .domain-sync-controls[data-sync-status="completed_with_warnings"] .domain-sync-state,
-.domain-sync-controls[data-sync-status="token_missing"] .domain-sync-state {
+.domain-sync-controls[data-sync-status="token_missing"] .domain-sync-state,
+.domain-sync-controls[data-sync-status="permission_denied"] .domain-sync-state {
     color: var(--gold);
 }
 
@@ -283,6 +292,21 @@ select {
 .equity-domain-sync {
     padding-left: 6px;
     border-left: 1px solid var(--verydim);
+}
+
+.domain-sync-details {
+    min-width: 0;
+    max-width: min(58vw, 760px);
+    overflow: hidden;
+    color: var(--neutral);
+    font-size: 9px;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.domain-sync-detail {
+    white-space: nowrap;
 }
 
 .asset-tab {

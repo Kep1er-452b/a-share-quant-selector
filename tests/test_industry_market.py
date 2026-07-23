@@ -101,6 +101,7 @@ def test_industry_catalog_registers_classification_index_and_cycle_datasets():
         "cn_ppi",
     }
     assert specs["index_member_all"].method == "index_member_all"
+    assert specs["sw_daily"].required is False
 
 
 def test_industry_plans_partition_hierarchy_and_index_symbols(tmp_path):
@@ -144,8 +145,29 @@ def test_industry_detail_returns_instrument_links_and_index_kline(service):
     )
     assert payload["members"][0]["name"] == "比亚迪"
     assert payload["index_candles"][0]["close"] == 5240.0
+    assert payload["index_candles_state"]["status"] == "ready"
     assert payload["coverage"]["ratio"] == 0.5
     assert payload["unclassified"]
+
+
+def test_industry_detail_explains_optional_sw_daily_permission_gap(tmp_path):
+    store = DomainStore(tmp_path / "industry-permission.sqlite")
+    store.upsert_rows(
+        "index_classify",
+        [{"index_code": "801880.SI", "industry_name": "汽车", "level": "L1"}],
+        key_fields=("index_code",),
+    )
+    store.set_sync_state(
+        "sw_daily",
+        status="warning",
+        warning="sw_daily: 抱歉，您没有接口(sw_daily)访问权限",
+    )
+
+    payload = IndustryService(store).detail("801880.SI")
+
+    assert payload["index_candles"] == []
+    assert payload["index_candles_state"]["status"] == "permission_denied"
+    assert "分类" in payload["index_candles_state"]["message"]
 
 
 def test_industry_cycle_keeps_different_units_on_separate_axes(service):

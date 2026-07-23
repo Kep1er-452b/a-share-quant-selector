@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from functools import lru_cache
+import json
 import os
 from threading import Event, Lock
 import uuid
@@ -18,6 +20,7 @@ from market_data.models import SyncRequest
 from market_data.store import DomainStore
 from market_data.sync_engine import SyncEngine
 from market_data.tushare_client import TushareClientFactory
+from market_data.tushare_client import classify_provider_error
 from utils.local_config import load_config_file
 from utils.platform_paths import runtime_paths
 
@@ -130,11 +133,64 @@ def domain_status(domain: str):
         return jsonify({"error": "unknown domain"}), 404
     store = _store(domain)
     health = store.health()
+    catalog = _CATALOGS[domain]()
     with store.connect() as conn:
-        has_rows = conn.execute("SELECT 1 FROM dataset_rows LIMIT 1").fetchone() is not None
+        row_stats = {
+            row["dataset"]: dict(row)
+            for row in conn.execute(
+                """
+                SELECT dataset,
+                       COUNT(*) AS row_count,
+                       MAX(data_date) AS max_data_date,
+                       MAX(updated_at) AS max_updated_at
+                FROM dataset_rows
+                GROUP BY dataset
+                """
+            ).fetchall()
+        }
+        sync_states = {}
+        for row in conn.execute(
+            """
+            SELECT dataset, scope, status, cursor, start_date, end_date,
+                   warning, error, row_count, details_json, updated_at
+            FROM sync_state
+            ORDER BY dataset ASC, updated_at DESC, scope ASC
+            """
+        ).fetchall():
+            if row["dataset"] in sync_states:
+                continue
+            state = dict(row)
+            details_json = state.pop("details_json")
+            state["details"] = json.loads(details_json) if details_json else None
+            sync_states[row["dataset"]] = state
+
+    datasets = {}
+    required_populated = []
+    any_rows = False
+    for spec in catalog:
+        stats = row_stats.get(spec.dataset_id) or {}
+        row_count = int(stats.get("row_count") or 0)
+        any_rows = any_rows or row_count > 0
+        if spec.required:
+            required_populated.append(row_count > 0)
+        datasets[spec.dataset_id] = {
+            "row_count": row_count,
+            "max_data_date": stats.get("max_data_date"),
+            "max_updated_at": stats.get("max_updated_at"),
+            "required": spec.required,
+            "sync_state": sync_states.get(spec.dataset_id),
+        }
+    state = (
+        "empty"
+        if not any_rows
+        else "ready"
+        if required_populated and all(required_populated)
+        else "partial"
+    )
     return jsonify({
         "domain": domain,
-        "state": "ready" if has_rows else "empty",
+        "state": state,
+        "datasets": datasets,
         "schema_version": health["schema_version"],
         "storage_bytes": health["db_size_bytes"],
         "integrity": health["integrity"],
@@ -297,8 +353,15 @@ def _run_sync_job(job_id, sync_request, catalog, store, client, cancel):
                 "rows_written": result.rows_written,
                 "warnings": list(result.warnings),
                 "error": result.error,
+                "error_code": result.error_code,
+                "retryable": result.retryable,
+                "datasets": {
+                    dataset_id: asdict(dataset_result)
+                    for dataset_id, dataset_result in result.datasets.items()
+                },
             }
     except Exception as exc:
+        issue = classify_provider_error(exc)
         with _SYNC_LOCK:
             job = _SYNC_JOBS.get(job_id)
             if job is not None:
@@ -307,13 +370,18 @@ def _run_sync_job(job_id, sync_request, catalog, store, client, cancel):
                     "status": "error",
                     "rows_written": 0,
                     "warnings": [],
-                    "error": str(exc) or exc.__class__.__name__,
+                    "error": issue.message or exc.__class__.__name__,
+                    "error_code": issue.code,
+                    "retryable": issue.retryable,
+                    "datasets": {},
                 }
         _observe_sync_event(job_id, domain, {
             "phase": "terminal",
             "status": "error",
             "rows_written": 0,
-            "error": str(exc) or exc.__class__.__name__,
+            "error": issue.message or exc.__class__.__name__,
+            "error_code": issue.code,
+            "retryable": issue.retryable,
         })
     finally:
         with _SYNC_LOCK:

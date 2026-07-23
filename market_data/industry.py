@@ -76,6 +76,7 @@ def industry_catalog() -> DatasetCatalog:
                 key_fields=("ts_code", "trade_date"),
                 symbol_field="ts_code",
                 date_field="trade_date",
+                required=False,
                 request_planner=symbol_calendar_planner(
                     source_dataset="index_classify",
                     source_field="index_code",
@@ -253,6 +254,7 @@ class IndustryService:
             "sw_daily", symbol=industry_key, limit=candle_limit
         )
         candles.reverse()
+        candle_state = self._index_candle_state(candles)
         coverage, unclassified = self._coverage()
         return {
             "industry": {
@@ -264,8 +266,30 @@ class IndustryService:
             },
             "members": members,
             "index_candles": candles,
+            "index_candles_state": candle_state,
             "coverage": coverage,
             "unclassified": unclassified,
+        }
+
+    def _index_candle_state(self, candles: list[dict[str, Any]]) -> dict[str, Any]:
+        if candles:
+            return {"status": "ready", "message": ""}
+        state = self.store.get_sync_state("sw_daily") or {}
+        message = _text(state.get("warning") or state.get("error"))
+        permission_denied = (
+            "没有接口" in message and "访问权限" in message
+        ) or "PERMISSION_DENIED" in message
+        if permission_denied:
+            return {
+                "status": "permission_denied",
+                "message": (
+                    "当前订阅不含申万指数日线（sw_daily，通常需更高积分）；"
+                    "行业分类、成分股和个股 K 线仍可使用。"
+                ),
+            }
+        return {
+            "status": "empty",
+            "message": "尚未同步该行业的指数日线；行业分类和成分股仍可使用。",
         }
 
     def cycle_series(
