@@ -15,6 +15,7 @@ from utils.strategy_labels import is_invalid_stock_name
 
 class B2BetaStrategy(BaseStrategy):
     """B2 选股 Beta 版"""
+    MIN_HISTORY_DAYS = 160
 
     def __init__(self, params=None):
         default_params = {

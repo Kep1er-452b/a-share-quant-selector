@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -47,11 +48,19 @@ class DomainStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _ensure_schema(self) -> None:
         # Compatibility must be checked before changing journaling mode or
@@ -74,8 +83,6 @@ class DomainStore:
                             "domain store schema is newer than this application: "
                             f"{existing_version} > {SCHEMA_VERSION}"
                         )
-
-        with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(
@@ -266,6 +273,7 @@ class DomainStore:
         dataset: str,
         *,
         rows_per_symbol: int = 1,
+        end_date: str | None = None,
         limit: int = 200,
         offset: int = 0,
     ) -> list[dict]:
@@ -277,6 +285,7 @@ class DomainStore:
         """
 
         dataset_id = self._required_text(dataset, "dataset")
+        end_text = self._optional_text(end_date)
         try:
             symbol_limit = int(limit)
             symbol_offset = int(offset)
@@ -292,11 +301,12 @@ class DomainStore:
         if history_limit < 1 or history_limit > 2:
             raise ValueError("rows_per_symbol must be between 1 and 2")
 
-        sql = """
+        date_filter = " AND data_date <= ?" if end_text else ""
+        sql = f"""
             WITH selected_symbols AS (
                 SELECT symbol
                 FROM dataset_rows
-                WHERE dataset = ? AND symbol IS NOT NULL
+                WHERE dataset = ? AND symbol IS NOT NULL{date_filter}
                 GROUP BY symbol
                 ORDER BY symbol ASC
                 LIMIT ? OFFSET ?
@@ -310,25 +320,26 @@ class DomainStore:
                 FROM dataset_rows AS rows
                 INNER JOIN selected_symbols AS selected
                     ON selected.symbol = rows.symbol
-                WHERE rows.dataset = ?
+                WHERE rows.dataset = ?{date_filter.replace("data_date", "rows.data_date")}
             )
             SELECT payload_json
             FROM ranked
             WHERE row_rank <= ?
             ORDER BY symbol ASC, row_rank ASC
         """
+        selected_args = [dataset_id]
+        if end_text:
+            selected_args.append(end_text)
+        selected_args.extend((symbol_limit, symbol_offset, dataset_id))
+        if end_text:
+            selected_args.append(end_text)
+        selected_args.append(history_limit)
         started_at = time.perf_counter()
         try:
             with self.connect() as conn:
                 rows = conn.execute(
                     sql,
-                    (
-                        dataset_id,
-                        symbol_limit,
-                        symbol_offset,
-                        dataset_id,
-                        history_limit,
-                    ),
+                    tuple(selected_args),
                 ).fetchall()
         finally:
             _observe_db_duration("query_latest_rows", started_at)

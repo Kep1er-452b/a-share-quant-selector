@@ -17,6 +17,7 @@ from threading import Lock
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.csv_manager import CSVManager
+from utils.atomic_io import atomic_write_json
 from utils.data_provider import BaseDataProvider, DataProviderError, normalize_market_cap_yuan
 
 # 设置请求会话
@@ -395,8 +396,7 @@ class AKShareFetcher(BaseDataProvider):
     def _save_stock_names(self, stock_dict):
         """保存股票名称到本地"""
         try:
-            with open(self.stock_names_file, 'w', encoding='utf-8') as f:
-                json.dump(stock_dict, f, ensure_ascii=False, indent=2)
+            atomic_write_json(self.stock_names_file, stock_dict)
         except Exception as e:
             print(f"  保存股票名称失败: {e}")
 
@@ -815,16 +815,19 @@ class AKShareFetcher(BaseDataProvider):
                             'high': float(item[3]),  # 最高 (item[3])
                             'low': float(item[4]),   # 最低 (item[4])
                             'volume': int(float(item[5])),
-                            'amount': 0,  # 腾讯接口不直接提供成交额
-                            'turnover': 0,  # 腾讯接口没有换手率
+                            'amount': np.nan,  # 腾讯接口不直接提供成交额
+                            'turnover': np.nan,  # 腾讯接口没有换手率
                         })
                 
                 if records:
                     df = pd.DataFrame(records)
                     df['date'] = pd.to_datetime(df['date'])
-                    df['market_cap'] = 0
+                    df['market_cap'] = np.nan
                     df = df.sort_values('date', ascending=False)
-                    return self._mark_data_source(df, source)
+                    effective_source = source
+                    if years * 365 > max_days:
+                        effective_source = f'{source}:coverage_truncated'
+                    return self._mark_data_source(df, effective_source)
             
             return None
         except DataProviderError:
@@ -1197,16 +1200,16 @@ class AKShareFetcher(BaseDataProvider):
                             'high': float(item[3]),  # 最高
                             'low': float(item[4]),   # 最低
                             'volume': int(float(item[5])),
-                            'amount': 0,
-                            'turnover': 0,
+                            'amount': np.nan,
+                            'turnover': np.nan,
                         })
                 
                 if records:
                     df = pd.DataFrame(records)
                     df['date'] = pd.to_datetime(df['date'])
-                    df['amount'] = 0
-                    df['turnover'] = 0
-                    df['market_cap'] = 0
+                    df['amount'] = np.nan
+                    df['turnover'] = np.nan
+                    df['market_cap'] = np.nan
                     df = df.sort_values('date', ascending=False)
                     return self._mark_data_source(df, source)
             
@@ -1492,8 +1495,7 @@ class AKShareFetcher(BaseDataProvider):
             # 只有在完整更新（非max_stocks模式）且收盘后才记录缓存
             if not max_stocks and is_after_market_close:
                 update_cache['last_update_date'] = today_str
-                with open(update_cache_file, 'w', encoding='utf-8') as f:
-                    json.dump(update_cache, f)
+                atomic_write_json(update_cache_file, update_cache, indent=None)
             print("✓ 所有数据已是最新")
             print("=" * 60)
             return
@@ -1554,8 +1556,7 @@ class AKShareFetcher(BaseDataProvider):
         
         # 更新缓存记录
         update_cache['last_update_date'] = today_str
-        with open(update_cache_file, 'w', encoding='utf-8') as f:
-            json.dump(update_cache, f)
+        atomic_write_json(update_cache_file, update_cache, indent=None)
         
         print("=" * 60)
         print(f"完成! 更新成功: {updated}, 跳过: {skipped}, 失败: {failed}")

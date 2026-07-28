@@ -51,13 +51,8 @@ def compress_image(filepath: str, max_size: int = MAX_FILE_SIZE) -> str:
         # 首先尝试PNG优化
         img.save(filepath, 'PNG', optimize=True)
         
-        # 如果仍然超过限制，使用JPEG压缩
-        if os.path.getsize(filepath) > max_size:
-            # 尝试不同的质量级别 (更激进的压缩)
-            for quality in [70, 60, 50, 40, 30]:
-                img.save(filepath, 'JPEG', quality=quality, optimize=True)
-                if os.path.getsize(filepath) <= max_size:
-                    break
+        # 保持扩展名和实际编码一致。PNG 仍超限时由通知层拒绝发送，
+        # 不能把 JPEG 字节写进 .png 文件。
         
         final_size = os.path.getsize(filepath)
         print(f"   图片压缩: {current_size/1024:.1f}KB -> {final_size/1024:.1f}KB")
@@ -130,12 +125,13 @@ def generate_kline_chart(
             ma114 = df['close'].rolling(window=114, min_periods=1).mean()
             df['bull_bear_line'] = (ma14 + ma28 + ma57 + ma114) / 4
         
-        # 只显示最近M天（默认20天），但用全部数据计算了双线
-        M = params.get('M', 20)
-        if len(df) > M:
-            df = df.tail(M).reset_index(drop=True)
     else:
         print(f"警告: 数据不足{len(df)}天，需要114天才能正确计算多空线")
+
+    # 显示窗口与指标计算所需的历史长度无关。
+    M = params.get('M', 20)
+    if len(df) > M:
+        df = df.tail(M).reset_index(drop=True)
     
     # 设置图表样式 (120dpi，清晰显示)
     if show_text:

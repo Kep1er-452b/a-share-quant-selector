@@ -762,12 +762,14 @@ class DingTalkNotifier:
             with open(image_path, 'rb') as f:
                 image_data = f.read()
 
+            # Webhook markdown 消息体只有约 20KB 可用；普通 K 线 PNG 的
+            # base64 远超该上限，明确拒绝而不是执行注定失败的网络请求。
+            if len(image_data) > 12 * 1024:
+                print("⚠️ 图片超过钉钉 Webhook markdown 可用大小，已跳过图片通道")
+                return False
+
             # 转为base64
             image_base64 = base64.b64encode(image_data).decode('utf-8')
-
-            # 检查大小（钉钉限制约2MB）
-            if len(image_data) > 2 * 1024 * 1024:
-                print(f"⚠️ 图片超过2MB，可能发送失败")
 
             # 构建data URL（markdown格式）
             # 使用png格式（K线图保存为png）
@@ -788,17 +790,17 @@ class DingTalkNotifier:
             # 发送
             success = self._send_request(data)
 
-            # 发送成功后删除本地图片
-            if success:
-                import os
-                os.remove(image_path)
-                print(f"✓ 已删除本地图片: {image_path}")
-
             return success
 
         except Exception as e:
             print(f"✗ 图片发送失败: {e}")
             return False
+        finally:
+            try:
+                Path(image_path).unlink(missing_ok=True)
+                print(f"✓ 已清理本地临时图片: {image_path}")
+            except OSError as exc:
+                print(f"⚠️ 清理本地临时图片失败: {exc}")
 
     def _format_stock_info_message(self, stock_code, stock_name, category, params, signal):
         """

@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.request
 from collections import Counter, deque
+from concurrent.futures import Future
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -67,8 +68,8 @@ class TushareFetcher(BaseDataProvider):
         self.token = (token or "").strip()
         if not self.token:
             raise DataProviderError(
-                "未找到 Tushare Token。请先设置环境变量 TUSHARE_TOKEN，或在 config/config_local.yaml / "
-                "config/config.yaml 中配置 data_source.tushare.token，或在交互模式下输入 token。"
+                "未找到 Tushare Token。请设置环境变量 TUSHARE_TOKEN，或仅在被 Git 忽略的 "
+                "config/config_local.yaml 中配置 data_source.tushare.token。"
             )
 
         try:
@@ -96,10 +97,12 @@ class TushareFetcher(BaseDataProvider):
         self.daily_basic_cache_lock = Lock()
         self.daily_basic_by_date_cache = {}
         self.daily_basic_by_date_failures = set()
+        self.daily_basic_inflight = {}
         self.daily_basic_date_cache_max_days = 40
         self.daily_basic_api_calls = 0
         self.daily_basic_cache_hits = 0
         self._latest_trade_date_cache = None
+        self._latest_trade_date_cache_checked_on = None
         self._latest_trade_date_daily_basic_cache = pd.DataFrame()
         self.trade_calendar_cache_file = Path(data_dir) / "trade_calendar_cache.json"
         self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
@@ -471,16 +474,26 @@ class TushareFetcher(BaseDataProvider):
 
     def _get_latest_trade_date(self, max_lookback_days=10):
         """获取最近一个可用交易日"""
-        if self._latest_trade_date_cache:
-            return self._latest_trade_date_cache, self._latest_trade_date_daily_basic_cache.copy()
+        today_key = datetime.now().date().isoformat()
+        with self.daily_basic_cache_lock:
+            if (
+                self._latest_trade_date_cache
+                and getattr(self, "_latest_trade_date_cache_checked_on", None) == today_key
+            ):
+                return (
+                    self._latest_trade_date_cache,
+                    self._latest_trade_date_daily_basic_cache.copy(),
+                )
 
         for delta in range(max_lookback_days):
             trade_date = (datetime.now() - timedelta(days=delta)).strftime("%Y%m%d")
             try:
                 df = self._fetch_daily_basic_trade_date(trade_date)
                 if df is not None and not df.empty:
-                    self._latest_trade_date_cache = trade_date
-                    self._latest_trade_date_daily_basic_cache = df.copy()
+                    with self.daily_basic_cache_lock:
+                        self._latest_trade_date_cache = trade_date
+                        self._latest_trade_date_cache_checked_on = today_key
+                        self._latest_trade_date_daily_basic_cache = df.copy()
                     return trade_date, df
             except TushareProviderError:
                 raise
@@ -686,8 +699,24 @@ class TushareFetcher(BaseDataProvider):
             if date_key in self.daily_basic_by_date_cache:
                 self.daily_basic_cache_hits += 1
                 return self.daily_basic_by_date_cache[date_key].copy()
+            inflight_map = getattr(self, "daily_basic_inflight", None)
+            if inflight_map is None:
+                inflight_map = {}
+                self.daily_basic_inflight = inflight_map
+            inflight = inflight_map.get(date_key)
+            if inflight is None:
+                inflight = Future()
+                inflight_map[date_key] = inflight
+                owns_request = True
+            else:
+                self.daily_basic_cache_hits += 1
+                owns_request = False
 
-            last_error = None
+        if not owns_request:
+            return inflight.result().copy()
+
+        last_error = None
+        try:
             for attempt in range(4):
                 try:
                     df = self._call_daily_basic(
@@ -696,9 +725,12 @@ class TushareFetcher(BaseDataProvider):
                     )
                     if not isinstance(df, pd.DataFrame):
                         df = pd.DataFrame()
-                    self.daily_basic_by_date_cache[date_key] = df.copy()
+                    with self.daily_basic_cache_lock:
+                        self.daily_basic_by_date_cache[date_key] = df.copy()
+                    inflight.set_result(df.copy())
                     return df
-                except TushareProviderError:
+                except TushareProviderError as exc:
+                    inflight.set_exception(exc)
                     raise
                 except Exception as e:
                     last_error = e
@@ -711,10 +743,16 @@ class TushareFetcher(BaseDataProvider):
                     if attempt < 3:
                         time.sleep(0.5 * (attempt + 1))
 
-            self.daily_basic_by_date_failures.add(date_key)
+            with self.daily_basic_cache_lock:
+                self.daily_basic_by_date_failures.add(date_key)
             if last_error is not None:
                 print(f"  获取 {date_key} daily_basic 失败: {last_error}")
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            inflight.set_result(empty)
+            return empty
+        finally:
+            with self.daily_basic_cache_lock:
+                self.daily_basic_inflight.pop(date_key, None)
 
     def _fetch_daily_basic_from_trade_date_cache(self, ts_code: str, start_date: str, end_date: str):
         start = pd.to_datetime(start_date).date()
@@ -1090,8 +1128,10 @@ class TushareFetcher(BaseDataProvider):
             raise TushareProviderError("pro_bar OHLC 关系异常", code="SCHEMA_MISMATCH", endpoint="pro_bar")
         checks.append({"id": "pro_bar", "status": "passed", "stock_code": sample_code, "rows": len(price_df)})
 
-        self._latest_trade_date_cache = latest_trade_date
-        self._latest_trade_date_daily_basic_cache = daily_basic_df.copy()
+        with self.daily_basic_cache_lock:
+            self._latest_trade_date_cache = latest_trade_date
+            self._latest_trade_date_cache_checked_on = datetime.now().date().isoformat()
+            self._latest_trade_date_daily_basic_cache = daily_basic_df.copy()
         self._preflight_stock_basic_df = stock_basic_df.copy()
         self._preflight_warnings = list(warnings)
         self._preflight_result = {

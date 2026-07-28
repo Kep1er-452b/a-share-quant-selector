@@ -5,10 +5,11 @@ Validation helpers for user-editable YAML configuration.
 from __future__ import annotations
 
 import copy
-import os
 from pathlib import Path
 
 import yaml
+
+from utils.atomic_io import atomic_write_text
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -175,14 +176,12 @@ def atomic_write_yaml(path, payload):
 
     backup_path = target.with_suffix(target.suffix + ".bak")
     if target.exists():
-        backup_path.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        atomic_write_text(backup_path, target.read_text(encoding="utf-8"))
 
-    tmp_path = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
-    tmp_path.write_text(
+    atomic_write_text(
+        target,
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
     )
-    os.replace(tmp_path, target)
     return backup_path if backup_path.exists() else None
 
 

@@ -31,6 +31,7 @@
 9. 选股信号 = 异动 AND 趋势线在上 AND J值低位 AND (回落碗中 OR 靠近多空线 OR 靠近短期趋势线)
 """
 import pandas as pd
+import numpy as np
 import sys
 from pathlib import Path
 
@@ -122,8 +123,9 @@ class BowlReboundStrategy(BaseStrategy):
         # 5. 放量阳线条件
         # 成交量 >= 前一日 * N
         ref_vol_1 = result['ref_vol_1'] if 'ref_vol_1' in result.columns else REF(result['volume'], 1)
-        result['vol_ratio'] = result['volume'] / ref_vol_1
-        result['vol_surge'] = result['vol_ratio'] >= self.params['N']
+        result['vol_ratio'] = result['volume'] / ref_vol_1.replace(0, np.nan)
+        result['vol_ratio'] = result['vol_ratio'].replace([np.inf, -np.inf], np.nan)
+        result['vol_surge'] = result['vol_ratio'].ge(self.params['N']).fillna(False)
         
         # 阳线：收盘价 > 开盘价
         result['positive_candle'] = result['close'] > result['open']
@@ -202,9 +204,12 @@ class BowlReboundStrategy(BaseStrategy):
         
         # 3. 异动条件：在M天内存在放量阳线
         lookback_df = df.head(self.params['M'])
+        valid_volume = pd.to_numeric(lookback_df['volume'], errors='coerce')
+        if valid_volume.notna().sum() == 0:
+            return []
 
         # 剔除：如果回顾期内最大成交量的一天是阴线（最大量是阴量）
-        max_volume_idx = lookback_df['volume'].idxmax()
+        max_volume_idx = valid_volume.idxmax()
         max_volume_row = lookback_df.loc[max_volume_idx]
         if max_volume_row['close'] < max_volume_row['open']:
             # 最大成交量那天是阴线，剔除
@@ -251,7 +256,11 @@ class BowlReboundStrategy(BaseStrategy):
             'date': latest_date,
             'close': round(latest['close'], 2),
             'J': round(latest['J'], 2),
-            'volume_ratio': round(latest['vol_ratio'], 2) if not pd.isna(latest['vol_ratio']) else 1.0,
+            'volume_ratio': (
+                round(latest['vol_ratio'], 2)
+                if np.isfinite(latest['vol_ratio'])
+                else 1.0
+            ),
             'market_cap': round(market_cap / 1e8, 2),
             'short_term_trend': round(latest['short_term_trend'], 2),
             'bull_bear_line': round(latest['bull_bear_line'], 2),

@@ -30,7 +30,11 @@
         const cleanSymbol = String(symbol || '').trim().toUpperCase();
         if (!cleanSymbol) throw new Error('Instrument symbol is required');
         if (sourceState) {
-            global.sessionStorage.setItem(SOURCE_STATE_KEY, JSON.stringify(sourceState));
+            try {
+                global.sessionStorage.setItem(SOURCE_STATE_KEY, JSON.stringify(sourceState));
+            } catch (_error) {
+                // Storage can be unavailable in private or locked-down WebViews.
+            }
         }
         const routeState = { market, symbol: cleanSymbol, sourceState: sourceState || null };
         global.history.pushState(routeState, '', routeFor(market, cleanSymbol));

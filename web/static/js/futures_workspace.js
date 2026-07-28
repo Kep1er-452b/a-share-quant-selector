@@ -31,11 +31,16 @@
         abortRequest();
         const controller = new AbortController();
         lifecycle.controller = controller;
-        const response = await fetch(url, { signal: controller.signal });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || `请求失败 (${response.status})`);
-        if (lifecycle.controller === controller) lifecycle.controller = null;
-        return payload;
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        try {
+            const response = await fetch(url, { signal: controller.signal });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || `请求失败 (${response.status})`);
+            return payload;
+        } finally {
+            clearTimeout(timeoutId);
+            if (lifecycle.controller === controller) lifecycle.controller = null;
+        }
     }
 
     function setStatus(message, tone = '') {

@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from market_data.hong_kong import canonical_hk_symbol
+from utils.atomic_io import atomic_write_json
 
 
 WATCHLIST_VERSION = 2
@@ -39,6 +41,7 @@ class MarketWatchlistStore:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._lock = RLock()
 
     @staticmethod
     def _now() -> str:
@@ -82,27 +85,23 @@ class MarketWatchlistStore:
         return {"version": WATCHLIST_VERSION, "items": normalized}, changed
 
     def _save(self, payload: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(self.path)
+        atomic_write_json(self.path, payload)
 
     def list_all(self, market: str | None = None) -> list[dict[str, Any]]:
-        payload, changed = self._normalized_payload()
-        if changed:
-            self._save(payload)
-        rows = list(payload["items"].values())
-        if market is not None:
-            market_id = str(market or "").strip()
-            if market_id not in SUPPORTED_MARKETS:
-                raise ValueError(f"unsupported equity market: {market_id}")
-            rows = [row for row in rows if row["market"] == market_id]
-        return sorted(
-            (dict(row) for row in rows),
-            key=lambda row: (str(row.get("created_at") or ""), row["market"], row["symbol"]),
-        )
+        with self._lock:
+            payload, changed = self._normalized_payload()
+            if changed:
+                self._save(payload)
+            rows = list(payload["items"].values())
+            if market is not None:
+                market_id = str(market or "").strip()
+                if market_id not in SUPPORTED_MARKETS:
+                    raise ValueError(f"unsupported equity market: {market_id}")
+                rows = [row for row in rows if row["market"] == market_id]
+            return sorted(
+                (dict(row) for row in rows),
+                key=lambda row: (str(row.get("created_at") or ""), row["market"], row["symbol"]),
+            )
 
     def add(
         self,
@@ -113,33 +112,35 @@ class MarketWatchlistStore:
         note: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        market_id = str(market or "").strip()
-        canonical = canonical_equity_symbol(market_id, symbol)
-        identity = watchlist_identity(market_id, canonical)
-        payload, _changed = self._normalized_payload()
-        existing = dict(payload["items"].get(identity) or {})
-        now = self._now()
-        item = {
-            **existing,
-            **dict(metadata or {}),
-            "market": market_id,
-            "symbol": canonical,
-            "code": canonical.split(".", 1)[0] if market_id == "a_share" else canonical,
-            "name": str(name or existing.get("name") or "").strip(),
-            "note": str(note if note != "" else existing.get("note") or ""),
-            "created_at": existing.get("created_at") or now,
-            "updated_at": now,
-        }
-        payload["items"][identity] = item
-        self._save(payload)
-        return dict(item)
+        with self._lock:
+            market_id = str(market or "").strip()
+            canonical = canonical_equity_symbol(market_id, symbol)
+            identity = watchlist_identity(market_id, canonical)
+            payload, _changed = self._normalized_payload()
+            existing = dict(payload["items"].get(identity) or {})
+            now = self._now()
+            item = {
+                **existing,
+                **dict(metadata or {}),
+                "market": market_id,
+                "symbol": canonical,
+                "code": canonical.split(".", 1)[0] if market_id == "a_share" else canonical,
+                "name": str(name or existing.get("name") or "").strip(),
+                "note": str(note if note != "" else existing.get("note") or ""),
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+            }
+            payload["items"][identity] = item
+            self._save(payload)
+            return dict(item)
 
     def remove(self, market: str, symbol: object) -> bool:
-        identity = watchlist_identity(market, symbol)
-        payload, _changed = self._normalized_payload()
-        removed = payload["items"].pop(identity, None) is not None
-        self._save(payload)
-        return removed
+        with self._lock:
+            identity = watchlist_identity(market, symbol)
+            payload, _changed = self._normalized_payload()
+            removed = payload["items"].pop(identity, None) is not None
+            self._save(payload)
+            return removed
 
 
 __all__ = [

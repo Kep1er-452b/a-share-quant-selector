@@ -119,13 +119,17 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     category_count = {}
     error_counts = {strategy_name: 0 for strategy_name in strategies}
     error_details = []
-    processed_count = len(candidates)
+    processed_count = 0
     valid_count = 0
     skipped_count = 0
     last_processed_code = None
     last_processed_name = None
 
     for code, name in candidates:
+        cancel_event = worker_context.get("cancel_event")
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        processed_count += 1
         canonical_symbol = canonical_equity_symbol(market_id, code)
         result_code = canonical_symbol if market_id == "hong_kong" else canonical_symbol.split(".", 1)[0]
         last_processed_code = result_code
@@ -145,6 +149,14 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
         indicator_frames = []
 
         for strategy_name, strategy in strategies.items():
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            minimum_history = max(
+                60,
+                int(getattr(strategy, "MIN_HISTORY_DAYS", 60)),
+            )
+            if len(prepared_df) < minimum_history:
+                continue
             try:
                 df_with_indicators = strategy.calculate_indicators(prepared_df)
                 signal_list = strategy.select_stocks(df_with_indicators, name)

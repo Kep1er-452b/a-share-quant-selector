@@ -2,7 +2,6 @@
 策略注册器 - 支持动态加载策略
 """
 import importlib
-import sys
 import threading
 from pathlib import Path
 import yaml
@@ -58,10 +57,6 @@ class StrategyRegistry:
         if not strategy_path.exists():
             strategy_path = Path(__file__).parent
         
-        # 添加策略目录到路径
-        if str(strategy_path) not in sys.path:
-            sys.path.insert(0, str(strategy_path))
-        
         self.load_errors = []
 
         # 遍历策略文件
@@ -69,14 +64,11 @@ class StrategyRegistry:
             if py_file.name.startswith("_"):
                 continue
             
-            module_name = py_file.stem
+            module_name = f"strategy.{py_file.stem}"
             
             try:
                 # 动态导入模块
-                if module_name in sys.modules:
-                    module = sys.modules[module_name]
-                else:
-                    module = importlib.import_module(module_name)
+                module = importlib.import_module(module_name)
                 
                 # 查找策略类（继承自 BaseStrategy 的类）
                 from strategy.base_strategy import BaseStrategy

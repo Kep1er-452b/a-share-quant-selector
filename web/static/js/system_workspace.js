@@ -112,10 +112,12 @@
             const token = document.querySelector('meta[name="quant-session-token"]')?.content || '';
             const status = document.getElementById('ops-export-status');
             if (status) status.textContent = 'CANCELLING';
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
             try {
                 const response = await fetch(
                     `/api/ops/tasks/${encodeURIComponent(taskType)}/${encodeURIComponent(jobId)}/cancel`,
-                    { method: 'POST', headers: { 'X-Quant-Session': token } },
+                    { method: 'POST', headers: { 'X-Quant-Session': token }, signal: controller.signal },
                 );
                 const payload = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -126,18 +128,23 @@
                     status.textContent = 'CANCEL ERROR';
                     status.title = error.message;
                 }
+            } finally {
+                clearTimeout(timeoutId);
             }
         }
 
         async exportDiagnostics() {
             const status = document.getElementById('ops-export-status');
             if (status) status.textContent = 'EXPORTING';
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
             try {
                 const token = document.querySelector('meta[name="quant-session-token"]')?.content || '';
                 const response = await fetch('/api/ops/diagnostics/export', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-Quant-Session': token },
                     body: JSON.stringify({ limit: 200 }),
+                    signal: controller.signal,
                 });
                 const payload = await response.json();
                 if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -150,13 +157,20 @@
                     status.textContent = 'EXPORT ERROR';
                     status.title = error.message;
                 }
+            } finally {
+                clearTimeout(timeoutId);
             }
         }
 
         async fetchInto(url, targetId, renderer) {
             if (!this.active) return;
+            const controller = new AbortController();
+            const parentSignal = this.controller?.signal;
+            const abortFromParent = () => controller.abort();
+            parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
             try {
-                const response = await fetch(url, { signal: this.controller?.signal });
+                const response = await fetch(url, { signal: controller.signal });
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const payload = await response.json();
                 const target = document.getElementById(targetId);
@@ -165,6 +179,9 @@
                 if (error.name === 'AbortError') return;
                 const target = document.getElementById(targetId);
                 if (target) target.innerHTML = `<div class="state-error">${this.escape(error.message)}</div>`;
+            } finally {
+                clearTimeout(timeoutId);
+                parentSignal?.removeEventListener('abort', abortFromParent);
             }
         }
 

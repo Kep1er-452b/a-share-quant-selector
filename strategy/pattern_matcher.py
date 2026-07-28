@@ -3,7 +3,6 @@
 使用DTW进行形态相似度计算
 """
 import numpy as np
-from scipy.spatial.distance import euclidean
 
 
 try:
@@ -111,8 +110,8 @@ class PatternMatcher:
                 similarities.append(0.2)
         
         # 4. 价格相对于短期趋势的偏离（百分比）
-        cand_price_bias = cand.get("price_vs_short_pct", cand.get("price_vs_short", 0) * 100 - 100)
-        case_price_bias = case.get("price_vs_short_pct", case.get("price_vs_short", 0) * 100 - 100)
+        cand_price_bias = cand.get("price_vs_short_pct", cand.get("price_vs_short", 1.0) * 100 - 100)
+        case_price_bias = case.get("price_vs_short_pct", case.get("price_vs_short", 1.0) * 100 - 100)
         price_bias_diff = abs(cand_price_bias - case_price_bias)
         sim = max(0, 1 - price_bias_diff / price_bias_tol)
         similarities.append(sim)
@@ -224,9 +223,13 @@ class PatternMatcher:
             if len(cand_curve) > 0 and len(case_curve) > 0:
                 if HAS_FASTDTW:
                     try:
-                        distance, _ = fastdtw(cand_curve, case_curve, dist=euclidean)
+                        distance, _ = fastdtw(
+                            cand_curve,
+                            case_curve,
+                            dist=lambda left, right: abs(float(left) - float(right)),
+                        )
                         curve_sim = self._normalize_dtw_score(distance, len(cand_curve), len(case_curve))
-                    except:
+                    except Exception:
                         curve_sim = self._simple_dtw(cand_curve, case_curve)
                 else:
                     curve_sim = self._simple_dtw(cand_curve, case_curve)
@@ -263,13 +266,13 @@ class PatternMatcher:
     def _normalize_dtw_score(self, distance: float, n: int, m: int) -> float:
         """归一化 DTW 距离为相似度分数 [0, 1]。
         
-        归一化曲线元素 ∈ [0,1]，最大可能欧氏距离为 sqrt(max(n,m))。
-        fastdtw / simple_dtw 两条路径共用此归一化，确保分数可比。
+        fastdtw 返回路径上的逐点距离和，因此按路径规模近似值 max(n,m)
+        归一化。simple_dtw 也返回相同的逐点绝对距离和。
         """
         max_len = max(n, m)
         if max_len <= 0:
             return 0.0
-        norm_factor = np.sqrt(float(max_len))
+        norm_factor = float(max_len)
         return max(0.0, float(1.0 - distance / norm_factor))
 
     def _simple_dtw(self, seq1: np.ndarray, seq2: np.ndarray) -> float:
@@ -295,6 +298,6 @@ class PatternMatcher:
                 )
             n = m = target_len
         
-        # 计算欧氏距离
-        distance = float(np.sqrt(np.sum((seq1 - seq2) ** 2)))
+        # 与 fastdtw 的逐点距离和保持相同尺度。
+        distance = float(np.sum(np.abs(seq1 - seq2)))
         return self._normalize_dtw_score(distance, n, m)

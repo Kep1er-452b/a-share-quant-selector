@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
 from threading import Lock
@@ -30,10 +31,19 @@ class OpsStore:
                 CREATE INDEX IF NOT EXISTS idx_ops_events_job ON ops_events(job_id, timestamp DESC);
             """)
 
+    @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        return conn
+        conn = sqlite3.connect(self.path, timeout=30)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def append(self, event: OpsEvent) -> None:
         payload = event.to_dict()

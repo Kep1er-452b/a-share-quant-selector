@@ -52,7 +52,7 @@ class TaskRegistry:
             try:
                 raw = provider()
             except Exception as exc:
-                source_errors.append({"task_type": kind, "error": str(exc)})
+                source_errors.append(redact({"task_type": kind, "error": str(exc)}))
                 continue
             jobs = raw.values() if isinstance(raw, Mapping) else (raw or ())
             for job in jobs:
@@ -82,4 +82,3 @@ class TaskRegistry:
             "offset": offset,
             "source_errors": source_errors,
         }
-

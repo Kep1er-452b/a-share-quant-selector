@@ -71,7 +71,7 @@ class EquityPolicy:
         compact = "".join(character for character in str(strategy or "").upper() if character.isalnum())
         if compact.startswith(("B1", "B2", "BOWL")):
             return "a_share_only"
-        return "a_share_only"
+        raise ValueError("unknown strategy scope; declare it explicitly")
 
     def is_strategy_allowed(self, strategy: str, *, declared_scope: str | None = None) -> bool:
         scope = str(declared_scope or self.strategy_scope(strategy)).strip()

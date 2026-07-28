@@ -4,6 +4,7 @@ CSV 数据管理工具
 import os
 import re
 import tempfile
+from contextlib import contextmanager, nullcontext
 from threading import RLock
 import pandas as pd
 from pathlib import Path
@@ -31,6 +32,34 @@ class CSVManager:
             if key not in cls._path_locks:
                 cls._path_locks[key] = RLock()
             return cls._path_locks[key]
+
+    @staticmethod
+    @contextmanager
+    def _process_lock_for_path(path: Path):
+        """Coordinate CSV writers across Web/CLI processes."""
+        lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                if lock_path.stat().st_size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     
     @classmethod
     def validate_stock_code(cls, stock_code):
@@ -112,10 +141,15 @@ class CSVManager:
         result["market_cap"] = result["market_cap"].fillna(0)
         return result
     
-    def write_stock(self, stock_code, df, write_guard=None):
+    def write_stock(self, stock_code, df, write_guard=None, _process_locked=False):
         """写入股票数据（自动去重排序，原子写入）"""
         path = self.get_stock_path(stock_code)
-        with self._lock_for_path(path):
+        process_lock = (
+            self._process_lock_for_path(path)
+            if not _process_locked
+            else nullcontext()
+        )
+        with self._lock_for_path(path), process_lock:
             if write_guard and not write_guard():
                 raise InterruptedError(f"{stock_code} 写入已取消")
             df = self._validate_stock_dataframe(df)
@@ -135,7 +169,10 @@ class CSVManager:
             )
             try:
                 os.close(tmp_fd)
-                df.to_csv(tmp_path, index=False)
+                with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
+                    df.to_csv(handle, index=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 if write_guard and not write_guard():
                     raise InterruptedError(f"{stock_code} 写入已取消")
                 os.replace(tmp_path, str(path))
@@ -149,7 +186,8 @@ class CSVManager:
     def _preserve_existing_metrics(existing_df, new_df):
         """
         在增量更新时，若新数据缺少辅助字段，则尽量保留旧值。
-        主要保护 turnover / market_cap，避免接口限流时把旧值覆盖成空值或 0。
+        主要保护 amount / turnover / market_cap，避免降级接口缺字段时把旧值
+        覆盖成空值或 0。
         """
         if existing_df.empty or new_df.empty:
             return new_df
@@ -157,7 +195,7 @@ class CSVManager:
         result = new_df.copy()
         existing_by_date = existing_df.drop_duplicates(subset=['date'], keep='last').set_index('date')
 
-        for column in ['turnover', 'market_cap']:
+        for column in ['amount', 'turnover', 'market_cap']:
             if column not in result.columns or column not in existing_by_date.columns:
                 continue
 
@@ -178,19 +216,29 @@ class CSVManager:
     def update_stock(self, stock_code, new_df, write_guard=None):
         """增量更新股票数据"""
         path = self.get_stock_path(stock_code)
-        with self._lock_for_path(path):
+        with self._lock_for_path(path), self._process_lock_for_path(path):
             if write_guard and not write_guard():
                 raise InterruptedError(f"{stock_code} 写入已取消")
             existing_df = self.read_stock(stock_code)
 
             if existing_df.empty:
-                return self.write_stock(stock_code, new_df, write_guard=write_guard)
+                return self.write_stock(
+                    stock_code,
+                    new_df,
+                    write_guard=write_guard,
+                    _process_locked=True,
+                )
 
             new_df = self._preserve_existing_metrics(existing_df, new_df)
 
             # 合并数据
             combined = pd.concat([existing_df, new_df], ignore_index=True)
-            return self.write_stock(stock_code, combined, write_guard=write_guard)
+            return self.write_stock(
+                stock_code,
+                combined,
+                write_guard=write_guard,
+                _process_locked=True,
+            )
     
     def list_all_stocks(self):
         """列出所有已保存的股票代码"""

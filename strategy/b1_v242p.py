@@ -194,6 +194,7 @@ def build_b1_v242p_signal(latest, category="b1_v242p", fallback_reason="满足 B
 
 class B1V242PStrategy(BaseStrategy):
     """B1 (V2.42P) 策略"""
+    MIN_HISTORY_DAYS = 160
 
     def __init__(self, params=None):
         super().__init__("B1 (V2.42P)", b1_v242p_default_params(params))

@@ -194,7 +194,7 @@ def EXIST(cond, n):
     except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
         pass
 
-    reversed_cond = cond.iloc[::-1]
+    reversed_cond = cond.fillna(False).iloc[::-1]
     exist_reversed = reversed_cond.rolling(window=n, min_periods=1).max().astype(bool)
     return exist_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
 
@@ -215,7 +215,7 @@ def COUNT(cond, n):
     except (quant_core.QuantCoreUnavailable, ValueError, TypeError):
         pass
 
-    reversed_cond = cond.astype(int).iloc[::-1]
+    reversed_cond = cond.fillna(False).astype(int).iloc[::-1]
     count_reversed = reversed_cond.rolling(window=n, min_periods=1).sum()
     return count_reversed.iloc[::-1].reset_index(drop=True).set_axis(cond.index)
 
@@ -305,7 +305,12 @@ def KDJ(df, n=9, m1=3, m2=3):
     
     # RSV计算，前n-1个周期不足时用50填充
     rsv = np.full(length, 50.0)
-    valid_mask = (np.arange(length) >= n - 1) & (range_val != 0)
+    valid_mask = (
+        (np.arange(length) >= n - 1)
+        & np.isfinite(range_val)
+        & np.isfinite(close_arr)
+        & np.isfinite(low_min)
+    )
     rsv[valid_mask] = (close_arr[valid_mask] - low_min[valid_mask]) / range_val[valid_mask] * 100
 
     # SMA计算 - 通达信风格（使用 numpy 数组，比 pandas .iloc 快 50x+）

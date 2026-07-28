@@ -41,7 +41,8 @@ class BaseStrategy(ABC):
         分析单只股票
         :return: 选股信号或None
         """
-        if df is None or df.empty or len(df) < 60:
+        minimum_history = max(60, int(getattr(self, "MIN_HISTORY_DAYS", 60)))
+        if df is None or df.empty or len(df) < minimum_history:
             return None
         
         # 计算指标

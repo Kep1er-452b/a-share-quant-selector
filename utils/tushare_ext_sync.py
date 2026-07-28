@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from datetime import date, datetime, timedelta
+from threading import Lock
 from typing import Callable, Iterable
 
 import pandas as pd
@@ -74,10 +77,22 @@ TRADING_ENDPOINTS = {
 class TushareExtSync:
     """Synchronize optional Tushare datasets into the extension store."""
 
-    def __init__(self, store: TushareExtStore, pro, pro_bar=None):
+    def __init__(
+        self,
+        store: TushareExtStore,
+        pro,
+        pro_bar=None,
+        *,
+        calls_per_minute: int = 180,
+        rate_limit_wait_seconds: float = 62,
+    ):
         self.store = store
         self.pro = pro
         self.pro_bar = pro_bar
+        self.calls_per_minute = max(1, int(calls_per_minute))
+        self.rate_limit_wait_seconds = max(0.0, float(rate_limit_wait_seconds))
+        self._call_times = deque()
+        self._call_lock = Lock()
 
     @staticmethod
     def _date_text(value) -> str:
@@ -95,6 +110,42 @@ class TushareExtSync:
         markers = ("没有访问", "没有权限", "权限", "permission", "not have access", "积分不足")
         return any(marker in text for marker in markers)
 
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return any(
+            marker in text
+            for marker in ("每分钟", "频率", "rate limit", "too many requests", "429")
+        )
+
+    def _acquire_call_slot(self) -> None:
+        while True:
+            wait_seconds = 0.0
+            with self._call_lock:
+                now = time.monotonic()
+                while self._call_times and now - self._call_times[0] >= 60:
+                    self._call_times.popleft()
+                if len(self._call_times) < self.calls_per_minute:
+                    self._call_times.append(now)
+                    return
+                wait_seconds = max(0.01, 60 - (now - self._call_times[0]))
+            time.sleep(wait_seconds)
+
+    def _invoke_provider(self, method, **params):
+        last_error = None
+        for attempt in range(4):
+            self._acquire_call_slot()
+            try:
+                return method(**params)
+            except Exception as exc:
+                last_error = exc
+                if not self._is_rate_limit_error(exc) or attempt >= 3:
+                    raise
+                time.sleep(self.rate_limit_wait_seconds)
+                with self._call_lock:
+                    self._call_times.clear()
+        raise last_error
+
     def _call_dataset(
         self,
         dataset: str,
@@ -109,7 +160,7 @@ class TushareExtSync:
     ) -> dict:
         try:
             method = getattr(self.pro, method_name)
-            frame = method(**params)
+            frame = self._invoke_provider(method, **params)
             rows = self._rows(frame)
             written = self.store.upsert_rows(
                 dataset,
@@ -338,7 +389,8 @@ class TushareExtSync:
                 progress_callback({"dataset": "daily_qfq", **result})
             return result
         try:
-            frame = self.pro_bar(
+            frame = self._invoke_provider(
+                self.pro_bar,
                 api=self.pro,
                 ts_code=ts_code,
                 asset="E",

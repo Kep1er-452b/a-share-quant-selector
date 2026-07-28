@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from threading import Event, Lock, Thread, Timer
+from threading import Event, Lock, RLock, Thread, Timer
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -26,6 +26,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
+from utils.atomic_io import atomic_write_json
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.error_logging import append_system_log as shared_append_system_log, write_error_report
 from utils.update_diagnostics import attach_auto_snapshot, resolve_update_error_report, run_update_diagnostics
@@ -97,6 +98,7 @@ from web_api.markets import markets_blueprint
 from web_api.domain_data import domain_data_blueprint
 from web_api.domain_data import (
     _store as _domain_store,
+    cancel_active_sync_jobs,
     sync_cancel as cancel_domain_sync_job,
     configure_sync_event_observer,
     domain_service,
@@ -135,6 +137,10 @@ diagnostic_jobs = {}
 diagnostic_jobs_lock = Lock()
 diagnostic_cancel_events = {}
 job_admission_lock = Lock()
+market_cache_rebuild_lock = Lock()
+index_kline_cache_lock = RLock()
+config_write_lock = RLock()
+registry_lock = RLock()
 sync_selection_active = False
 wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
@@ -142,6 +148,15 @@ wyckoff_cancel_events = {}
 watchlist_lock = Lock()
 ACTIVE_JOB_STATUSES = {'queued', 'running', 'cancelling'}
 MAX_RETAINED_TERMINAL_JOBS = 50
+
+
+class JobAdmissionConflict(RuntimeError):
+    status_code = 409
+    error_code = "TASK_CONFLICT"
+
+    def __init__(self, message, job=None):
+        super().__init__(message)
+        self.job = job
 
 INDEX_KLINE_TARGETS = {
     'sh000001': {'symbol': 'sh000001', 'name': '上证指数'},
@@ -172,11 +187,18 @@ class _LazyDomainStore:
 
 ops_store = OpsStore(platform_runtime_paths().ops_store_path())
 ops_logger = EventLogger(ops_store, platform_runtime_paths().logs_root / "ops-events.jsonl")
+
+
+def _snapshot_jobs(jobs, lock):
+    with lock:
+        return {job_id: dict(job) for job_id, job in jobs.items()}
+
+
 ops_tasks = TaskRegistry({
-    "selection": lambda: selection_jobs,
-    "update": lambda: update_jobs,
-    "diagnostic": lambda: diagnostic_jobs,
-    "wyckoff": lambda: wyckoff_jobs,
+    "selection": lambda: _snapshot_jobs(selection_jobs, selection_jobs_lock),
+    "update": lambda: _snapshot_jobs(update_jobs, update_jobs_lock),
+    "diagnostic": lambda: _snapshot_jobs(diagnostic_jobs, diagnostic_jobs_lock),
+    "wyckoff": lambda: _snapshot_jobs(wyckoff_jobs, wyckoff_jobs_lock),
     "domain_sync": sync_jobs_snapshot,
 })
 
@@ -205,6 +227,12 @@ def _ops_disk_health():
         'free_bytes': usage.free,
         'free_ratio': round(free_ratio, 4),
     }
+
+
+def _rebuild_market_caches_serialized(**kwargs):
+    """Serialize every cache rebuild path to avoid concurrent file replacement."""
+    with market_cache_rebuild_lock:
+        return rebuild_market_caches(**kwargs)
 
 
 def _ops_task_health():
@@ -379,10 +407,12 @@ app.register_blueprint(create_ops_blueprint(
 def _reload_registry():
     """重新加载策略注册器，确保参数变更立即生效。"""
     global registry
-    registry = StrategyRegistry("config/strategy_params.yaml")
-    registry.auto_register_from_directory("strategy")
-    strategy_registry_module._registry = registry
-    return registry
+    with registry_lock:
+        replacement = StrategyRegistry("config/strategy_params.yaml")
+        replacement.auto_register_from_directory("strategy")
+        registry = replacement
+        strategy_registry_module._registry = replacement
+        return replacement
 
 
 registry = _reload_registry()
@@ -479,9 +509,10 @@ def _load_json_file(path, default=None):
 
 def _save_index_kline_cache(cache, data_dir='data'):
     cache_path = _index_kline_cache_path(data_dir)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, 'w', encoding='utf-8') as file:
-        json.dump(cache, file, ensure_ascii=False, indent=2)
+    with index_kline_cache_lock:
+        current = _load_index_kline_cache(data_dir)
+        current.update(cache)
+        atomic_write_json(cache_path, current)
 
 
 def _cached_index_kline(symbol, data_dir='data'):
@@ -798,8 +829,11 @@ def _write_emergency_incident(reason):
         "tasks": _snapshot_jobs_for_incident(),
     }
     incident_path = INCIDENT_DIR / f"{incident_id}-emergency-stop.json"
-    with open(incident_path, "w", encoding="utf-8") as file:
-        json.dump(_sanitize_for_log(payload), file, ensure_ascii=False, indent=2, default=_json_default)
+    atomic_write_json(
+        incident_path,
+        _sanitize_for_log(payload),
+        default=_json_default,
+    )
     _append_system_log(
         "emergency_stop",
         "事故急停触发，任务快照已写入，Web 服务即将退出。",
@@ -819,8 +853,13 @@ def _trigger_emergency_stop(reason="用户手动触发事故急停"):
     halt_event.set()
     shutdown_event.set()
     _mark_jobs_emergency_halted(reason)
-    incident_path = _write_emergency_incident(reason)
-    _schedule_process_termination(EMERGENCY_EXIT_DELAY_SECONDS)
+    incident_path = None
+    try:
+        incident_path = _write_emergency_incident(reason)
+    except Exception as exc:
+        print(f"事故急停快照写入失败: {exc}", file=sys.stderr)
+    finally:
+        _schedule_process_termination(EMERGENCY_EXIT_DELAY_SECONDS)
     return incident_path
 
 
@@ -872,25 +911,29 @@ def _parse_requested_boards(raw_value):
 
 
 def _parse_requested_strategies(raw_value, allow_empty=False):
-    available = [name for name in registry.list_strategies() if name != FORMULA_STRATEGY_NAME]
-    if raw_value is None:
-        return available
-    if str(raw_value).strip() == "":
-        if allow_empty:
-            return []
-        return available
+    with registry_lock:
+        available = [
+            name for name in registry.list_strategies()
+            if name != FORMULA_STRATEGY_NAME
+        ]
+        if raw_value is None:
+            return available
+        if str(raw_value).strip() == "":
+            if allow_empty:
+                return []
+            return available
 
-    requested = []
-    invalid = []
-    for item in str(raw_value).split(","):
-        strategy_name = item.strip()
-        if len(strategy_name) > 80:
-            invalid.append(strategy_name[:80])
-            continue
-        if strategy_name and strategy_name in registry.strategies:
-            requested.append(strategy_name)
-        elif strategy_name:
-            invalid.append(strategy_name)
+        requested = []
+        invalid = []
+        for item in str(raw_value).split(","):
+            strategy_name = item.strip()
+            if len(strategy_name) > 80:
+                invalid.append(strategy_name[:80])
+                continue
+            if strategy_name and strategy_name in registry.strategies:
+                requested.append(strategy_name)
+            elif strategy_name:
+                invalid.append(strategy_name)
 
     if invalid:
         raise ValueError(f"无效策略: {', '.join(invalid)}")
@@ -1469,6 +1512,14 @@ def _find_running_diagnostic_job(report_path=None):
     return None
 
 
+def _find_running_wyckoff_job():
+    with wyckoff_jobs_lock:
+        for job in wyckoff_jobs.values():
+            if job.get('status') in ACTIVE_JOB_STATUSES:
+                return _serialize_job(job)
+    return None
+
+
 def _selection_conflict_response():
     running_diagnostic = _find_running_diagnostic_job()
     if running_diagnostic:
@@ -1864,6 +1915,7 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                 str(registry.params_file),
                 runtime_strategy_params,
             )
+            worker_context['cancel_event'] = cancel_event
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [
                     executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
@@ -1999,7 +2051,7 @@ def _refresh_market_caches_for_job(job_id, data_dir):
         elif stage == 'heatmap_payload':
             _emit_update_progress(job_id, payload, phase_offset=99, phase_weight=1)
 
-    cache_result = rebuild_market_caches(
+    cache_result = _rebuild_market_caches_serialized(
         data_dir=data_dir,
         progress_callback=cache_progress,
         preserve_existing=True,
@@ -2523,7 +2575,7 @@ def _warm_market_caches_background():
     data_dir = str(_active_data_dir())
     try:
         if market_cache_needs_refresh(data_dir=data_dir):
-            rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
+            _rebuild_market_caches_serialized(data_dir=data_dir, preserve_existing=True)
         else:
             ensure_market_caches(data_dir=data_dir)
         print("✓ 市场云图缓存已就绪")
@@ -3227,30 +3279,37 @@ def _start_market_wyckoff_job(market, query, reader=None):
             symbol = canonical_equity_symbol(market_id, raw_query)
         except ValueError:
             symbol = raw_query
-    job_id = str(uuid.uuid4())
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    job = {
-        'job_id': job_id,
-        'query': job_query,
-        'symbol': symbol,
-        'market': market_id,
-        'currency': 'HKD' if market_id == 'hong_kong' else 'CNY',
-        'status': 'queued',
-        'current_step': '排队',
-        'message': '威科夫任务已进入队列。',
-        'progress_pct': 0,
-        'created_at': now,
-        'updated_at': now,
-        'result': None,
-        'error': None,
-    }
-    with wyckoff_jobs_lock:
-        wyckoff_jobs[job_id] = job
-        wyckoff_cancel_events[job_id] = Event()
-        _prune_terminal_jobs(
-            wyckoff_jobs,
-            cleanup_callback=lambda removed_id: wyckoff_cancel_events.pop(removed_id, None),
-        )
+    with job_admission_lock:
+        running_job = _find_running_wyckoff_job()
+        if running_job:
+            raise JobAdmissionConflict(
+                '已有威科夫分析正在执行，请等待完成或先取消现有任务',
+                running_job,
+            )
+        job_id = str(uuid.uuid4())
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        job = {
+            'job_id': job_id,
+            'query': job_query,
+            'symbol': symbol,
+            'market': market_id,
+            'currency': 'HKD' if market_id == 'hong_kong' else 'CNY',
+            'status': 'queued',
+            'current_step': '排队',
+            'message': '威科夫任务已进入队列。',
+            'progress_pct': 0,
+            'created_at': now,
+            'updated_at': now,
+            'result': None,
+            'error': None,
+        }
+        with wyckoff_jobs_lock:
+            wyckoff_jobs[job_id] = job
+            wyckoff_cancel_events[job_id] = Event()
+            _prune_terminal_jobs(
+                wyckoff_jobs,
+                cleanup_callback=lambda removed_id: wyckoff_cancel_events.pop(removed_id, None),
+            )
     thread = Thread(
         target=_run_wyckoff_job,
         args=(job_id, job_query, market_id, reader),
@@ -3274,6 +3333,13 @@ def start_wyckoff_stock():
 
         job = _start_market_wyckoff_job('a_share', query)
         return jsonify({'success': True, 'job_id': job['job_id'], 'data': job})
+    except JobAdmissionConflict as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'job_id': (e.job or {}).get('job_id'),
+            'data': e.job,
+        }), 409
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -3284,6 +3350,7 @@ def get_wyckoff_job_status(job_id):
     try:
         if _is_halted():
             return _halted_response()
+        job_id = _validate_job_id(job_id)
         with wyckoff_jobs_lock:
             job = wyckoff_jobs.get(job_id)
             if not job:
@@ -3449,6 +3516,14 @@ def activate_data_provider():
                 'job': running_selection,
             }), 409
 
+        running_wyckoff = _find_running_wyckoff_job()
+        if running_wyckoff:
+            return jsonify({
+                'success': False,
+                'error': '当前有威科夫分析正在读取行情，请等待完成后再切换数据源',
+                'job': running_wyckoff,
+            }), 409
+
         payload = request.get_json(silent=True)
         if payload is None:
             payload = {}
@@ -3475,12 +3550,25 @@ def activate_data_provider():
         warnings = _provider_switch_warnings(data_root, provider, provider_state)
         with job_admission_lock:
             running_update = _find_running_update_job()
+            running_diagnostic = _find_running_diagnostic_job()
             running_selection = _find_running_job()
-            if running_update or running_selection or sync_selection_active:
+            running_wyckoff = _find_running_wyckoff_job()
+            if (
+                running_update
+                or running_diagnostic
+                or running_selection
+                or running_wyckoff
+                or sync_selection_active
+            ):
                 return jsonify({
                     'success': False,
-                    'error': '任务状态已变化，请等待当前更新或选股完成后再切换数据源',
-                    'job': running_update or running_selection,
+                    'error': '任务状态已变化，请等待当前数据读取任务完成后再切换数据源',
+                    'job': (
+                        running_update
+                        or running_diagnostic
+                        or running_selection
+                        or running_wyckoff
+                    ),
                 }), 409
             activate_provider(data_root, provider, provider_state)
         active_state = load_active_provider(data_root)
@@ -3828,7 +3916,11 @@ def get_index_kline():
         symbol = _normalize_csv_value(request.args.get('symbol')) or 'sh000001'
         if symbol not in INDEX_KLINE_TARGETS:
             symbol = 'sh000001'
-        months = int(request.args.get('months', 3))
+        try:
+            months = int(request.args.get('months', 3))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'months 必须是整数'}), 400
+        months = max(1, min(months, 120))
         store = _tushare_ext_store()
         cache_result = _ensure_tushare_index_cache(store=store)
         payload = build_index_kline_payload(store, symbol, months=months)
@@ -3874,6 +3966,11 @@ def get_heatmap():
     try:
         data_dir = str(_active_data_dir())
         force_refresh = str(request.args.get('refresh') or '').lower() in {'1', 'true', 'yes'}
+        if force_refresh:
+            return jsonify({
+                'success': False,
+                'error': '云图强制重建必须使用 POST /api/heatmap/rebuild',
+            }), 405
         scope = _normalize_csv_value(request.args.get('scope')) or 'all'
         if scope not in {'all', 'main', 'chinext', 'star'}:
             scope = 'all'
@@ -3889,8 +3986,7 @@ def get_heatmap():
             Path(data_dir) / 'index_snapshot.json',
         ]
         if (
-            not force_refresh
-            and payload_path.exists()
+            payload_path.exists()
             and payload_path.stat().st_mtime >= max(
                 (path.stat().st_mtime for path in cache_refs if path.exists()),
                 default=0,
@@ -3898,41 +3994,47 @@ def get_heatmap():
         ):
             return Response(payload_path.read_text(encoding='utf-8'), mimetype='application/json')
 
-        refresh_errors = {}
-        if force_refresh:
-            cache_result = rebuild_market_caches(data_dir=data_dir, preserve_existing=True)
-            refresh_errors = cache_result.get('errors') or {}
-            health = market_cache_health(data_dir=data_dir)
-            if health.get('refresh_pending'):
-                return jsonify({
-                    'success': False,
-                    'error': '市场云图刷新后仍不是最新，旧缓存已保留，请检查刷新失败项。',
-                    'reason': 'refresh_pending_after_refresh',
-                    'data': {
-                        'health': health,
-                        'errors': refresh_errors,
-                    },
-                })
-        else:
-            health = market_cache_health(data_dir=data_dir)
-            if health.get('refresh_pending'):
-                return jsonify({
-                    'success': False,
-                    'error': '市场云图缓存不是最新，请先点击“刷新云图”或执行数据更新。',
-                    'reason': 'refresh_pending',
-                    'data': health,
-                })
+        health = market_cache_health(data_dir=data_dir)
+        if health.get('refresh_pending'):
+            return jsonify({
+                'success': False,
+                'error': '市场云图缓存不是最新，请先点击“刷新云图”或执行数据更新。',
+                'reason': 'refresh_pending',
+                'data': health,
+            })
 
-        if payload_path.exists() and not refresh_errors:
+        if payload_path.exists():
             return Response(payload_path.read_text(encoding='utf-8'), mimetype='application/json')
 
         payload = build_heatmap_payload(data_dir=data_dir, scope=scope, metric=metric, refresh=False)
-        if refresh_errors:
-            payload.setdefault('cache_status', {})['errors'] = refresh_errors
-            payload.setdefault('cache_status', {})['warning'] = '部分缓存刷新失败，当前云图可能使用保留缓存。'
         return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/heatmap/rebuild', methods=['POST'])
+def rebuild_heatmap():
+    """显式重建 A 股市场缓存；POST 请求由会话令牌保护。"""
+    try:
+        if _is_halted():
+            return _halted_response()
+        data_dir = str(_active_data_dir())
+        cache_result = _rebuild_market_caches_serialized(
+            data_dir=data_dir,
+            preserve_existing=True,
+        )
+        health = market_cache_health(data_dir=data_dir)
+        success = not bool(health.get('refresh_pending'))
+        return jsonify({
+            'success': success,
+            'error': None if success else '市场云图刷新后仍不是最新，请检查刷新失败项。',
+            'data': {
+                'cache_result': cache_result,
+                'cache_health': health,
+            },
+        }), 200 if success else 503
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 
 @app.route('/api/heatmap/health')
@@ -4216,6 +4318,7 @@ def _request_job_cancel(task_type, job_id, jobs, cancel_events, lock, current_st
         job['current_step'] = current_step
         job['updated_at'] = _job_timestamp()
         job['elapsed_seconds'] = _elapsed_seconds(job)
+        _append_job_log(job, '用户请求停止任务；正在安全结束并保留日志。')
         snapshot = dict(job)
     _record_ops_task_event(task_type, job_id, snapshot, message=f'{task_type} cancellation requested')
     return _serialize_job(snapshot), True
@@ -4286,39 +4389,29 @@ def cancel_update_job(job_id):
     except ValueError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 400
 
-    with update_jobs_lock:
-        job = update_jobs.get(job_id)
-        if not job:
-            return jsonify({'success': False, 'error': '任务不存在'}), 404
-
-        status = str(job.get('status') or '').lower()
-        if status in {'completed', 'error', 'failed', 'halted', 'cancelled'}:
-            return jsonify({
-                'success': True,
-                'message': '任务已结束，现有日志已保留。',
-                'data': _serialize_job(job),
-            })
-
-        cancel_event = update_cancel_events.get(job_id)
-        if cancel_event is None:
-            cancel_event = Event()
-            update_cancel_events[job_id] = cancel_event
-        cancel_event.set()
-        job['cancel_requested'] = True
-        job['current_step'] = '正在停止此次更新'
-        job['updated_at'] = _job_timestamp()
-        job['elapsed_seconds'] = _elapsed_seconds(job)
-        _append_job_log(job, '用户请求停止此次更新；正在结束任务并保留日志。')
-        serialized = _serialize_job(job)
+    serialized, requested = _request_job_cancel(
+        'update',
+        job_id,
+        update_jobs,
+        update_cancel_events,
+        update_jobs_lock,
+        '正在停止此次更新',
+    )
+    if serialized is None:
+        return jsonify({'success': False, 'error': '任务不存在'}), 404
 
     _append_system_log(
         'update_job_cancel_requested',
-        '用户请求停止此次更新。',
-        {'job_id': job_id, 'provider': job.get('provider')},
+        '用户请求停止此次更新。' if requested else '更新任务已结束，无需再次停止。',
+        {'job_id': job_id, 'provider': serialized.get('provider')},
     )
     return jsonify({
         'success': True,
-        'message': '停止请求已提交，已写入的数据和日志将保留。',
+        'message': (
+            '停止请求已提交，已写入的数据和日志将保留。'
+            if requested
+            else '任务已结束，现有日志已保留。'
+        ),
         'data': serialized,
     })
 
@@ -4352,11 +4445,11 @@ def add_watchlist_item():
             item = _update_market_watchlist(
                 'a_share', {'query': query, 'note': note}
             )
-            row = next(
+            row = next((
                 current
                 for current in _market_watchlist_rows('a_share')
                 if current['symbol'] == item['symbol']
-            )
+            ), item)
         return jsonify({'success': True, 'data': row})
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -4452,11 +4545,16 @@ def update_config():
                 'details': validation_errors,
             }), 400
         
-        config_file = Path("config/strategy_params.yaml")
-        backup_path = atomic_write_yaml(config_file, new_config)
-        
-        # 重新加载策略
-        _reload_registry()
+        with job_admission_lock:
+            if _find_running_job() or sync_selection_active:
+                return jsonify({
+                    'success': False,
+                    'error': '选股任务运行期间不能修改策略配置',
+                }), 409
+            with config_write_lock:
+                config_file = Path("config/strategy_params.yaml")
+                backup_path = atomic_write_yaml(config_file, new_config)
+                _reload_registry()
         
         return jsonify({'success': True, 'backup': str(backup_path) if backup_path else None})
     except Exception as e:
@@ -4467,30 +4565,40 @@ def update_config():
 def update_single_strategy_config(strategy_name):
     """Update one strategy parameter block without discarding unrelated config."""
     try:
-        if strategy_name not in registry.strategies or strategy_name == FORMULA_STRATEGY_NAME:
-            return jsonify({'success': False, 'error': '策略不存在'}), 404
-
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict) or not isinstance(payload.get('params'), dict):
             return jsonify({'success': False, 'error': 'params 必须是对象'}), 400
 
-        config_file = Path("config/strategy_params.yaml")
-        config = {}
-        if config_file.exists():
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f) or {}
-        config[strategy_name] = payload['params']
+        with job_admission_lock:
+            if _find_running_job() or sync_selection_active:
+                return jsonify({
+                    'success': False,
+                    'error': '选股任务运行期间不能修改策略配置',
+                }), 409
+            with config_write_lock:
+                with registry_lock:
+                    if (
+                        strategy_name not in registry.strategies
+                        or strategy_name == FORMULA_STRATEGY_NAME
+                    ):
+                        return jsonify({'success': False, 'error': '策略不存在'}), 404
+                config_file = Path("config/strategy_params.yaml")
+                config = {}
+                if config_file.exists():
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        config = yaml.safe_load(f) or {}
+                config[strategy_name] = payload['params']
 
-        validation_errors = validate_strategy_params(config)
-        if validation_errors:
-            return jsonify({
-                'success': False,
-                'error': '配置校验失败',
-                'details': validation_errors,
-            }), 400
+                validation_errors = validate_strategy_params(config)
+                if validation_errors:
+                    return jsonify({
+                        'success': False,
+                        'error': '配置校验失败',
+                        'details': validation_errors,
+                    }), 400
 
-        backup_path = atomic_write_yaml(config_file, config)
-        _reload_registry()
+                backup_path = atomic_write_yaml(config_file, config)
+                _reload_registry()
 
         return jsonify({'success': True, 'backup': str(backup_path) if backup_path else None})
     except Exception as e:
@@ -4550,16 +4658,58 @@ def _terminate_current_process():
     os.kill(os.getpid(), signal.SIGTERM)
 
 
+def _prepare_graceful_shutdown():
+    """Cancel active local jobs and persist an interrupted terminal snapshot."""
+    halt_event.set()
+    shutdown_event.set()
+    timestamp = _job_timestamp()
+    sources = (
+        ('selection', selection_jobs, selection_cancel_events, selection_jobs_lock),
+        ('update', update_jobs, update_cancel_events, update_jobs_lock),
+        ('diagnostic', diagnostic_jobs, diagnostic_cancel_events, diagnostic_jobs_lock),
+        ('wyckoff', wyckoff_jobs, wyckoff_cancel_events, wyckoff_jobs_lock),
+    )
+    snapshots = []
+    for task_type, jobs, cancel_events, lock in sources:
+        with lock:
+            for job_id, job in jobs.items():
+                if job.get('status') not in ACTIVE_JOB_STATUSES:
+                    continue
+                cancel_event = cancel_events.get(job_id)
+                if cancel_event is None:
+                    cancel_event = Event()
+                    cancel_events[job_id] = cancel_event
+                cancel_event.set()
+                job.update({
+                    'status': 'interrupted',
+                    'current_step': '系统正常退出',
+                    'error': '系统关闭导致任务中断',
+                    'finished_at': timestamp,
+                    'updated_at': timestamp,
+                    'elapsed_seconds': _elapsed_seconds(job),
+                })
+                _append_job_log(job, '系统正常退出，任务已中断并保留当前状态。')
+                snapshots.append((task_type, job_id, dict(job)))
+    for task_type, job_id, snapshot in snapshots:
+        _record_ops_task_event(
+            task_type,
+            job_id,
+            snapshot,
+            message=f'{task_type} interrupted by system shutdown',
+        )
+    return len(snapshots) + len(cancel_active_sync_jobs())
+
+
 @app.route('/api/system_shutdown', methods=['POST'])
 def system_shutdown():
     """关闭当前 Web 服务进程。"""
-    halt_event.set()
-    shutdown_event.set()
-    _schedule_process_termination(0.8)
+    interrupted_jobs = _prepare_graceful_shutdown()
+    _schedule_process_termination(2.0)
     return jsonify({
         'success': True,
         'halted': True,
         'shutdown_requested': True,
+        'interrupted_jobs': interrupted_jobs,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'message': '系统正在退出，Web 服务进程即将关闭'
     })

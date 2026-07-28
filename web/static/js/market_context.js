@@ -52,8 +52,10 @@
     }
 
     async function validateCapabilities() {
+        const controller = new AbortController();
+        const timeoutId = global.setTimeout(() => controller.abort(), 30000);
         try {
-            const response = await fetch('/api/markets/capabilities');
+            const response = await fetch('/api/markets/capabilities', { signal: controller.signal });
             if (!response.ok) return;
             const payload = await response.json();
             capabilities = payload.markets || null;
@@ -62,6 +64,8 @@
             }
         } catch (_error) {
             // Offline startup keeps the last validated local market.
+        } finally {
+            global.clearTimeout(timeoutId);
         }
     }
 

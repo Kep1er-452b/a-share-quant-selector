@@ -41,8 +41,11 @@ class PatternFeatureExtractor:
         
         # 计算知行指标
         trend_df = calculate_zhixing_trend(window_df)
-        window_df['short_term_trend'] = trend_df['short_term_trend']
-        window_df['bull_bear_line'] = trend_df['bull_bear_line']
+        # calculate_zhixing_trend 的标准输出保持“最新在前”，而本提取器在
+        # 日期升序窗口上继续计算斜率和最新值，因此恢复升序后再按位置赋值。
+        trend_df = trend_df.iloc[::-1].reset_index(drop=True)
+        window_df['short_term_trend'] = trend_df['short_term_trend'].to_numpy()
+        window_df['bull_bear_line'] = trend_df['bull_bear_line'].to_numpy()
         
         # 计算KDJ
         kdj_df = KDJ(window_df, n=9, m1=3, m2=3)

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from decimal import Decimal, ROUND_HALF_UP
@@ -17,6 +16,7 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
+from utils.atomic_io import atomic_write_json
 from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, get_config_value, normalize_market_cap_yuan
 from utils.local_config import load_config_file
 from utils.price_adjustment import repair_adjustment_gaps
@@ -70,9 +70,7 @@ def _load_json(path: Path, default):
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
+    atomic_write_json(path, payload)
 
 
 def _classify_board(stock_code: str) -> str:
@@ -468,8 +466,6 @@ def _run_industry_fetch_pool(fetch_func, code_list: List[str], max_workers: int)
     source_map: Dict[str, str] = {}
     pending = set()
     executor = ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(code_list) or 1)))
-    previous_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(INDUSTRY_FETCH_TIMEOUT_SECONDS)
     deadline = time.monotonic() + INDUSTRY_FETCH_MAX_SECONDS
     try:
         pending = {executor.submit(fetch_func, code): code for code in code_list}
@@ -486,9 +482,18 @@ def _run_industry_fetch_pool(fetch_func, code_list: List[str], max_workers: int)
         for future in pending:
             future.cancel()
     finally:
-        socket.setdefaulttimeout(previous_timeout)
         executor.shutdown(wait=False, cancel_futures=True)
     return mapping, source_map, len(pending)
+
+
+def _call_with_optional_timeout(function, **kwargs):
+    """Pass request-local timeouts where the installed provider supports it."""
+    try:
+        return function(timeout=INDUSTRY_FETCH_TIMEOUT_SECONDS, **kwargs)
+    except TypeError as exc:
+        if "timeout" not in str(exc):
+            raise
+        return function(**kwargs)
 
 
 def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Callable] = None) -> dict:
@@ -574,7 +579,10 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
 
     def fetch_eastmoney_industry(code: str) -> tuple[str, str, str]:
         try:
-            info_df = ak.stock_individual_info_em(symbol=code)
+            info_df = _call_with_optional_timeout(
+                ak.stock_individual_info_em,
+                symbol=code,
+            )
         except Exception:
             return code, "", "eastmoney"
         if info_df is None or info_df.empty or not {"item", "value"}.issubset(info_df.columns):
@@ -631,7 +639,8 @@ def build_industry_cache(data_dir: str = "data", progress_callback: Optional[Cal
     def fetch_cninfo_industry(code: str) -> tuple[str, str, str]:
         try:
             with _CNINFO_FETCH_LOCK:
-                detail_df = ak.stock_industry_change_cninfo(
+                detail_df = _call_with_optional_timeout(
+                    ak.stock_industry_change_cninfo,
                     symbol=code,
                     start_date="20000101",
                     end_date="20300101",
@@ -691,12 +700,7 @@ def build_index_cache(data_dir: str = "data") -> dict:
     except ImportError as exc:
         raise RuntimeError("未安装 akshare，无法构建指数缓存") from exc
 
-    previous_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(INDUSTRY_FETCH_TIMEOUT_SECONDS)
-    try:
-        index_df = ak.stock_zh_index_spot_sina()
-    finally:
-        socket.setdefaulttimeout(previous_timeout)
+    index_df = _call_with_optional_timeout(ak.stock_zh_index_spot_sina)
     index_df["代码"] = index_df["代码"].astype(str)
     items = []
     for target in INDEX_TARGETS:

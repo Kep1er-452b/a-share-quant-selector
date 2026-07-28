@@ -103,6 +103,11 @@ def load_config_file(config_file="config/config.yaml", include_local=True) -> di
     return config
 
 
+def load_local_config_file(config_file="config/config.yaml") -> dict:
+    """Load only the ignored machine-local override, never tracked config."""
+    return _load_yaml(local_override_path(config_file))
+
+
 def write_local_config_file(payload: dict, config_file="config/config.yaml") -> Path:
     """Atomically write the machine-local override under the writable config root."""
 

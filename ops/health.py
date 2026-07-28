@@ -29,6 +29,12 @@ class HealthService:
         self.stores = dict(stores)
         self.datasets = {str(key): dict(value) for key, value in datasets.items()}
         self.checks = dict(checks or {})
+        reserved = {"status", "stores", "datasets", "storage_bytes", "deep"}
+        collisions = reserved.intersection(self.checks)
+        if collisions:
+            raise ValueError(
+                f"health check names are reserved: {', '.join(sorted(collisions))}"
+            )
         self.now = now or (lambda: datetime.now(timezone.utc))
 
     def snapshot(self, *, deep: bool = False) -> dict:

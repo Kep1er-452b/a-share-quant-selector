@@ -14,17 +14,27 @@
     async function requestJson(url, options = {}) {
         const method = String(options.method || 'GET').toUpperCase();
         const headers = { ...(options.headers || {}) };
+        const controller = new AbortController();
+        const timeoutId = global.setTimeout(() => controller.abort(), 30000);
+        const externalSignal = options.signal;
+        const abortFromExternal = () => controller.abort();
+        externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
         if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
             headers['X-Quant-Session'] = document.querySelector('meta[name="quant-session-token"]')?.content || '';
         }
-        const response = await fetch(url, { ...options, headers });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-            const error = new Error(payload.error || `请求失败 (${response.status})`);
-            error.code = payload.code || 'REQUEST_FAILED';
-            throw error;
+        try {
+            const response = await fetch(url, { ...options, headers, signal: controller.signal });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const error = new Error(payload.error || `请求失败 (${response.status})`);
+                error.code = payload.code || 'REQUEST_FAILED';
+                throw error;
+            }
+            return payload;
+        } finally {
+            global.clearTimeout(timeoutId);
+            externalSignal?.removeEventListener?.('abort', abortFromExternal);
         }
-        return payload;
     }
 
     function ensureDetails(control) {
@@ -160,6 +170,7 @@
                 );
             const displayStatus = permissionDenied ? 'permission_denied' : (job.status || 'running');
             const message = permissionDenied ? permissionMessage(detail) : rawMessage;
+            control.networkFailures = 0;
             setState(control, displayStatus, message, { ...detail, message });
             if (TERMINAL.has(job.status)) {
                 stopPolling(control);
@@ -169,6 +180,17 @@
                 return;
             }
         } catch (error) {
+            control.networkFailures = (control.networkFailures || 0) + 1;
+            if (control.networkFailures <= 3) {
+                const retryDelay = 500 * (2 ** (control.networkFailures - 1));
+                setState(control, 'running', `状态读取暂时失败，${retryDelay}ms 后重试`, {
+                    jobId: control.jobId,
+                    errorCode: error.code,
+                    errorText: error.message,
+                });
+                control.pollTimer = global.setTimeout(() => poll(control), retryDelay);
+                return;
+            }
             setState(control, 'error', error.message, {
                 jobId: control.jobId,
                 errorCode: error.code,

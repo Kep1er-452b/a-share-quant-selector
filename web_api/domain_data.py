@@ -71,11 +71,18 @@ def _observe_sync_event(job_id: str, domain: str, event: dict) -> None:
 
 
 def _prune_sync_jobs_locked() -> None:
-    terminal_ids = [
-        job_id
-        for job_id, job in _SYNC_JOBS.items()
-        if job.get("status") in _TERMINAL_SYNC_STATES
-    ]
+    terminal_ids = sorted(
+        (
+            job_id
+            for job_id, job in _SYNC_JOBS.items()
+            if job.get("status") in _TERMINAL_SYNC_STATES
+        ),
+        key=lambda job_id: str(
+            _SYNC_JOBS[job_id].get("finished_at")
+            or _SYNC_JOBS[job_id].get("updated_at")
+            or ""
+        ),
+    )
     for job_id in terminal_ids[:-_MAX_TERMINAL_SYNC_JOBS]:
         _SYNC_JOBS.pop(job_id, None)
         _SYNC_CANCEL.pop(job_id, None)
@@ -108,6 +115,20 @@ def domain_service(domain: str):
 def sync_jobs_snapshot() -> dict[str, dict]:
     with _SYNC_LOCK:
         return {job_id: dict(job) for job_id, job in _SYNC_JOBS.items()}
+
+
+def cancel_active_sync_jobs() -> list[str]:
+    """Request cancellation for every active domain sync during process shutdown."""
+    cancelled = []
+    with _SYNC_LOCK:
+        for job_id, cancel in _SYNC_CANCEL.items():
+            job = _SYNC_JOBS.get(job_id)
+            if not job or job.get("status") in _TERMINAL_SYNC_STATES:
+                continue
+            cancel.set()
+            job["status"] = "cancelling"
+            cancelled.append(job_id)
+    return cancelled
 
 
 def _integer(name: str, default: int, maximum: int) -> int:
@@ -403,8 +424,13 @@ def sync_status(job_id: str):
 @domain_data_blueprint.post("/sync/cancel/<job_id>")
 def sync_cancel(job_id: str):
     with _SYNC_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        if job is not None and job.get("status") in _TERMINAL_SYNC_STATES:
+            return jsonify({"job_id": job_id, "status": job.get("status")})
         cancel = _SYNC_CANCEL.get(job_id)
         if cancel is None:
             return jsonify({"error": "unknown job"}), 404
         cancel.set()
+        if job is not None:
+            job["status"] = "cancelling"
     return jsonify({"job_id": job_id, "status": "cancelling"})

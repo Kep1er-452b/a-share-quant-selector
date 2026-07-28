@@ -10,15 +10,25 @@ import uuid
 _SECRET_PARTS = ("token", "api_key", "secret", "password", "webhook", "credential")
 _MESSAGE_SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
-    re.compile(r"(?i)\b((?:tushare_token|deepseek_api_key|api_key|token|password|secret)\s*[=:]\s*)[^\s,;]+"),
-    re.compile(r"(?i)([?&](?:token|api_key|key|secret)=)[^&#\s]+"),
+    re.compile(
+        r"(?i)\b([\w-]*(?:token|api[_-]?key|secret|password|credential)"
+        r"\s*[=:]\s*)[^\s,;&#]+"
+    ),
+    re.compile(
+        r"(?i)([?&][\w-]*(?:token|api[_-]?key|secret|password|credential)=)"
+        r"[^&#\s]+"
+    ),
+    re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@"),
 )
 
 
 def _redact_text(value: str) -> str:
     redacted = value
     for pattern in _MESSAGE_SECRET_PATTERNS:
-        redacted = pattern.sub(r"\1[REDACTED]", redacted)
+        if pattern.groups == 3:
+            redacted = pattern.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
+        else:
+            redacted = pattern.sub(r"\1[REDACTED]", redacted)
     return redacted
 
 

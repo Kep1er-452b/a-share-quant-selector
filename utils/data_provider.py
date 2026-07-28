@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -15,8 +16,9 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from utils.atomic_io import atomic_write_json
 from utils.csv_manager import CSVManager
-from utils.local_config import load_config_file
+from utils.local_config import load_local_config_file
 from utils.price_adjustment import detect_adjustment_gaps
 from utils.provider_router import (
     VALID_PROVIDERS,
@@ -38,6 +40,7 @@ MAX_REASONABLE_MARKET_CAP_YUAN = 20_000_000_000_000
 MIN_REASONABLE_MARKET_CAP_YUAN = 1_000_000
 DATA_SYNC_IDLE_TIMEOUT_SECONDS = 90
 DATA_SYNC_POLL_SECONDS = 1
+LOGGER = logging.getLogger(__name__)
 
 
 def normalize_market_cap_yuan(value, source_unit: str = "yuan") -> Optional[int]:
@@ -59,6 +62,11 @@ def normalize_market_cap_yuan(value, source_unit: str = "yuan") -> Optional[int]
     if normalized_unit in {"hundred_million", "yi", "亿"}:
         numeric *= 1e8
     elif normalized_unit == "auto" and numeric < MIN_REASONABLE_MARKET_CAP_YUAN:
+        LOGGER.warning(
+            "market_cap auto unit inferred hundred_million for value=%s; "
+            "provider integrations should pass an explicit source_unit",
+            numeric,
+        )
         numeric *= 1e8
 
     if numeric > MAX_REASONABLE_MARKET_CAP_YUAN:
@@ -241,8 +249,7 @@ class BaseDataProvider:
 
     def _save_fetch_state(self, state: dict) -> None:
         try:
-            with open(self.fetch_state_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+            atomic_write_json(self.fetch_state_file, state)
         except Exception as e:
             print(f"  保存抓取状态失败: {e}")
 
@@ -1401,14 +1408,10 @@ def create_data_provider(provider_name: str, data_dir: str = "data", config: Opt
     if normalized == "tushare":
         from utils.tushare_fetcher import TushareFetcher
 
-        token_source = "temporary" if token else ("environment" if os.getenv("TUSHARE_TOKEN") else "config")
-        resolved_token = (
-            token
-            or os.getenv("TUSHARE_TOKEN")
-            or get_config_value(config, "data_source", "tushare", "token")
-        )
+        token_source = "temporary" if token else ("environment" if os.getenv("TUSHARE_TOKEN") else "missing")
+        resolved_token = token or os.getenv("TUSHARE_TOKEN")
         if not resolved_token:
-            local_config = load_config_file()
+            local_config = load_local_config_file()
             resolved_token = get_config_value(local_config, "data_source", "tushare", "token")
             token_source = "local_config" if resolved_token else "missing"
         provider = TushareFetcher(data_dir=str(storage_dir), token=resolved_token, config=config).configure_storage(storage_root, normalized)

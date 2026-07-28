@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import math
 from typing import Any
 
 from market_data.hong_kong import (
@@ -83,13 +84,19 @@ class HongKongService:
         row.update({"ts_code": symbol, "symbol": symbol, "currency": CURRENCY})
         return row
 
+    def _basic_rows(self):
+        for source in self._all_rows("hk_basic"):
+            try:
+                yield self._basic_row(source)
+            except (TypeError, ValueError):
+                continue
+
     def search(self, query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         page_limit, page_offset = self._page_args(limit, offset)
         needle = str(query or "").strip().casefold()
         compact_needle = needle.replace(".hk", "").lstrip("0") or needle
         items = []
-        for source in self._all_rows("hk_basic"):
-            row = self._basic_row(source)
+        for row in self._basic_rows():
             values = (
                 row.get("symbol"),
                 str(row.get("symbol") or "").replace(".HK", "").lstrip("0"),
@@ -150,13 +157,27 @@ class HongKongService:
                 resolved = "raw"
                 fallback = True
             else:
-                latest_factor = float(factor_map[dates[-1]])
-                for row in normalized:
-                    factor = float(factor_map[row["trade_date"]])
-                    multiplier = factor / latest_factor if requested == "qfq" else factor
-                    for field in ("open", "high", "low", "close", "pre_close"):
-                        if row.get(field) is not None:
-                            row[field] = float(row[field]) * multiplier
+                try:
+                    latest_factor = float(factor_map[dates[-1]])
+                    resolved_factors = [
+                        float(factor_map[row["trade_date"]]) for row in normalized
+                    ]
+                except (TypeError, ValueError):
+                    latest_factor = math.nan
+                    resolved_factors = []
+                if (
+                    not math.isfinite(latest_factor)
+                    or latest_factor <= 0
+                    or any(not math.isfinite(value) or value <= 0 for value in resolved_factors)
+                ):
+                    resolved = "raw"
+                    fallback = True
+                else:
+                    for row, factor in zip(normalized, resolved_factors):
+                        multiplier = factor / latest_factor if requested == "qfq" else factor
+                        for field in ("open", "high", "low", "close", "pre_close"):
+                            if row.get(field) is not None:
+                                row[field] = float(row[field]) * multiplier
 
         previous_close = float(context["close"]) if context and context.get("close") else None
         for row in normalized:
@@ -201,7 +222,7 @@ class HongKongService:
         return payload
 
     def overview(self) -> dict[str, Any]:
-        instruments = [self._basic_row(row) for row in self._all_rows("hk_basic")]
+        instruments = list(self._basic_rows())
         segment_counts = Counter(
             str(row.get("market") or "").strip()
             for row in instruments
@@ -218,6 +239,8 @@ class HongKongService:
             row = rows[0]
             close = row.get("close")
             pre_close = row.get("pre_close")
+            if close is None:
+                continue
             if pre_close in (None, 0, 0.0) and len(rows) > 1:
                 pre_close = rows[1].get("close")
             if pre_close in (None, 0, 0.0):
@@ -254,7 +277,7 @@ class HongKongService:
 
         basics = {
             row["symbol"]: row
-            for row in (self._basic_row(source) for source in self._all_rows("hk_basic"))
+            for row in self._basic_rows()
         }
         latest: dict[str, dict[str, Any]] = {}
         for source in self._latest_rows("hk_daily", rows_per_symbol=1):

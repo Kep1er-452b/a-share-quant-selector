@@ -40,7 +40,11 @@ class FormulaStrategy(BaseStrategy):
         return result
 
     def select_stocks(self, df, stock_name="") -> list:
-        if is_invalid_stock_name(stock_name) or df.empty or "FORMULA_MATCH" not in df.columns:
+        if (
+            (stock_name and is_invalid_stock_name(stock_name))
+            or df.empty
+            or "FORMULA_MATCH" not in df.columns
+        ):
             return []
 
         latest = df.iloc[0]

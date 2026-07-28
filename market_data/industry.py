@@ -151,6 +151,10 @@ class IndustryService:
             if len(page) < MAX_QUERY_LIMIT:
                 break
             offset += MAX_QUERY_LIMIT
+        if len(rows) >= 20_000 and len(page) == MAX_QUERY_LIMIT:
+            raise RuntimeError(
+                f"{dataset} 超过行业读取上限，拒绝基于截断数据计算覆盖率"
+            )
         return rows
 
     def _coverage(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:

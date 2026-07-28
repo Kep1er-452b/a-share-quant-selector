@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from ops.events import redact
 from utils.platform_paths import runtime_paths
 
 LOG_DIR = runtime_paths().logs_root
@@ -54,7 +55,7 @@ def append_system_log(event: str, message: str, detail=None) -> Path:
     payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "event": event,
-        "message": message,
+        "message": redact(str(message)),
     }
     if detail is not None:
         payload["detail"] = sanitize_for_log(detail)
@@ -77,12 +78,12 @@ def write_error_report(
     path = ERROR_DIR / f"{timestamp.strftime('%Y%m%d-%H%M%S')}-{safe_module}-{safe_id}.json"
     payload = {
         "error_id": safe_id,
-        "module": module,
+        "module": redact(str(module)),
         "created_at": timestamp.isoformat(timespec="seconds"),
         "pid": os.getpid(),
         "error_type": type(error).__name__,
-        "error_message": str(error),
-        "traceback": traceback.format_exc(),
+        "error_message": redact(str(error)),
+        "traceback": redact(traceback.format_exc()),
         "context": sanitize_for_log(context or {}),
         "diagnostics": {
             "schema_version": 1,
@@ -104,7 +105,7 @@ def write_error_report(
     append_system_log(
         f"{module}_error_report",
         f"错误日志已写入: {path}",
-        {"error_report_path": str(path), "error": str(error), "context": context or {}},
+        {"error_report_path": str(path), "error": redact(str(error)), "context": context or {}},
     )
     print(f"错误日志已写入: {path}")
     return path

@@ -122,6 +122,7 @@ def _volume_ratio(latest, numerator, denominator):
 
 class B1V24261Strategy(BaseStrategy):
     """B1 (V2.42.61) 策略。"""
+    MIN_HISTORY_DAYS = 160
 
     def __init__(self, params=None):
         super().__init__("B1 (V2.42.61)", b1_v24261_default_params(params))

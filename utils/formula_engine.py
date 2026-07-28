@@ -57,7 +57,6 @@ _BINARY_OPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
     ast.Div: operator.truediv,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
 }
 
 _COMPARE_OPS: dict[type[ast.cmpop], Callable[[Any, Any], Any]] = {
@@ -147,7 +146,10 @@ class CompiledFormula:
 
     def evaluate(self, df: pd.DataFrame) -> pd.Series:
         evaluator = _FormulaEvaluator(df)
-        value = evaluator.eval(self.tree.body)
+        try:
+            value = evaluator.eval(self.tree.body)
+        except RecursionError as exc:
+            raise FormulaError("公式嵌套层级过深") from exc
         return _as_bool_series(value, evaluator.index)
 
 
@@ -309,9 +311,11 @@ def compile_formula(source: str) -> CompiledFormula:
     normalized = _preprocess_formula(source)
     try:
         tree = ast.parse(normalized, mode="eval")
+        _validate_node(tree)
     except SyntaxError as exc:
         raise FormulaError(f"公式语法错误: {exc.msg}") from exc
-    _validate_node(tree)
+    except RecursionError as exc:
+        raise FormulaError("公式嵌套层级过深") from exc
     return CompiledFormula(source=str(source or "").strip(), normalized_source=normalized, tree=tree)
 
 

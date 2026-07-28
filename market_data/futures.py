@@ -380,16 +380,25 @@ class FuturesService:
         limit, offset = self._page(limit, offset)
         exchange_key = _exchange("", exchange) if exchange else ""
         active_date = _text(active_on)
-        rows = normalize_fut_mapping(_all_store_rows(self.store, "fut_mapping"))
         latest: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            if active_date and row["trade_date"] > active_date:
-                continue
-            if exchange_key and row["exchange"] != exchange_key:
-                continue
-            current = latest.get(row["continuous_symbol"])
-            if current is None or row["trade_date"] > current["trade_date"]:
+        symbol_offset = 0
+        while True:
+            page = self.store.query_latest_rows(
+                "fut_mapping",
+                rows_per_symbol=1,
+                end_date=active_date or None,
+                limit=MAX_QUERY_LIMIT,
+                offset=symbol_offset,
+            )
+            if not page:
+                break
+            for row in normalize_fut_mapping(page):
+                if exchange_key and row["exchange"] != exchange_key:
+                    continue
                 latest[row["continuous_symbol"]] = row
+            if len(page) < MAX_QUERY_LIMIT:
+                break
+            symbol_offset += len(page)
         items = [
             {
                 "continuous_symbol": row["continuous_symbol"],

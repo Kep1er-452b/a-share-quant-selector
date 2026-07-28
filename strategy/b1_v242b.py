@@ -14,6 +14,7 @@ from utils.strategy_labels import is_invalid_stock_name
 
 class B1V242BStrategy(BaseStrategy):
     """B1 (V2.42B) 策略"""
+    MIN_HISTORY_DAYS = 160
 
     def __init__(self, params=None):
         default_params = {

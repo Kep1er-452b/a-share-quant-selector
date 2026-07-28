@@ -119,10 +119,12 @@ const state = {
     currentPage: 'dashboard',
     chartInstance: null,
     heatmapChart: null,
+    heatmapResizeBound: false,
     allStocksCache: [],
     stocksLoaded: false,
     stocksLoadingPromise: null,
     stockSearchTimer: null,
+    stockSearchRequestId: 0,
     strategies: [],
     strategyGroups: [],
     openStrategyGroups: new Set(),
@@ -139,9 +141,12 @@ const state = {
     toastTimer: null,
     activeControllers: new Set(),
     selectionPollTimer: null,
+    selectionPollInFlight: false,
     currentSelectionJobId: null,
     updatePollTimer: null,
+    updatePollInFlight: false,
     updateDiagnosticPollTimer: null,
+    updateDiagnosticPollInFlight: false,
     currentUpdateDiagnosticId: null,
     currentUpdateJobId: null,
     currentUpdateJob: null,
@@ -194,7 +199,9 @@ const state = {
     wyckoffProgressTimer: null,
     wyckoffProgressStep: 0,
     wyckoffPollTimer: null,
+    wyckoffPollInFlight: false,
     wyckoffJobId: null,
+    wyckoffJobMarket: null,
     wyckoffLastProgressText: '',
     wyckoffTickerQueue: [],
     wyckoffTickerTimer: null,
@@ -682,6 +689,16 @@ async function apiFetch(url, fetchOptions = {}, config = {}) {
 
     const controller = new AbortController();
     state.activeControllers.add(controller);
+    const timeoutId = window.setTimeout(() => controller.abort(), 30000);
+    const externalSignal = fetchOptions.signal;
+    const abortFromExternal = () => controller.abort();
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            controller.abort();
+        } else {
+            externalSignal.addEventListener('abort', abortFromExternal, { once: true });
+        }
+    }
 
     try {
         const method = String(fetchOptions.method || 'GET').toUpperCase();
@@ -718,6 +735,8 @@ async function apiFetch(url, fetchOptions = {}, config = {}) {
 
         return data;
     } finally {
+        window.clearTimeout(timeoutId);
+        externalSignal?.removeEventListener?.('abort', abortFromExternal);
         state.activeControllers.delete(controller);
     }
 }
@@ -2032,6 +2051,9 @@ function renderHeatmapChart(groups) {
     }
     if (!state.heatmapChart) {
         state.heatmapChart = window.echarts.init(container);
+    }
+    if (!state.heatmapResizeBound) {
+        state.heatmapResizeBound = true;
         window.addEventListener('resize', () => {
             if (state.heatmapChart) {
                 state.heatmapChart.resize();
@@ -2261,7 +2283,10 @@ async function loadHeatmap(forceReload = false) {
             throw new Error('市场云图缓存不是最新，请点击“刷新云图”重建缓存，或先执行 UPDATE 更新数据。');
         }
 
-        const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}${forceReload ? '&refresh=1' : ''}`);
+        if (forceReload) {
+            await apiFetch('/api/heatmap/rebuild', { method: 'POST' });
+        }
+        const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}`);
         if (!result.success) {
             const detail = result.data?.errors && Object.keys(result.data.errors).length
                 ? `: ${Object.entries(result.data.errors).map(([key, value]) => `${key}=${value}`).join('; ')}`
@@ -2415,6 +2440,7 @@ async function searchStocks(keyword, limit = 20) {
 }
 
 async function applyStockSearch(keyword) {
+    const requestId = ++state.stockSearchRequestId;
     const normalized = String(keyword || '').trim().toLowerCase();
     if (!normalized) {
         renderStocks(state.allStocksCache);
@@ -2452,6 +2478,9 @@ async function applyStockSearch(keyword) {
         console.warn('stock search failed:', error);
     }
 
+    if (requestId !== state.stockSearchRequestId) {
+        return;
+    }
     renderStocks(filtered);
 }
 
@@ -2536,7 +2565,12 @@ function applyMacdInputs() {
     const fast = Math.max(2, Number(document.getElementById('stock-macd-fast')?.value) || 12);
     const slow = Math.max(fast + 1, Number(document.getElementById('stock-macd-slow')?.value) || 26);
     const signal = Math.max(2, Number(document.getElementById('stock-macd-signal')?.value) || 9);
-    state.macdSettings = { fast, slow, signal };
+    state.macdSettings = {
+        fast,
+        slow,
+        signal,
+        enabled: state.macdSettings?.enabled !== false,
+    };
     saveKlinePreferences();
 }
 
@@ -2671,7 +2705,13 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
     const normalizedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
     state.currentStockPeriod = normalizedPeriod;
     state.currentStockLimit = normalizeStockChartLimit(state.currentStockLimit);
-    state.currentStockDetail = { code, name: name || '', period: normalizedPeriod, limit: state.currentStockLimit };
+    state.currentStockDetail = {
+        code,
+        name: name || '',
+        period: normalizedPeriod,
+        limit: state.currentStockLimit,
+        market: currentEquityMarket(),
+    };
     document.getElementById('modal-title').textContent = `${formatStockTitle(code, name)} · ${STOCK_PERIOD_LABELS[normalizedPeriod]}`;
     document.getElementById('stock-export-btn').disabled = false;
     setStockExportStatus('');
@@ -2682,12 +2722,20 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
 
     try {
         if (currentEquityMarket() === 'hong_kong') {
+            document.getElementById('stock-export-btn').disabled = true;
+            setStockExportStatus('港股导出暂不支持', 'warning');
             const hongKongLimit = state.currentStockLimit === 'all' ? 1000 : state.currentStockLimit;
             const payload = await apiFetch(`/api/equities/hong_kong/instrument/${encodeURIComponent(code)}?limit=${encodeURIComponent(hongKongLimit)}&adjustment=raw`);
             const instrument = payload.instrument || {};
             const kline = payload.kline || {};
             const resolvedSymbol = kline.symbol || instrument.symbol || code;
-            state.currentStockDetail = { code: resolvedSymbol, name: instrument.name || name || '', period: 'daily', limit: state.currentStockLimit };
+            state.currentStockDetail = {
+                code: resolvedSymbol,
+                name: instrument.name || name || '',
+                period: 'daily',
+                limit: state.currentStockLimit,
+                market: 'hong_kong',
+            };
             document.getElementById('modal-title').textContent = `${instrument.name || name || code} · 港股日K · HKD`;
             document.getElementById('stock-info').innerHTML = `<div class="detail-section"><div class="detail-section-title">HONG KONG SECURITY</div><div class="detail-kv-grid"><span>代码</span><b>${escapeHtml(resolvedSymbol)}</b><span>市场</span><b>${escapeHtml(instrument.market || '--')}</b><span>币种</span><b>HKD</b></div></div>`;
             renderStockChart([...(kline.items || [])].reverse(), 'daily', { currency: 'HKD', finance: payload.finance || {} });
@@ -2700,7 +2748,13 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
         const resolvedName = result.name || name || findCachedStock(code)?.name || '';
         const resolvedPeriod = result.period || normalizedPeriod;
         state.currentStockPeriod = resolvedPeriod;
-        state.currentStockDetail = { code: result.code || code, name: resolvedName, period: resolvedPeriod, limit: state.currentStockLimit };
+        state.currentStockDetail = {
+            code: result.code || code,
+            name: resolvedName,
+            period: resolvedPeriod,
+            limit: state.currentStockLimit,
+            market: 'a_share',
+        };
         document.getElementById('modal-title').textContent = `${formatStockTitle(result.code || code, resolvedName)} · ${result.period_label || STOCK_PERIOD_LABELS[resolvedPeriod] || '日K'}`;
         renderStockPeriodControls();
         syncIndicatorControls();
@@ -3191,6 +3245,11 @@ async function exportCurrentStock(mode = 'check') {
         toast('当前没有打开的股票', 'error');
         return;
     }
+    if (stock.market === 'hong_kong' || currentEquityMarket() === 'hong_kong') {
+        setStockExportStatus('港股导出暂不支持', 'warning');
+        toast('港股导出暂不支持', 'error');
+        return;
+    }
 
     const exportButton = document.getElementById('stock-export-btn');
     const updateButton = document.getElementById('export-update-first-btn');
@@ -3524,6 +3583,7 @@ function stopWyckoffProgress() {
     state.wyckoffPollTimer = null;
     state.wyckoffProgressStep = 0;
     state.wyckoffJobId = null;
+    state.wyckoffJobMarket = null;
     state.wyckoffLastProgressText = '';
     state.wyckoffTickerQueue = [];
     state.wyckoffTickerTimer = null;
@@ -3585,11 +3645,12 @@ function renderWyckoffProgress(job) {
 }
 
 async function pollWyckoffJob() {
-    if (!state.wyckoffJobId) {
+    if (!state.wyckoffJobId || state.wyckoffPollInFlight) {
         return;
     }
+    state.wyckoffPollInFlight = true;
     try {
-        const isHongKong = currentEquityMarket() === 'hong_kong';
+        const isHongKong = state.wyckoffJobMarket === 'hong_kong';
         const result = await apiFetch(isHongKong
             ? `/api/equities/hong_kong/wyckoff/status/${state.wyckoffJobId}`
             : `/api/wyckoff/status/${state.wyckoffJobId}`);
@@ -3626,6 +3687,8 @@ async function pollWyckoffJob() {
         toast(`威科夫分析失败: ${error.message}`, 'error', 5200);
         state.wyckoffRunning = false;
         document.getElementById('wyckoff-run-btn').disabled = false;
+    } finally {
+        state.wyckoffPollInFlight = false;
     }
 }
 
@@ -3873,7 +3936,8 @@ function showWyckoffBatchResult(index) {
 }
 
 async function startWyckoffJob(query) {
-    const isHongKong = currentEquityMarket() === 'hong_kong';
+    const market = currentEquityMarket();
+    const isHongKong = market === 'hong_kong';
     const result = await apiFetch(isHongKong ? '/api/equities/hong_kong/wyckoff/start' : '/api/wyckoff/start', {
         method: 'POST',
         headers: {
@@ -3884,15 +3948,19 @@ async function startWyckoffJob(query) {
     if (!isHongKong && !result.success) {
         throw new Error(result.error || '威科夫分析失败');
     }
-    return result;
+    return { ...result, _market: market };
 }
 
-async function waitForWyckoffJob(jobId) {
+async function waitForWyckoffJob(jobId, market) {
+    const deadline = Date.now() + 30 * 60 * 1000;
     while (true) {
         if (state.systemHalted) {
             throw new Error('系统已急停');
         }
-        const isHongKong = currentEquityMarket() === 'hong_kong';
+        if (Date.now() >= deadline) {
+            throw new Error('威科夫任务轮询超时，请稍后在任务状态中检查结果');
+        }
+        const isHongKong = market === 'hong_kong';
         const result = await apiFetch(isHongKong
             ? `/api/equities/hong_kong/wyckoff/status/${jobId}`
             : `/api/wyckoff/status/${jobId}`);
@@ -3904,7 +3972,7 @@ async function waitForWyckoffJob(jobId) {
         if (job.status === 'done') {
             return job.result;
         }
-        if (job.status === 'error' || job.status === 'halted') {
+        if (job.status === 'error' || job.status === 'halted' || job.status === 'cancelled') {
             throw new Error(`${job.error || job.message || '威科夫分析失败'}${job.error_report_path ? `；日志: ${job.error_report_path}` : ''}`);
         }
         await delay(1200);
@@ -3968,10 +4036,11 @@ async function runSelectedWatchlistWyckoffBatch() {
             try {
                 const startResult = await startWyckoffJob(item.code);
                 state.wyckoffJobId = startResult.job_id;
+                state.wyckoffJobMarket = startResult._market;
                 item.detail = '分析中';
                 renderWyckoffProgress(startResult.data || {});
                 renderWyckoffBatchQueue();
-                const result = await waitForWyckoffJob(startResult.job_id);
+                const result = await waitForWyckoffJob(startResult.job_id, startResult._market);
                 renderWyckoffResult(result);
                 state.currentWyckoffBatchIndex = index;
                 item.status = 'done';
@@ -4037,6 +4106,7 @@ async function runWyckoffAnalysis() {
     try {
         const result = await startWyckoffJob(query);
         state.wyckoffJobId = result.job_id;
+        state.wyckoffJobMarket = result._market;
         renderWyckoffProgress(result.data || {});
         await pollWyckoffJob();
         if (state.wyckoffRunning && state.wyckoffJobId && !state.wyckoffPollTimer) {
@@ -4336,9 +4406,10 @@ async function startUpdateDiagnostic(mode) {
 }
 
 async function pollUpdateDiagnosticStatus() {
-    if (!state.currentUpdateDiagnosticId) {
+    if (!state.currentUpdateDiagnosticId || state.updateDiagnosticPollInFlight) {
         return;
     }
+    state.updateDiagnosticPollInFlight = true;
     try {
         const result = await apiFetch(`/api/update/diagnostics/status/${state.currentUpdateDiagnosticId}`);
         if (!result.success) {
@@ -4368,6 +4439,8 @@ async function pollUpdateDiagnosticStatus() {
         document.getElementById('update-diagnostic-extended-btn').disabled = false;
         document.getElementById('update-diagnostic-note').textContent = `自检失败: ${error.message}`;
         toast(`自检失败: ${error.message}`, 'error');
+    } finally {
+        state.updateDiagnosticPollInFlight = false;
     }
 }
 
@@ -4445,9 +4518,10 @@ function formatUpdateWorkload(job) {
 }
 
 async function pollUpdateJobStatus() {
-    if (!state.currentUpdateJobId) {
+    if (!state.currentUpdateJobId || state.updatePollInFlight) {
         return;
     }
+    state.updatePollInFlight = true;
     try {
         const result = await apiFetch(`/api/update/status/${state.currentUpdateJobId}`, {}, {
             allowWhenHalted: true,
@@ -4510,6 +4584,8 @@ async function pollUpdateJobStatus() {
             updateButton.disabled = false;
         }
         toast(`更新状态同步失败: ${error.message}`, 'error');
+    } finally {
+        state.updatePollInFlight = false;
     }
 }
 
@@ -5209,9 +5285,6 @@ async function runSelection() {
         return;
     }
 
-    // 先中止仍在后台执行的股票列表/概览请求，避免它们继续占用连接和资源。
-    abortActiveRequests();
-
     if (state.currentPage !== 'selection') {
         switchPage('selection');
     }
@@ -5281,10 +5354,11 @@ async function runSelection() {
 }
 
 async function pollSelectionJobStatus() {
-    if (!state.currentSelectionJobId) {
+    if (!state.currentSelectionJobId || state.selectionPollInFlight) {
         return;
     }
 
+    state.selectionPollInFlight = true;
     try {
         const result = await apiFetch(`/api/select/status/${state.currentSelectionJobId}`);
         if (!result.success) {
@@ -5353,6 +5427,8 @@ async function pollSelectionJobStatus() {
         document.getElementById('selection-results-meta').textContent = 'Error';
         document.getElementById('selection-results').innerHTML = `<div class="state-empty">状态同步失败: ${escapeHtml(error.message)}</div>`;
         toast(`状态同步失败: ${error.message}`, 'error');
+    } finally {
+        state.selectionPollInFlight = false;
     }
 }
 

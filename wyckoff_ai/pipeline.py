@@ -131,7 +131,10 @@ class WyckoffPipeline:
 
         api_key = resolve_deepseek_api_key(self.config)
         if not api_key:
-            raise WyckoffPipelineError("未配置 DeepSeek API Key，请在 config/config_local.yaml 或 DEEPSEEK_API_KEY 中配置")
+            raise WyckoffPipelineError(
+                "未配置 DeepSeek API Key，请设置 DEEPSEEK_API_KEY，或仅写入被 Git 忽略的 "
+                "config/config_local.yaml"
+            )
 
         emit("build_prompt", f"正在压缩最近 {len(recent)} 根日线，构建威科夫分析上下文。", 38)
         messages = build_messages(

@@ -7,6 +7,7 @@ import os
 import re
 from typing import Any
 
+from utils.local_config import load_local_config_file
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-pro"
@@ -20,8 +21,8 @@ def resolve_deepseek_api_key(config: dict | None = None) -> str | None:
     env_token = os.getenv("DEEPSEEK_API_KEY")
     if env_token:
         return env_token.strip()
-    config = config or {}
-    token = config.get("wyckoff_ai", {}).get("deepseek_api_key")
+    local_config = load_local_config_file()
+    token = local_config.get("wyckoff_ai", {}).get("deepseek_api_key")
     if token:
         return str(token).strip()
     return None

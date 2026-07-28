@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `a45a43f`
-  (`Persist K-line preferences and fix indicator context`, 2026-07-11).
+  `9e4b329`
+  (`Fix multi-market syncs and macro GDP visualization`, 2026-07-23).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -407,11 +407,21 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `a45a43f` on branch
+Baseline commit: `9e4b329` on branch
 `codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
 
 State at handoff:
 
+- The uncommitted code-review remediation batch validates the findings in
+  `docs/code_review_9e4b329.md` before changing behavior. Confirmed fixes cover
+  Tencent metric preservation and explicit history truncation, cross-process
+  atomic CSV/config/cache writes, secret redaction, bounded provider/API
+  concurrency, task admission/cancellation/shutdown, indicator and pattern
+  correctness, market-specific UI guards, POST-only heatmap rebuilds, request
+  timeouts, and a vendored ECharts runtime. Static checks, 86 focused tests,
+  browser checks for dashboard/heatmap/Hong Kong export behavior, and the full
+  suite passed (`411 passed in 13.73s`). The review document remains unmodified
+  and the repair batch remains unstaged for user review.
 - The macro GDP visualization now distinguishes provider-exact year-to-date
   cumulative values from derived single-quarter flows. Growth defaults to
   `cn_gdp.gdp_quarterly`; Q1 uses the provider cumulative value and Q2-Q4 use

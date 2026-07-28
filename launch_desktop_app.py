@@ -20,6 +20,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from ops.events import redact
+from utils.atomic_io import atomic_write_json
 from utils.platform_paths import runtime_paths
 
 try:
@@ -106,12 +108,11 @@ def write_startup_incident(error_detail: str) -> Path:
         "pid": os.getpid(),
         "project_root": str(PROJECT_ROOT),
         "log_file": str(log_file),
-        "system_proxy": urllib.request.getproxies(),
-        "local_proxy_bypass": os.environ.get("NO_PROXY", ""),
-        "error": error_detail,
+        "system_proxy_keys": sorted(urllib.request.getproxies()),
+        "local_proxy_bypass_configured": bool(os.environ.get("NO_PROXY", "")),
+        "error": redact(error_detail),
     }
-    with open(incident_path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
+    atomic_write_json(incident_path, payload)
     append_system_log(
         "desktop_launcher_failed",
         "桌面 App 启动失败，事故快照已写入。",
@@ -325,10 +326,12 @@ def run_gui() -> int:
         min_size=(1100, 720),
     )
     api.bind_window(window)
+    backend_started = threading.Event()
 
     def boot() -> None:
         try:
             url, _thread = launch_backend()
+            backend_started.set()
             logging.info("Web UI is ready: %s", url)
             window.load_url(url)
         except Exception:
@@ -353,6 +356,16 @@ def run_gui() -> int:
     if icon_path is not None:
         start_options["icon"] = str(icon_path)
     webview.start(**start_options)
+    if backend_started.is_set():
+        try:
+            from web_server import _prepare_graceful_shutdown
+
+            interrupted = _prepare_graceful_shutdown()
+            if interrupted:
+                logging.info("Waiting for %s interrupted job(s) to stop", interrupted)
+                time.sleep(1.5)
+        except Exception:
+            logging.exception("Graceful desktop shutdown preparation failed")
     return 0
 
 

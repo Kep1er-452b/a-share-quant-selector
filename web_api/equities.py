@@ -79,6 +79,20 @@ def create_equities_blueprint(*, services: Mapping[str, Any], capabilities=None)
             payload = callback(*args, **kwargs)
         except (KeyError, TypeError, ValueError) as exc:
             return error("INVALID_REQUEST", str(exc), 400, market=market)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code is None:
+                raise
+            payload = {
+                "code": getattr(exc, "error_code", "TASK_CONFLICT"),
+                "error": str(exc),
+                "market": market,
+            }
+            job = getattr(exc, "job", None)
+            if job:
+                payload["job_id"] = job.get("job_id")
+                payload["data"] = job
+            return jsonify(payload), int(status_code)
         return jsonify(context(market, payload)), status
 
     @blueprint.get("/<market>/overview")
