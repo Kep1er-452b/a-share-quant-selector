@@ -403,8 +403,9 @@ function signedClass(value) {
     return numeric > 0 ? 'price-up' : 'price-down';
 }
 
-function calculateMovingAverage(values, windowSize) {
+function calculateMovingAverage(values, windowSize, minimumPeriods = windowSize) {
     const window = Math.max(Number(windowSize) || 0, 0);
+    const required = Math.max(1, Math.min(window, Number(minimumPeriods) || window));
     const result = [];
     const buffer = [];
     values.forEach(value => {
@@ -413,14 +414,27 @@ function calculateMovingAverage(values, windowSize) {
         if (buffer.length > window) {
             buffer.shift();
         }
-        if (!window || buffer.length < window || buffer.some(item => item === null)) {
+        if (!window || buffer.length < required || buffer.some(item => item === null)) {
             result.push(null);
         } else {
             const total = buffer.reduce((sum, item) => sum + item, 0);
-            result.push(Number((total / window).toFixed(4)));
+            result.push(Number((total / buffer.length).toFixed(4)));
         }
     });
     return result;
+}
+
+function calculateVisibleMovingAverage(values, windowSize, visibleCount) {
+    const count = Math.max(0, Math.min(values.length, Number(visibleCount) || 0));
+    if (!count) {
+        return [];
+    }
+    const availableWarmup = Math.max(0, values.length - count);
+    const minimumPeriods = Math.min(
+        Math.max(Number(windowSize) || 0, 1),
+        availableWarmup + 1,
+    );
+    return calculateMovingAverage(values, windowSize, minimumPeriods).slice(-count);
 }
 
 function ema(values, span) {
@@ -2803,7 +2817,11 @@ function renderStockChart(data, period = 'daily', detail = {}) {
         name: `MA${item.window}`,
         window: item.window,
         color: item.color,
-        values: calculateMovingAverage(calculationCloseValues, item.window).slice(-reversed.length),
+        values: calculateVisibleMovingAverage(
+            calculationCloseValues,
+            item.window,
+            reversed.length,
+        ),
     }));
     const calculatedMacdValues = calculateMacd(calculationCloseValues, state.macdSettings);
     const macdValues = {
