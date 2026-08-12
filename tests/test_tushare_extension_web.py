@@ -35,6 +35,7 @@ def test_index_kline_api_uses_tushare_cache_and_month_range(monkeypatch, tmp_pat
         web_server,
         "_fetch_index_kline",
         lambda *args, **kwargs: {"source": "legacy", "candles": [{"date": "2026-06-30"}]},
+        raising=False,
     )
 
     response = web_server.app.test_client().get("/api/index-kline?symbol=sh000001&months=99")

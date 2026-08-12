@@ -16,8 +16,8 @@ git log -5 --date=short --pretty=format:'%h %ad %s'
 ```
 
 - This document was last reconciled against commit:
-  `32e6714`
-  (`Harden multi-market syncs, APIs, and runtime safety`, 2026-07-28).
+  `c80e304`
+  (`Add public CI workflow`, 2026-08-12).
 - If `HEAD` differs, trust the code and `git show`, then update the relevant
   parts of this document when the change affects architecture, invariants,
   workflows, or future handoff context.
@@ -150,6 +150,12 @@ Critical rules:
 - Rows are newest-first. Many Tongdaxin helpers depend on this.
 - Writes are validated, deduplicated by date, sorted descending, locked, and
   atomic.
+- Missing files return an empty frame, but permission, decoding, and other I/O
+  failures propagate; treating real read failures as empty can truncate an
+  incremental warehouse. Cross-process writes use bounded striped lock files.
+- The analysis repair view uses local listing metadata when available so the
+  listing-session exemption matches adjustment-gap detection without guessing
+  from a truncated history.
 - `market_cap` is stored in yuan.
 - The repository currently stores total market capitalization, not a separate
   circulating-market-cap field.
@@ -209,6 +215,9 @@ Critical rules:
   `market_trading_summary` dataset. Cache validity depends on a signature of
   the source trading datasets and visible market-turnover inputs; keep this
   cache out of its own source signature.
+- Extension-store connections are thread-local and reused. Source signatures
+  use aggregate row metadata plus per-date revision counters; do not restore
+  full payload JSON decoding merely to invalidate Market Pulse caches.
 
 ### Independent Domain Warehouses
 
@@ -239,6 +248,11 @@ Critical rules:
   is shown as an explicit partial-data state rather than failing the workspace.
 - Domain sync requests and query limits are bounded. Completed Web sync jobs
   retain only the newest terminal entries, while active jobs remain preserved.
+- Planned history syncs derive incremental cursors per symbol rather than from
+  one dataset-global maximum. Provider rows missing composite-key fields are
+  skipped and reported as warnings; valid rows in the same page remain atomic.
+  Running-state checkpoints are persisted at slice boundaries and every ten
+  provider pages, while failure/cancellation always persists the exact offset.
 - Tushare tokens are resolved in memory from `TUSHARE_TOKEN` or ignored local
   configuration. Never call global `tushare.set_token()` or serialize a token
   into diagnostics, task state, package resources, or API responses.
@@ -283,6 +297,9 @@ Do not hardcode a second independent grouping table in the frontend.
 - CLI and Web should converge on `utils/selection_worker.py`.
 - Each stock is read once, shared features are prepared once, then selected
   strategies run against that frame.
+- Dynamic Min-J features are shared by parameter pair across the three Min-J
+  strategies, and strategy indicator frames extend shallow copies so the full
+  prepared frame is not deep-copied once per strategy.
 - Supported execution modes are process, thread, and sequential.
 - Process/thread equivalence and optional C-core equivalence are tested.
 - Results are grouped by strategy name and sorted by stock code.
@@ -304,6 +321,9 @@ Do not hardcode a second independent grouping table in the frontend.
 - Domain workspace controllers must abort requests and release listeners,
   timers, and chart instances on deactivation.
 - Side-effect APIs must use appropriate HTTP methods and session-token checks.
+- Ops GET endpoints and Wyckoff output routes are private too. Independent
+  workspace controllers must send the `X-Quant-Session` header for protected
+  reads as well as writes.
 - Validate payload shape, bounded string lengths, stock codes, job IDs, strategy
   names, and file paths at API boundaries.
 - Keep long update/selection/Wyckoff work outside request handlers using the
@@ -311,6 +331,10 @@ Do not hardcode a second independent grouping table in the frontend.
 - In-memory Web job maps retain active jobs and the newest terminal jobs only.
   Do not remove this pruning without adding another bounded job-lifecycle
   mechanism; update-job pruning must also remove matching cancel events.
+- Stock lists use bounded 500-row API pages and render at most 300 rows at a
+  time. Stock-detail payloads use a bounded revision-keyed cache. Async UI
+  surfaces use request generations so stale stock/index/heatmap responses
+  cannot replace newer views.
 - After significant frontend changes, start the local Web app and verify the
   actual interaction in a browser, not only JavaScript syntax.
 
@@ -371,6 +395,15 @@ live route/API/browser checks, and the full suite:
 389 passed in 7.69s
 ```
 
+The audit-remediation batch atop `c80e304` passed changed-Python compilation,
+JavaScript syntax checks, `git diff --check`, focused provider/domain/strategy /
+ops/Web regressions, live local API and browser interaction checks, and the
+full suite:
+
+```text
+421 passed in 7.91s
+```
+
 Useful runtime checks:
 
 ```bash
@@ -407,10 +440,24 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `32e6714` on branch
-`codex/tushare-comprehensive-upgrade`; `origin/main` remains `46c486d`.
+Baseline commit: `c80e304` on branch `main`; `origin/main` is `c80e304`.
 
 State at handoff:
+
+- The current uncommitted remediation resolves every finding in
+  `docs/audit_report_2026-08-12.md`: provider I/O/session/timeout correctness,
+  atomic CSV and log behavior, per-symbol resumable domain sync, Tushare
+  extension cache costs, formula/strategy correctness, bounded Web hot paths,
+  authenticated ops/output reads, frontend request races, notification truth
+  reporting, AI result persistence, and safer desktop/build lifecycles.
+- New regression coverage exercises both Tencent success parsers, Ops runtime
+  scalar serialization and mixed-type keys, failed background-thread admission,
+  DingTalk image retention, Min-J sharing, and protected System GET requests.
+  A live local browser pass verified overview, a bounded stock list, 000001
+  detail, Hong Kong formula validation, System health, and rapid heatmap metric
+  switching with an empty console. The full suite passed (`421 passed in
+  7.91s`). The audit report remains an untracked user-supplied document, and no
+  changes have been staged or committed.
 
 - The current uncommitted K-line fix keeps long moving averages continuous
   when the local period history cannot fully prewarm the selected visible

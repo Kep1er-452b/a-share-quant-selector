@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import datetime, timezone
 from functools import lru_cache
 import json
 import os
@@ -52,6 +53,10 @@ _TERMINAL_SYNC_STATES = {"completed", "completed_with_warnings", "failed", "erro
 _SYNC_EVENT_OBSERVER = None
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def configure_sync_event_observer(observer=None) -> None:
     """Install one best-effort operations observer without coupling this API to ops."""
     global _SYNC_EVENT_OBSERVER
@@ -80,7 +85,7 @@ def _prune_sync_jobs_locked() -> None:
         key=lambda job_id: str(
             _SYNC_JOBS[job_id].get("finished_at")
             or _SYNC_JOBS[job_id].get("updated_at")
-            or ""
+            or "9999-12-31T23:59:59+00:00"
         ),
     )
     for job_id in terminal_ids[:-_MAX_TERMINAL_SYNC_JOBS]:
@@ -309,7 +314,14 @@ def sync_start():
         return jsonify({"error": str(exc), "code": "INVALID_REQUEST"}), 400
 
     job_id = uuid.uuid4().hex
-    job = {"job_id": job_id, "domain": domain, "status": "queued", "events": [], "result": None}
+    job = {
+        "job_id": job_id,
+        "domain": domain,
+        "status": "queued",
+        "events": [],
+        "result": None,
+        "created_at": _utc_now(),
+    }
     cancel = Event()
     with _SYNC_LOCK:
         _prune_sync_jobs_locked()
@@ -356,6 +368,7 @@ def _run_sync_job(job_id, sync_request, catalog, store, client, cancel):
     try:
         with _SYNC_LOCK:
             _SYNC_JOBS[job_id]["status"] = "running"
+            _SYNC_JOBS[job_id]["started_at"] = _utc_now()
 
         def emit(event):
             with _SYNC_LOCK:
@@ -406,6 +419,9 @@ def _run_sync_job(job_id, sync_request, catalog, store, client, cancel):
         })
     finally:
         with _SYNC_LOCK:
+            job = _SYNC_JOBS.get(job_id)
+            if job is not None:
+                job["finished_at"] = _utc_now()
             _SYNC_CANCEL.pop(job_id, None)
             if _ACTIVE_SYNC_DOMAINS.get(domain) == job_id:
                 _ACTIVE_SYNC_DOMAINS.pop(domain, None)

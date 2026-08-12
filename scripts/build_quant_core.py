@@ -30,15 +30,17 @@ def resolve_compiler(compiler: str | None = None) -> str:
             return compiler
         if compiler == "clang" and shutil.which("gcc"):
             return "gcc"
-        return compiler
+        raise FileNotFoundError(f"C compiler not found: {compiler}")
 
     for candidate in ("clang", "gcc", "cc"):
         if shutil.which(candidate):
             return candidate
-    return "clang"
+    raise FileNotFoundError("no supported C compiler found (tried clang, gcc, cc)")
 
 
 def build(compiler: str | None = None, extra_cflags: list[str] | None = None) -> Path:
+    if not SOURCE.is_file():
+        raise FileNotFoundError(f"quant core source not found: {SOURCE}")
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     output = BUILD_DIR / library_name()
     system = platform.system()
@@ -53,7 +55,7 @@ def build(compiler: str | None = None, extra_cflags: list[str] | None = None) ->
     else:
         command.extend(["-shared", str(SOURCE), "-lm", "-o", str(output)])
 
-    subprocess.run(command, cwd=ROOT, check=True)
+    subprocess.run(command, cwd=ROOT, check=True, timeout=120)
     return output
 
 

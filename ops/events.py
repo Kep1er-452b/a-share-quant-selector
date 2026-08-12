@@ -37,7 +37,19 @@ def redact(value: Any, key: str = "") -> Any:
     if any(part in normalized for part in _SECRET_PARTS) and not normalized.endswith(("_source", "_present")):
         return "[REDACTED]"
     if isinstance(value, Mapping):
-        return {str(item_key): redact(item, str(item_key)) for item_key, item in value.items()}
+        result = {}
+        original_types = {}
+        for item_key, item in value.items():
+            text_key = str(item_key)
+            output_key = text_key
+            key_type = type(item_key).__name__
+            if text_key in result and original_types[text_key] != key_type:
+                prior_key = f"{original_types[text_key]}:{text_key}"
+                result[prior_key] = result.pop(text_key)
+                output_key = f"{key_type}:{text_key}"
+            result[output_key] = redact(item, text_key)
+            original_types[text_key] = key_type
+        return result
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]
     if isinstance(value, str):

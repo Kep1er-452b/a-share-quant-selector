@@ -14,6 +14,12 @@ def test_system_workspace_has_required_views_and_script():
     assert html.index("system_workspace.js") < html.index("app.js")
 
 
+def test_system_workspace_authenticates_protected_get_requests():
+    source = JS.read_text(encoding="utf-8")
+
+    assert "headers: { 'X-Quant-Session': token }" in source
+
+
 def test_system_controller_uses_bounded_ops_apis_and_lifecycle():
     js = JS.read_text(encoding="utf-8")
     for endpoint in ("/api/ops/tasks", "/api/ops/events", "/api/ops/health", "/api/ops/performance"):

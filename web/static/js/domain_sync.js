@@ -203,7 +203,8 @@
     }
 
     async function start(control, options = {}) {
-        if (!control) return;
+        if (!control || control.starting || (control.jobId && ACTIVE.has(control.status))) return;
+        control.starting = true;
         stopPolling(control);
         setState(control, 'queued', '正在创建本地同步任务');
         const request = {
@@ -231,6 +232,8 @@
                     : error.message,
                 { errorCode: error.code, errorText: error.message },
             );
+        } finally {
+            control.starting = false;
         }
     }
 
@@ -292,6 +295,7 @@
                 jobId: null,
                 pollTimer: null,
                 status: 'empty',
+                starting: false,
             };
             controls.set(domain, control);
             control.start?.addEventListener('click', () => start(control));

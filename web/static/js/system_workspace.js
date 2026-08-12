@@ -56,10 +56,13 @@
         }
 
         async activate() {
+            if (this.active) return;
             this.mount();
             this.active = true;
             await this.refresh();
-            this.timer = global.setInterval(() => this.active && this.refreshTasks(), 5000);
+            this.timer = global.setInterval(() => {
+                if (this.active && this.view === 'ops-tasks') this.refreshTasks();
+            }, 5000);
         }
 
         deactivate() {
@@ -170,7 +173,11 @@
             parentSignal?.addEventListener('abort', abortFromParent, { once: true });
             const timeoutId = setTimeout(() => controller.abort(), 30000);
             try {
-                const response = await fetch(url, { signal: controller.signal });
+                const token = document.querySelector('meta[name="quant-session-token"]')?.content || '';
+                const response = await fetch(url, {
+                    headers: { 'X-Quant-Session': token },
+                    signal: controller.signal,
+                });
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const payload = await response.json();
                 const target = document.getElementById(targetId);

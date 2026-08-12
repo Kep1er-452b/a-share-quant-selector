@@ -12,6 +12,19 @@ import time
 from ops.events import OpsEvent, RetentionPolicy
 
 
+def _json_default(value):
+    """Keep operational logging best-effort for common runtime scalar types."""
+    if isinstance(value, (datetime, Path)):
+        return value.isoformat() if isinstance(value, datetime) else str(value)
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
 class OpsStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -54,7 +67,12 @@ class OpsStore:
                     payload["event_id"], payload["timestamp"], payload["severity"], payload["message"],
                     payload["domain"], payload["market"], payload["module"], payload["job_id"],
                     payload["dataset"], payload["symbol"], payload["error_code"], payload["event_type"],
-                    json.dumps(payload["details"], ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(
+                        payload["details"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=_json_default,
+                    ),
                 ),
             )
 

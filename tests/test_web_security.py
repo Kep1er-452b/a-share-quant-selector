@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import sys
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -596,3 +597,36 @@ def test_wyckoff_job_honors_global_halt_before_pipeline(monkeypatch, tmp_path):
         web_server.halt_event.clear()
         with web_server.wyckoff_jobs_lock:
             web_server.wyckoff_jobs.pop(job_id, None)
+
+
+def test_background_thread_start_failure_marks_wyckoff_job_terminal(monkeypatch):
+    class FailingThread:
+        def __init__(self, *, target, args, daemon):
+            self.name = ""
+
+        def start(self):
+            raise RuntimeError("thread quota exhausted")
+
+    with web_server.wyckoff_jobs_lock:
+        before = set(web_server.wyckoff_jobs)
+    monkeypatch.setattr(web_server, "Thread", FailingThread)
+    with pytest.raises(RuntimeError, match="thread quota exhausted"):
+        web_server._start_market_wyckoff_job("a_share", "平安银行")
+
+    try:
+        with web_server.wyckoff_jobs_lock:
+            created_ids = set(web_server.wyckoff_jobs) - before
+            assert len(created_ids) == 1
+            job = web_server.wyckoff_jobs[created_ids.pop()]
+            assert job["status"] == "error"
+            assert "后台线程启动失败" in job["error"]
+    finally:
+        with web_server.wyckoff_jobs_lock:
+            failed_ids = [
+                job_id
+                for job_id, item in web_server.wyckoff_jobs.items()
+                if item.get("error") and "thread quota exhausted" in item["error"]
+            ]
+            for job_id in failed_ids:
+                web_server.wyckoff_jobs.pop(job_id, None)
+                web_server.wyckoff_cancel_events.pop(job_id, None)

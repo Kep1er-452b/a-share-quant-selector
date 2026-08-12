@@ -100,9 +100,23 @@ def write_runtime_icon(target_path: Path, app_path: Path = APP_PATH) -> None:
 
 
 def sign_app(app_path: Path = APP_PATH) -> None:
-    subprocess.run(
-        ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app_path)],
-        check=True,
+    try:
+        subprocess.run(
+            ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app_path)],
+            check=True,
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"codesign failed for {app_path}: {detail}") from exc
+
+
+def assert_app_bundle_safe(app_path: Path) -> None:
+    assert_package_safe(
+        (path for path in app_path.rglob("*") if path.is_file()),
+        root=app_path,
     )
 
 
@@ -123,10 +137,12 @@ def build() -> None:
     package_files = package_resource_files(project_root)
     assert_package_safe(package_files)
 
-    if app_path.exists():
-        shutil.rmtree(app_path)
+    build_path = app_path.with_name(f".{app_path.name}.building-{os.getpid()}")
+    backup_path = app_path.with_name(f".{app_path.name}.previous-{os.getpid()}")
+    if build_path.exists():
+        shutil.rmtree(build_path)
 
-    contents = app_path / "Contents"
+    contents = build_path / "Contents"
     macos = contents / "MacOS"
     resources = contents / "Resources"
     macos.mkdir(parents=True, exist_ok=True)
@@ -140,19 +156,30 @@ def build() -> None:
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     # NSWorkspace adds a disabled badge to unsigned app icons.
-    sign_app(app_path)
-    write_runtime_icon(resources / RUNTIME_ICON_NAME, app_path)
-    assert_package_safe(
-        (path for path in app_path.rglob("*") if path.is_file()),
-        root=app_path,
-    )
-    sign_app(app_path)
+    sign_app(build_path)
+    write_runtime_icon(resources / RUNTIME_ICON_NAME, build_path)
+    assert_app_bundle_safe(build_path)
+    sign_app(build_path)
+
+    replaced_existing = False
+    try:
+        if app_path.exists():
+            os.replace(app_path, backup_path)
+            replaced_existing = True
+        os.replace(build_path, app_path)
+    except Exception:
+        if replaced_existing and backup_path.exists() and not app_path.exists():
+            os.replace(backup_path, app_path)
+        raise
+    else:
+        if backup_path.exists():
+            shutil.rmtree(backup_path)
 
     # Helps Finder refresh metadata after replacing an app bundle.
     os.utime(app_path, None)
     print(f"OK built {app_path}")
     print(f"OK project_root={project_root}")
-    print(f"OK executable={executable}")
+    print(f"OK executable={app_path / 'Contents' / 'MacOS' / EXECUTABLE_NAME}")
 
 
 if __name__ == "__main__":

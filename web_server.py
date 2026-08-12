@@ -2,6 +2,8 @@
 Web 服务器 - A股量化选股系统前端
 """
 from flask import Flask, Response, g, render_template, jsonify, request, send_from_directory, has_request_context
+from collections import OrderedDict
+from copy import deepcopy
 import json
 import sys
 import socket
@@ -9,6 +11,7 @@ import os
 import re
 import secrets
 import signal
+import math
 import shutil
 import subprocess
 import time
@@ -115,7 +118,7 @@ from ops.logging import EventLogger
 from ops.performance import PerformanceRecorder
 from ops.store import OpsRetentionMaintenance, OpsStore
 from ops.tasks import TaskRegistry
-from utils.platform_paths import runtime_paths as platform_runtime_paths
+from utils.platform_paths import resolve_data_root, runtime_paths as platform_runtime_paths
 
 app = Flask(__name__, 
             template_folder='web/templates',
@@ -138,7 +141,7 @@ diagnostic_jobs_lock = Lock()
 diagnostic_cancel_events = {}
 job_admission_lock = Lock()
 market_cache_rebuild_lock = Lock()
-index_kline_cache_lock = RLock()
+market_cache_refresh_scheduled = Event()
 config_write_lock = RLock()
 registry_lock = RLock()
 sync_selection_active = False
@@ -146,8 +149,12 @@ wyckoff_jobs = {}
 wyckoff_jobs_lock = Lock()
 wyckoff_cancel_events = {}
 watchlist_lock = Lock()
+stock_detail_cache_lock = Lock()
+stock_detail_cache = OrderedDict()
+MAX_STOCK_DETAIL_CACHE_ENTRIES = 12
 ACTIVE_JOB_STATUSES = {'queued', 'running', 'cancelling'}
 MAX_RETAINED_TERMINAL_JOBS = 50
+MAX_QUEUED_JOB_SECONDS = 30
 
 
 class JobAdmissionConflict(RuntimeError):
@@ -164,7 +171,6 @@ INDEX_KLINE_TARGETS = {
     'sz399006': {'symbol': 'sz399006', 'name': '创业板指'},
     'sh000688': {'symbol': 'sh000688', 'name': '科创50'},
 }
-INDEX_KLINE_CACHE_TTL_SECONDS = 15 * 60
 LOG_DIR = platform_runtime_paths().logs_root
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 INCIDENT_DIR = LOG_DIR / "incidents"
@@ -191,7 +197,7 @@ ops_logger = EventLogger(ops_store, platform_runtime_paths().logs_root / "ops-ev
 
 def _snapshot_jobs(jobs, lock):
     with lock:
-        return {job_id: dict(job) for job_id, job in jobs.items()}
+        return {job_id: deepcopy(job) for job_id, job in jobs.items()}
 
 
 ops_tasks = TaskRegistry({
@@ -233,6 +239,25 @@ def _rebuild_market_caches_serialized(**kwargs):
     """Serialize every cache rebuild path to avoid concurrent file replacement."""
     with market_cache_rebuild_lock:
         return rebuild_market_caches(**kwargs)
+
+
+def _schedule_market_cache_refresh(data_dir):
+    if market_cache_refresh_scheduled.is_set():
+        return False
+    market_cache_refresh_scheduled.set()
+
+    def refresh():
+        try:
+            _rebuild_market_caches_serialized(data_dir=data_dir, preserve_existing=True)
+        finally:
+            market_cache_refresh_scheduled.clear()
+
+    try:
+        Thread(target=refresh, daemon=True).start()
+    except Exception:
+        market_cache_refresh_scheduled.clear()
+        raise
+    return True
 
 
 def _ops_task_health():
@@ -408,7 +433,7 @@ def _reload_registry():
     """重新加载策略注册器，确保参数变更立即生效。"""
     global registry
     with registry_lock:
-        replacement = StrategyRegistry("config/strategy_params.yaml")
+        replacement = StrategyRegistry(project_root / "config" / "strategy_params.yaml")
         replacement.auto_register_from_directory("strategy")
         registry = replacement
         strategy_registry_module._registry = replacement
@@ -418,13 +443,16 @@ def _reload_registry():
 registry = _reload_registry()
 
 
-def _load_config(config_path="config/config.yaml"):
-    return load_config_file(config_path)
+def _load_config(config_path=None):
+    path = project_root / "config" / "config.yaml" if config_path is None else Path(config_path)
+    if not path.is_absolute():
+        path = project_root / path
+    return load_config_file(path)
 
 
 def _data_root_dir():
     config = _load_config()
-    return Path(str(_config_value(config, 'data_dir', default='data')))
+    return resolve_data_root(_config_value(config, 'data_dir', default='data'))
 
 
 def _active_data_dir():
@@ -481,21 +509,6 @@ def _ensure_tushare_index_cache(store=None, symbols=None):
         return {'status': 'warning', 'warning': warning}
 
 
-def _index_kline_cache_path(data_dir='data'):
-    return Path(data_dir) / 'index_kline_cache.json'
-
-
-def _load_index_kline_cache(data_dir='data'):
-    cache_path = _index_kline_cache_path(data_dir)
-    if not cache_path.exists():
-        return {}
-    try:
-        with open(cache_path, 'r', encoding='utf-8') as file:
-            return json.load(file) or {}
-    except Exception:
-        return {}
-
-
 def _load_json_file(path, default=None):
     target = Path(path)
     if not target.exists():
@@ -505,137 +518,6 @@ def _load_json_file(path, default=None):
             return json.load(file) or ({} if default is None else default)
     except Exception:
         return {} if default is None else default
-
-
-def _save_index_kline_cache(cache, data_dir='data'):
-    cache_path = _index_kline_cache_path(data_dir)
-    with index_kline_cache_lock:
-        current = _load_index_kline_cache(data_dir)
-        current.update(cache)
-        atomic_write_json(cache_path, current)
-
-
-def _cached_index_kline(symbol, data_dir='data'):
-    cache = _load_index_kline_cache(data_dir)
-    item = cache.get(symbol) or {}
-    updated_at = item.get('updated_at')
-    if not updated_at:
-        return None, cache
-    try:
-        updated_time = datetime.strptime(updated_at, '%Y-%m-%d %H:%M:%S')
-    except ValueError:
-        return None, cache
-    if (datetime.now() - updated_time).total_seconds() <= INDEX_KLINE_CACHE_TTL_SECONDS:
-        return item, cache
-    return None, cache
-
-
-def _fetch_index_kline(symbol, data_dir='data', limit=30):
-    target = INDEX_KLINE_TARGETS.get(symbol) or INDEX_KLINE_TARGETS['sh000001']
-    cached_item, cache = _cached_index_kline(target['symbol'], data_dir=data_dir)
-    if cached_item:
-        return {**cached_item, 'from_cache': True}
-
-    try:
-        import akshare as ak
-    except ImportError as exc:
-        raise RuntimeError('未安装 akshare，无法获取指数K线') from exc
-
-    source = 'akshare:stock_zh_index_daily_em'
-    end_date = datetime.now().strftime('%Y%m%d')
-    start_date = (datetime.now() - timedelta(days=180)).strftime('%Y%m%d')
-    try:
-        df = ak.stock_zh_index_daily_em(
-            symbol=target['symbol'],
-            start_date=start_date,
-            end_date=end_date,
-        )
-    except Exception:
-        try:
-            df = _fetch_index_kline_tencent(target['symbol'], max(limit + 5, 35))
-            source = 'tencent:appstock/fqkline'
-        except Exception:
-            df = ak.stock_zh_index_daily(symbol=target['symbol'])
-            source = 'akshare:stock_zh_index_daily'
-
-    if df is None or df.empty:
-        df = _fetch_index_kline_tencent(target['symbol'], max(limit + 5, 35))
-        source = 'tencent:appstock/fqkline'
-    if df is None or df.empty:
-        raise RuntimeError(f"{target['name']} 暂无K线数据")
-
-    df = df.copy()
-    df['date'] = df['date'].astype(str)
-    for column in ['open', 'close', 'low', 'high', 'volume', 'amount']:
-        if column in df.columns:
-            df[column] = df[column].astype(float)
-    df = df.sort_values('date').tail(limit)
-    candles = [
-        {
-            'date': row['date'],
-            'open': round(float(row['open']), 2),
-            'close': round(float(row['close']), 2),
-            'low': round(float(row['low']), 2),
-            'high': round(float(row['high']), 2),
-            'volume': round(float(row.get('volume', 0)), 2),
-            'amount': round(float(row.get('amount', 0)), 2),
-        }
-        for row in df.to_dict('records')
-    ]
-    payload = {
-        'symbol': target['symbol'],
-        'name': target['name'],
-        'period': 'daily',
-        'limit': limit,
-        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'source': source,
-        'candles': candles,
-    }
-    cache[target['symbol']] = payload
-    _save_index_kline_cache(cache, data_dir=data_dir)
-    return {**payload, 'from_cache': False}
-
-
-def _fetch_index_kline_tencent(symbol, limit):
-    import requests
-
-    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{limit},qfq'
-    response = requests.get(
-        url,
-        timeout=15,
-        headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://stock.finance.qq.com/',
-        },
-    )
-    response.raise_for_status()
-    payload = response.json()
-    data_level = payload.get('data', {})
-    klines = []
-
-    if isinstance(data_level, dict):
-        stock_data = data_level.get(symbol, {})
-        if isinstance(stock_data, dict):
-            klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
-    elif isinstance(data_level, list):
-        for item in data_level:
-            if isinstance(item, list) and len(item) >= 2 and item[0] == symbol and isinstance(item[1], list):
-                klines = item[1]
-                break
-
-    records = []
-    for item in klines:
-        if isinstance(item, list) and len(item) >= 6:
-            records.append({
-                'date': str(item[0]),
-                'open': float(item[1]),
-                'close': float(item[2]),
-                'high': float(item[3]),
-                'low': float(item[4]),
-                'volume': float(item[5]),
-                'amount': 0.0,
-            })
-    return pd.DataFrame(records)
 
 
 def _config_value(config, *keys, default=None):
@@ -869,12 +751,26 @@ def _classify_board(stock_code):
         return "star"
     if code.startswith(("300", "301")):
         return "chinext"
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return "beijing"
     return "main"
 
 
 def _normalize_csv_value(raw_value):
     value = str(raw_value or "").strip().lower()
     return value
+
+
+def _json_number(value, digits=None, *, integer=False):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    if integer:
+        return int(numeric)
+    return round(numeric, digits) if digits is not None else numeric
 
 
 def _bounded_text(value, field_name, *, max_length=200, allow_empty=True):
@@ -902,7 +798,7 @@ def _validate_job_id(job_id):
 def _parse_requested_boards(raw_value):
     allowed = set(BOARD_LABELS.keys()) - {"all"}
     if raw_value is None or str(raw_value).strip() == "":
-        return ["main", "chinext", "star"]
+        return ["main", "chinext", "star", "beijing"]
     values = [_normalize_csv_value(item) for item in str(raw_value or "").split(",")]
     selected = [item for item in values if item in allowed]
     if not selected:
@@ -1082,14 +978,26 @@ def _market_watchlist_store():
     return MarketWatchlistStore(_watchlist_path())
 
 
-def _market_watchlist_rows(market, service=None):
-    rows = _market_watchlist_store().list_all(market)
+def _market_watchlist_rows(market, service=None, rows=None):
+    rows = list(rows) if rows is not None else _market_watchlist_store().list_all(market)
     if market == 'a_share':
         stock_names = _load_stock_names()
+        snapshot = load_market_snapshot(str(_active_data_dir())) or {}
+        snapshot_by_code = {
+            str(item.get('code') or '').zfill(6): item
+            for item in snapshot.get('stocks') or []
+            if item.get('code')
+        }
+        row_counts = _load_stock_row_counts(str(_active_data_dir()))
         enriched = []
         for item in rows:
             code = CSVManager.validate_stock_code(item['code'])
-            row = _stock_table_row(code, stock_names)
+            cached = snapshot_by_code.get(code)
+            row = (
+                _stock_table_row_from_snapshot(cached, stock_names, row_counts)
+                if cached
+                else _stock_table_row(code, stock_names)
+            )
             row.update(item)
             row['market'] = 'a_share'
             row['symbol'] = canonical_equity_symbol('a_share', code)
@@ -1144,7 +1052,7 @@ def _is_fallback_stock_name(code, name):
 
 
 def _build_board_counts(stock_codes):
-    counts = {"main": 0, "chinext": 0, "star": 0}
+    counts = {"main": 0, "chinext": 0, "star": 0, "beijing": 0}
     for code in stock_codes:
         counts[_classify_board(code)] += 1
     return counts
@@ -1173,7 +1081,12 @@ def _safe_int_arg(name, default, minimum=1, maximum=1000):
 
 def _stock_table_row(code, stock_names=None):
     stock_names = stock_names or _load_stock_names()
-    df = _active_csv_manager().read_stock_for_analysis(code)
+    manager = _active_csv_manager()
+    path = manager.get_stock_path(code, create_dirs=False)
+    try:
+        df = pd.read_csv(path, nrows=1)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        df = pd.DataFrame()
     if df.empty:
         return {
             'code': code,
@@ -1192,10 +1105,13 @@ def _stock_table_row(code, stock_names=None):
         'code': code,
         'name': _stock_display_name(code, stock_names),
         'board': _classify_board(code),
-        'latest_price': round(float(latest['close']), 2),
+        'latest_price': _json_number(latest.get('close'), 2),
         'latest_date': latest_date,
-        'market_cap': round(float(latest.get('market_cap', 0)) / 1e8, 2),
-        'data_count': len(df),
+        'market_cap': (
+            _json_number(float(latest.get('market_cap')) / 1e8, 2)
+            if _json_number(latest.get('market_cap')) is not None else None
+        ),
+        'data_count': _load_stock_row_counts(str(manager.data_dir)).get(code) or '--',
     }
 
 
@@ -1209,7 +1125,11 @@ def _stock_table_row_from_snapshot(stock, stock_names=None, row_counts=None):
         'board': stock.get('board') or _classify_board(code),
         'latest_price': stock.get('latest_price'),
         'latest_date': stock.get('latest_date'),
-        'market_cap': round(float(stock.get('market_cap') or 0) / 1e8, 2),
+        'market_cap': (
+            round(float(stock.get('market_cap')) / 1e8, 2)
+            if _json_number(stock.get('market_cap')) is not None
+            else None
+        ),
         'data_count': stock.get('data_count') or row_counts.get(code) or '--',
     }
 
@@ -1252,7 +1172,7 @@ def _export_service():
 
 def _require_session_token():
     token = request.headers.get("X-Quant-Session", "")
-    if token != WEB_SESSION_TOKEN:
+    if not secrets.compare_digest(str(token), WEB_SESSION_TOKEN):
         return jsonify({
             'success': False,
             'error': '本地会话令牌无效，请刷新页面后重试',
@@ -1421,11 +1341,11 @@ def _append_job_log_by_id(job_id, message):
 def _serialize_job(job):
     if not job:
         return None
-    serialized = {
+    serialized = deepcopy({
         key: value
         for key, value in job.items()
         if key not in {'started_at_monotonic'}
-    }
+    })
     serialized['elapsed_seconds'] = _elapsed_seconds(job)
     return serialized
 
@@ -1437,6 +1357,45 @@ def _job_retention_key(job_id, job):
     )
 
 
+def _expire_stale_queued_jobs():
+    timestamp = _job_timestamp()
+    for job_map, lock in (
+        (selection_jobs, selection_jobs_lock),
+        (update_jobs, update_jobs_lock),
+        (diagnostic_jobs, diagnostic_jobs_lock),
+        (wyckoff_jobs, wyckoff_jobs_lock),
+    ):
+        with lock:
+            for job in job_map.values():
+                if job.get('status') != 'queued':
+                    continue
+                if _elapsed_seconds(job) <= MAX_QUEUED_JOB_SECONDS:
+                    continue
+                job.update({
+                    'status': 'error',
+                    'error': '后台任务未能在队列时限内启动',
+                    'finished_at': timestamp,
+                    'updated_at': timestamp,
+                    'elapsed_seconds': _elapsed_seconds(job),
+                })
+
+
+def _start_background_job(thread, on_failure):
+    try:
+        thread.start()
+    except Exception as exc:
+        on_failure(exc)
+        raise
+    return thread
+
+
+def _job_thread(*, target, args, name):
+    """Create a worker thread while keeping simple test doubles compatible."""
+    thread = Thread(target=target, args=args, daemon=True)
+    thread.name = name
+    return thread
+
+
 def _prune_terminal_jobs(job_map, *, keep=None, cleanup_callback=None):
     """Retain active jobs and the newest terminal jobs in an in-memory job map."""
     keep = MAX_RETAINED_TERMINAL_JOBS if keep is None else max(int(keep), 0)
@@ -1445,6 +1404,17 @@ def _prune_terminal_jobs(job_map, *, keep=None, cleanup_callback=None):
         for job_id, job in job_map.items()
         if job.get('status') not in ACTIVE_JOB_STATUSES
     ]
+    newest_first = sorted(
+        terminal_jobs,
+        key=lambda item: _job_retention_key(*item),
+        reverse=True,
+    )
+    for _job_id, job in newest_first[5:]:
+        for field in ('results', 'result'):
+            value = job.get(field)
+            if value not in (None, {}, []):
+                job[f'{field}_evicted'] = True
+                job.pop(field, None)
     overflow = len(terminal_jobs) - keep
     if overflow <= 0:
         return []
@@ -1471,6 +1441,11 @@ def _update_update_job(job_id, **updates):
         job = update_jobs.get(job_id)
         if not job:
             return None
+        if 'progress_pct' in updates:
+            updates['progress_pct'] = max(
+                int(job.get('progress_pct') or 0),
+                int(updates.get('progress_pct') or 0),
+            )
         previous_status = job.get('status')
         job.update(updates)
         job['updated_at'] = _job_timestamp()
@@ -1728,11 +1703,160 @@ def _create_selection_job(requested_boards, requested_strategies, formula_spec=N
     return job_id
 
 
+def _selection_csv_value(value):
+    if isinstance(value, list):
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError('选股选项必须是字符串列表')
+        return ','.join(value)
+    return value
+
+
+def _start_a_share_selection(payload):
+    formula_spec = _parse_formula_spec(payload.get('formula'))
+    requested_boards = _parse_requested_boards(_selection_csv_value(payload.get('boards')))
+    requested_strategies = _parse_requested_strategies(
+        _selection_csv_value(payload.get('strategies')),
+        allow_empty=bool(formula_spec),
+    )
+    requested_strategies = _append_formula_strategy(requested_strategies, formula_spec)
+    with job_admission_lock:
+        conflict_response = _selection_conflict_response()
+        if conflict_response:
+            raise JobAdmissionConflict('已有互斥任务正在执行', _find_running_job())
+        job_id = _create_selection_job(requested_boards, requested_strategies, formula_spec)
+    thread = _job_thread(
+        target=_run_selection_job,
+        args=(job_id, requested_boards, requested_strategies, formula_spec),
+        name=f'aqs-selection-{job_id[:8]}',
+    )
+    _start_background_job(
+        thread,
+        lambda exc: _update_job(
+            job_id,
+            status='error',
+            error=f'后台线程启动失败: {exc}',
+            finished_at=_job_timestamp(),
+        ),
+    )
+    with selection_jobs_lock:
+        return _serialize_job(selection_jobs.get(job_id))
+
+
+def _run_hong_kong_selection_job(job_id, formula_spec, service):
+    with selection_jobs_lock:
+        cancel_event = selection_cancel_events.get(job_id)
+    try:
+        _update_job(job_id, status='running', market='hong_kong')
+        reader = HongKongEquityReader(service)
+        candidates = []
+        offset = 0
+        while True:
+            if cancel_event and cancel_event.is_set():
+                _update_job(job_id, status='cancelled', finished_at=_job_timestamp())
+                return
+            page = reader.list_instruments('', limit=2000, offset=offset)
+            items = page.get('items') or []
+            candidates.extend(
+                (item.get('symbol') or item.get('ts_code'), item.get('name') or item.get('symbol'))
+                for item in items
+                if item.get('symbol') or item.get('ts_code')
+            )
+            offset += len(items)
+            if not items or offset >= int(page.get('total') or 0):
+                break
+
+        strategies = [FORMULA_STRATEGY_NAME]
+        context = build_worker_context(
+            '',
+            strategies,
+            str(registry.params_file),
+            _selection_runtime_params(formula_spec),
+            market_id='hong_kong',
+            reader=reader,
+            strategy_scopes={FORMULA_STRATEGY_NAME: 'market_neutral'},
+        )
+        context['cancel_event'] = cancel_event
+        _update_job(job_id, total_candidates=len(candidates), backend='thread')
+        result = process_selection_chunk(candidates, 'all', False, context)
+        if cancel_event and cancel_event.is_set():
+            _update_job(job_id, status='cancelled', finished_at=_job_timestamp())
+            return
+        results = result.get('results_by_strategy') or {}
+        result_time = _job_timestamp()
+        report_path = _save_selection_markdown(
+            results,
+            result_time,
+            {
+                'market': 'hong_kong',
+                'boards': ['hong_kong'],
+                'strategies': strategies,
+                'formula': formula_spec,
+                'stock_pool_size': len(candidates),
+            },
+        )
+        error_counts = result.get('error_counts') or {}
+        _update_job(
+            job_id,
+            status='completed_with_warnings' if sum(error_counts.values()) else 'completed',
+            progress_pct=100,
+            completed_candidates=result.get('processed_count', 0),
+            valid_stock_count=result.get('valid_count', 0),
+            skipped_stock_count=result.get('skipped_count', 0),
+            selected_count=sum(len(items) for items in results.values()),
+            results=results,
+            result_time=result_time,
+            selection_report_path=report_path,
+            error_counts=error_counts,
+            error_details=result.get('error_details') or [],
+            finished_at=result_time,
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status='error',
+            error=str(exc),
+            finished_at=_job_timestamp(),
+        )
+
+
+def _start_hong_kong_selection(payload, service):
+    formula_spec = _parse_formula_spec(payload.get('formula'))
+    requested = payload.get('strategies') or []
+    if requested and requested != [FORMULA_STRATEGY_NAME]:
+        raise ValueError('当前港股选股仅支持市场中性的条件公式')
+    if not formula_spec:
+        raise ValueError('当前港股选股请启用条件公式')
+    with job_admission_lock:
+        if _find_running_job() or _find_running_update_job() or _find_running_diagnostic_job():
+            raise JobAdmissionConflict('已有互斥任务正在执行', _find_running_job())
+        job_id = _create_selection_job(['hong_kong'], [FORMULA_STRATEGY_NAME], formula_spec)
+        _update_job(job_id, market='hong_kong')
+    thread = _job_thread(
+        target=_run_hong_kong_selection_job,
+        args=(job_id, formula_spec, service),
+        name=f'aqs-selection-{job_id[:8]}',
+    )
+    _start_background_job(
+        thread,
+        lambda exc: _update_job(
+            job_id,
+            status='error',
+            error=f'后台线程启动失败: {exc}',
+            finished_at=_job_timestamp(),
+        ),
+    )
+    with selection_jobs_lock:
+        return _serialize_job(selection_jobs.get(job_id))
+
+
 @app.before_request
 def block_requests_after_halt():
     if request.path.startswith('/api/'):
         g.ops_request_started_at = time.perf_counter()
-    if request.path.startswith('/api/') and request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+    sensitive_get = request.path.startswith('/api/ops/')
+    if request.path.startswith('/api/') and (
+        request.method not in {'GET', 'HEAD', 'OPTIONS'} or sensitive_get
+    ):
         token_error = _require_session_token()
         if token_error:
             return token_error
@@ -1786,6 +1910,7 @@ def record_api_performance(response):
 def maintain_ops_retention():
     """Best-effort hourly retention; active task events remain protected."""
     try:
+        _expire_stale_queued_jobs()
         ops_retention.run_if_due()
     except Exception:
         # Operations maintenance must never make an application request fail.
@@ -2621,7 +2746,7 @@ def get_stocks():
 
         # 获取每只股票的基本信息 - 支持分页
         page = _safe_int_arg('page', 1, minimum=1, maximum=100000)
-        per_page = _safe_int_arg('per_page', 1000, minimum=1, maximum=10000)
+        per_page = _safe_int_arg('per_page', 500, minimum=1, maximum=500)
 
         snapshot_stocks = (load_market_caches(data_dir=data_dir).get('snapshot') or {}).get('stocks') or []
         if snapshot_stocks:
@@ -2631,7 +2756,7 @@ def get_stocks():
                 for stock in snapshot_stocks
                 if not is_hidden_market_stock(stock.get('code'), stock.get('name'))
             ]
-            if requested_board in {"main", "chinext", "star"}:
+            if requested_board in {"main", "chinext", "star", "beijing"}:
                 rows = [row for row in rows if row.get('board') == requested_board]
             rows.sort(key=lambda row: str(row.get('code') or ''))
 
@@ -2648,9 +2773,10 @@ def get_stocks():
             })
 
         manager = _active_csv_manager()
+        _schedule_market_cache_refresh(data_dir)
         stocks = manager.list_all_stocks()
         stocks = _filter_hidden_stock_codes(stocks, stock_names)
-        if requested_board in {"main", "chinext", "star"}:
+        if requested_board in {"main", "chinext", "star", "beijing"}:
             stocks = [code for code in stocks if _classify_board(code) == requested_board]
 
         start_idx = (page - 1) * per_page
@@ -2775,7 +2901,31 @@ def get_stock_detail(code):
         requested_period = _normalize_csv_value(request.args.get('period')) or 'daily'
         stock_names = _load_stock_names()
         stock_name = _stock_display_name(code, stock_names)
-        df = _active_csv_manager().read_stock_for_analysis(code)
+        manager = _active_csv_manager()
+        get_stock_path = getattr(manager, 'get_stock_path', None)
+        csv_path = get_stock_path(code, create_dirs=False) if callable(get_stock_path) else None
+        csv_stat = csv_path.stat() if csv_path is not None and csv_path.exists() else None
+        ext_store = _tushare_ext_store()
+        ext_path = Path(ext_store.db_path)
+        ext_stat = ext_path.stat() if ext_path.exists() else None
+        cache_key = (
+            str(csv_path),
+            code,
+            requested_period,
+            str(request.args.get('limit') or ''),
+            str(request.args.get('indicator_lookback') or ''),
+            (csv_stat.st_mtime_ns, csv_stat.st_size) if csv_stat else None,
+            (ext_stat.st_mtime_ns, ext_stat.st_size) if ext_stat else None,
+        )
+        cache_enabled = csv_path is not None
+        if cache_enabled:
+            with stock_detail_cache_lock:
+                cached_payload = stock_detail_cache.get(cache_key)
+                if cached_payload is not None:
+                    stock_detail_cache.move_to_end(cache_key)
+                    return jsonify(cached_payload)
+
+        df = manager.read_stock_for_analysis(code)
         if df.empty:
             return jsonify({'success': False, 'error': '股票不存在'})
         df, period = _resample_stock_period(df, requested_period)
@@ -2807,29 +2957,29 @@ def get_stock_detail(code):
         for i, (_, row) in enumerate(df.head(limit).iterrows()):
             data.append({
                 'date': row['date'].strftime('%Y-%m-%d'),
-                'open': round(row['open'], 2),
-                'high': round(row['high'], 2),
-                'low': round(row['low'], 2),
-                'close': round(row['close'], 2),
-                'volume': int(row['volume']),
-                'amount': round(row['amount'] / 1e4, 2),  # 万元
-                'turnover': round(row.get('turnover', 0), 2),
-                'market_cap': round(row.get('market_cap', 0) / 1e8, 2),  # 总市值，单位：亿
-                'K': round(kdj_df.iloc[i]['K'], 2),
-                'D': round(kdj_df.iloc[i]['D'], 2),
-                'J': round(kdj_df.iloc[i]['J'], 2),
-                'MIN_J': round(min_j.iloc[i], 2),
-                'ZX_SHORT': round(overlay_df.iloc[i]['ZX_SHORT'], 2),
-                'ZX_LONG': round(overlay_df.iloc[i]['ZX_LONG'], 2),
+                'open': _json_number(row.get('open'), 2),
+                'high': _json_number(row.get('high'), 2),
+                'low': _json_number(row.get('low'), 2),
+                'close': _json_number(row.get('close'), 2),
+                'volume': _json_number(row.get('volume'), integer=True),
+                'amount': _json_number(row.get('amount') / 1e4, 2),  # 万元
+                'turnover': _json_number(row.get('turnover'), 2),
+                'market_cap': _json_number(row.get('market_cap') / 1e8, 2),  # 总市值，单位：亿
+                'K': _json_number(kdj_df.iloc[i]['K'], 2),
+                'D': _json_number(kdj_df.iloc[i]['D'], 2),
+                'J': _json_number(kdj_df.iloc[i]['J'], 2),
+                'MIN_J': _json_number(min_j.iloc[i], 2),
+                'ZX_SHORT': _json_number(overlay_df.iloc[i]['ZX_SHORT'], 2),
+                'ZX_LONG': _json_number(overlay_df.iloc[i]['ZX_LONG'], 2),
                 'UP_SEQ': None if pd.isna(overlay_df.iloc[i]['UP_SEQ']) else int(overlay_df.iloc[i]['UP_SEQ']),
-                'UP_SEQ_Y': None if pd.isna(overlay_df.iloc[i]['UP_SEQ_Y']) else round(overlay_df.iloc[i]['UP_SEQ_Y'], 2),
+                'UP_SEQ_Y': _json_number(overlay_df.iloc[i]['UP_SEQ_Y'], 2),
                 'DOWN_SEQ': None if pd.isna(overlay_df.iloc[i]['DOWN_SEQ']) else int(overlay_df.iloc[i]['DOWN_SEQ']),
-                'DOWN_SEQ_Y': None if pd.isna(overlay_df.iloc[i]['DOWN_SEQ_Y']) else round(overlay_df.iloc[i]['DOWN_SEQ_Y'], 2),
+                'DOWN_SEQ_Y': _json_number(overlay_df.iloc[i]['DOWN_SEQ_Y'], 2),
                 'VIOLENT_K': bool(overlay_df.iloc[i]['VIOLENT_K']),
-                'VIOLENT_K_Y': round(overlay_df.iloc[i]['VIOLENT_K_Y'], 2),
+                'VIOLENT_K_Y': _json_number(overlay_df.iloc[i]['VIOLENT_K_Y'], 2),
             })
         
-        return jsonify({
+        response_payload = {
             'success': True,
             'code': code,
             'name': stock_name,
@@ -2846,19 +2996,26 @@ def get_stock_detail(code):
                     'high': round(row['high'], 2),
                     'low': round(row['low'], 2),
                     'close': round(row['close'], 2),
-                    'volume': int(row['volume']),
-                    'amount': round(row['amount'] / 1e4, 2),
+                    'volume': _json_number(row.get('volume'), integer=True),
+                    'amount': _json_number(row.get('amount') / 1e4, 2),
                 }
                 for _, row in df.head(context_count).iterrows()
             ],
             'adjusted_data': build_adjusted_candles(
-                _tushare_ext_store(),
+                ext_store,
                 code,
                 limit=limit,
                 required_trade_dates=[item.get('date') for item in data],
             ),
-            **build_stock_extension_payload(_tushare_ext_store(), code),
-        })
+            **build_stock_extension_payload(ext_store, code),
+        }
+        if cache_enabled:
+            with stock_detail_cache_lock:
+                stock_detail_cache[cache_key] = response_payload
+                stock_detail_cache.move_to_end(cache_key)
+                while len(stock_detail_cache) > MAX_STOCK_DETAIL_CACHE_ENTRIES:
+                    stock_detail_cache.popitem(last=False)
+        return jsonify(response_payload)
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
@@ -2877,11 +3034,16 @@ def export_stock_csv(code):
         mode = _normalize_csv_value(payload.get('mode')) or 'check'
         if mode not in {'check', 'update', 'force'}:
             return jsonify({'success': False, 'error': '不支持的导出模式'}), 400
+        if mode == 'update':
+            return jsonify({
+                'success': False,
+                'error': '单股联网更新不在请求线程执行；请先启动后台数据更新任务，再导出。',
+            }), 409
 
         service = _export_service()
         result = service.export_stock(
             code,
-            update_first=(mode == 'update'),
+            update_first=False,
             force_export=(mode == 'force'),
         )
         return jsonify(result)
@@ -2898,8 +3060,8 @@ def get_wyckoff_config():
             'success': True,
             'data': {
                 'configured': has_deepseek_config(config),
-                'provider': 'deepseek',
-                'model': 'deepseek-v4-pro',
+                'provider': _config_value(config, 'wyckoff_ai', 'provider', default='deepseek'),
+                'model': _config_value(config, 'wyckoff_ai', 'model', default='deepseek-v4-pro'),
             },
         })
     except Exception as e:
@@ -2927,9 +3089,9 @@ def _wyckoff_chart_url(chart_path):
         target = project_root / target
     try:
         relative = target.resolve().relative_to(outputs_root).as_posix()
-        return f"/outputs/wyckoff/files/{quote(relative)}"
+        return f"/outputs/wyckoff/files/{quote(relative)}?session={quote(WEB_SESSION_TOKEN)}"
     except ValueError:
-        return f"/outputs/wyckoff/charts/{quote(target.name)}"
+        return f"/outputs/wyckoff/charts/{quote(target.name)}?session={quote(WEB_SESSION_TOKEN)}"
 
 
 def _attach_wyckoff_chart_url(result):
@@ -3270,6 +3432,8 @@ def _start_market_wyckoff_job(market, query, reader=None):
     raw_query = str(query or '').strip()
     if not raw_query:
         raise ValueError('请输入股票代码、名称或拼音')
+    if len(raw_query) > 80:
+        raise ValueError('股票查询过长，最多 80 个字符')
     if market_id == 'hong_kong':
         symbol = canonical_equity_symbol(market_id, raw_query)
         job_query = symbol
@@ -3310,12 +3474,20 @@ def _start_market_wyckoff_job(market, query, reader=None):
                 wyckoff_jobs,
                 cleanup_callback=lambda removed_id: wyckoff_cancel_events.pop(removed_id, None),
             )
-    thread = Thread(
+    thread = _job_thread(
         target=_run_wyckoff_job,
         args=(job_id, job_query, market_id, reader),
-        daemon=True,
+        name=f'aqs-wyckoff-{job_id[:8]}',
     )
-    thread.start()
+    _start_background_job(
+        thread,
+        lambda exc: _update_wyckoff_job(
+            job_id,
+            status='error',
+            error=f'后台线程启动失败: {exc}',
+            finished_at=_job_timestamp(),
+        ),
+    )
     return dict(job)
 
 
@@ -3406,7 +3578,16 @@ def reveal_wyckoff_file():
         if not target.exists():
             return jsonify({'success': False, 'error': f'文件不存在: {target}'}), 404
 
-        subprocess.run(['open', '-R', str(target)], check=False)
+        if sys.platform == 'darwin':
+            subprocess.run(['open', '-R', str(target)], check=False, timeout=10)
+        elif os.name == 'nt':
+            os.startfile(str(target.parent if target.is_file() else target))
+        else:
+            subprocess.run(
+                ['xdg-open', str(target.parent if target.is_file() else target)],
+                check=False,
+                timeout=10,
+            )
         return jsonify({'success': True, 'path': str(target)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3415,6 +3596,8 @@ def reveal_wyckoff_file():
 @app.route('/outputs/wyckoff/charts/<path:filename>')
 def serve_wyckoff_chart(filename):
     """Serve legacy flat Wyckoff chart PNG files."""
+    if not secrets.compare_digest(str(request.args.get('session') or ''), WEB_SESSION_TOKEN):
+        return jsonify({'success': False, 'error': '本地会话令牌无效'}), 403
     charts_dir = _wyckoff_outputs_root() / 'charts'
     return send_from_directory(charts_dir, filename)
 
@@ -3422,6 +3605,8 @@ def serve_wyckoff_chart(filename):
 @app.route('/outputs/wyckoff/files/<path:filename>')
 def serve_wyckoff_file(filename):
     """Serve generated Wyckoff files from nested output folders."""
+    if not secrets.compare_digest(str(request.args.get('session') or ''), WEB_SESSION_TOKEN):
+        return jsonify({'success': False, 'error': '本地会话令牌无效'}), 403
     outputs_root = _wyckoff_outputs_root().resolve()
     target = (outputs_root / filename).resolve()
     if outputs_root not in target.parents and target != outputs_root:
@@ -3435,11 +3620,13 @@ def get_dashboard_pulse():
     try:
         data_dir = str(_active_data_dir())
         data_root = str(_data_root_dir())
+        if market_cache_needs_refresh(data_dir):
+            _schedule_market_cache_refresh(data_dir)
         payload = build_heatmap_payload(
             data_dir=data_dir,
             scope='all',
             metric='daily',
-            refresh=market_cache_needs_refresh(data_dir),
+            refresh=False,
         )
         health = market_cache_health(data_dir=data_dir)
         groups = payload.get('groups', []) or []
@@ -3598,160 +3785,11 @@ def activate_data_provider():
 
 @app.route('/api/select', methods=['POST'])
 def run_selection():
-    """执行选股"""
-    global sync_selection_active
-    admitted = False
-    try:
-        with job_admission_lock:
-            conflict_response = _selection_conflict_response()
-            if conflict_response:
-                return conflict_response
-            sync_selection_active = True
-            admitted = True
-
-        payload = request.get_json(silent=True)
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
-        formula_spec = _parse_formula_spec(payload.get('formula'))
-        requested_boards = _parse_requested_boards(payload.get('boards'))
-        requested_strategies = _parse_requested_strategies(payload.get('strategies'), allow_empty=bool(formula_spec))
-        requested_strategies = _append_formula_strategy(requested_strategies, formula_spec)
-
-        manager = _active_csv_manager()
-        stock_codes = [
-            code for code in manager.list_all_stocks()
-            if _classify_board(code) in requested_boards
-        ]
-        stock_names = _load_stock_names()
-        stock_codes = _filter_hidden_stock_codes(stock_codes, stock_names)
-        candidates = []
-        invalid_name_count = 0
-        for code in stock_codes:
-            name = _stock_display_name(code, stock_names)
-            if _is_invalid_stock_name(name):
-                invalid_name_count += 1
-                continue
-            candidates.append((code, name))
-
-        data_dir = str(manager.data_dir)
-        settings = _get_web_selection_settings()
-        backend = _resolve_selection_backend(len(candidates), settings)
-        candidate_chunks = _chunk_candidates(candidates, settings['chunk_size'])
-        effective_workers = min(settings['max_workers'], max(len(candidate_chunks), 1))
-
-        runtime_strategy_params = _selection_runtime_params(formula_spec)
-
-        print(
-            f"[web] 开始执行选股: boards={requested_boards}, "
-            f"strategies={requested_strategies}, "
-            f"候选={len(candidates)}, backend={backend}, workers={effective_workers}, "
-            f"chunk={settings['chunk_size']}"
-        )
-
-        results = {strategy_name: [] for strategy_name in requested_strategies}
-        valid_total_count = 0
-        skipped_count = 0
-        error_counts = {strategy_name: 0 for strategy_name in requested_strategies}
-        error_details = []
-
-        def consume_chunk(chunk_result):
-            nonlocal valid_total_count, skipped_count
-            valid_total_count += chunk_result.get('valid_count', 0)
-            skipped_count += chunk_result.get('skipped_count', 0)
-
-            for strategy_name in requested_strategies:
-                results[strategy_name].extend(
-                    chunk_result['results_by_strategy'].get(strategy_name, [])
-                )
-                error_counts[strategy_name] += chunk_result['error_counts'].get(strategy_name, 0)
-            remaining_error_slots = max(0, 100 - len(error_details))
-            if remaining_error_slots:
-                error_details.extend((chunk_result.get('error_details') or [])[:remaining_error_slots])
-
-        if backend == 'process':
-            with ProcessPoolExecutor(
-                max_workers=effective_workers,
-                initializer=initialize_selection_worker,
-                initargs=(data_dir, requested_strategies, str(registry.params_file), runtime_strategy_params),
-            ) as executor:
-                futures = [
-                    executor.submit(process_selection_chunk, chunk, "all", False)
-                    for chunk in candidate_chunks
-                ]
-                for future in as_completed(futures):
-                    if _is_halted():
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        return _halted_response()
-                    consume_chunk(future.result())
-        elif backend == 'thread':
-            worker_context = build_worker_context(
-                data_dir,
-                requested_strategies,
-                str(registry.params_file),
-                runtime_strategy_params,
-            )
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = [
-                    executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
-                    for chunk in candidate_chunks
-                ]
-                for future in as_completed(futures):
-                    if _is_halted():
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        return _halted_response()
-                    consume_chunk(future.result())
-        else:
-            worker_context = build_worker_context(
-                data_dir,
-                requested_strategies,
-                str(registry.params_file),
-                runtime_strategy_params,
-            )
-            for chunk in candidate_chunks:
-                if _is_halted():
-                    return _halted_response()
-                consume_chunk(process_selection_chunk(chunk, "all", False, worker_context))
-
-        for strategy_name in results:
-            results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
-
-        result_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        meta = {
-            'boards': requested_boards,
-            'strategies': requested_strategies,
-            'stock_pool_size': len(candidates),
-            'invalid_name_count': invalid_name_count,
-            'valid_stock_count': valid_total_count,
-            'skipped_stock_count': skipped_count,
-            'backend': backend,
-            'formula': formula_spec,
-            'error_counts': error_counts,
-            'error_details': error_details,
-        }
-        report_path = _save_selection_markdown(results, result_time, meta)
-
-        print(
-            f"[web] 选股完成: valid={valid_total_count}, skipped={skipped_count}, "
-            f"invalid_name={invalid_name_count}, "
-            f"selected={sum(len(items) for items in results.values())}, "
-            f"errors={error_counts}"
-        )
-
-        return jsonify({
-            'success': True,
-            'data': results,
-            'time': result_time,
-            'selection_report_path': report_path,
-            'meta': meta,
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-    finally:
-        if admitted:
-            with job_admission_lock:
-                sync_selection_active = False
+    """Compatibility alias for the bounded asynchronous selection endpoint."""
+    conflict_response = _selection_conflict_response()
+    if conflict_response:
+        return conflict_response
+    return start_selection_job()
 
 
 @app.route('/api/select/start', methods=['POST'])
@@ -3766,28 +3804,14 @@ def start_selection_job():
             payload = {}
         if not isinstance(payload, dict):
             return jsonify({'success': False, 'error': '请求体必须是 JSON 对象'}), 400
-        formula_spec = _parse_formula_spec(payload.get('formula'))
-        requested_boards = _parse_requested_boards(payload.get('boards'))
-        requested_strategies = _parse_requested_strategies(payload.get('strategies'), allow_empty=bool(formula_spec))
-        requested_strategies = _append_formula_strategy(requested_strategies, formula_spec)
-
-        with job_admission_lock:
-            conflict_response = _selection_conflict_response()
-            if conflict_response:
-                return conflict_response
-            job_id = _create_selection_job(requested_boards, requested_strategies, formula_spec)
-        thread = Thread(
-            target=_run_selection_job,
-            args=(job_id, requested_boards, requested_strategies, formula_spec),
-            daemon=True,
-        )
-        thread.start()
-
+        job = _start_a_share_selection(payload)
         return jsonify({
             'success': True,
-            'job_id': job_id,
-            'data': _serialize_job(selection_jobs.get(job_id)),
+            'job_id': job.get('job_id'),
+            'data': job,
         })
+    except JobAdmissionConflict as exc:
+        return jsonify({'success': False, 'error': str(exc), 'job': exc.job}), 409
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
@@ -3824,7 +3848,7 @@ def get_selection_options():
                 'label': BOARD_LABELS[board_key],
                 'count': board_counts.get(board_key, 0),
             }
-            for board_key in ['main', 'chinext', 'star']
+            for board_key in ['main', 'chinext', 'star', 'beijing']
         ]
 
         strategies = []
@@ -3886,14 +3910,8 @@ def get_stats():
         stocks = _filter_hidden_stock_codes(manager.list_all_stocks(), stock_names)
         board_counts = _build_board_counts(stocks)
         
-        # 计算数据日期范围
-        dates = []
-        for code in stocks[:50]:  # 采样
-            df = manager.read_stock_for_analysis(code)
-            if not df.empty:
-                dates.append(df.iloc[0]['date'])
-        
-        latest_date = max(dates).strftime('%Y-%m-%d') if dates else '-'
+        snapshot = load_market_caches(data_dir=str(manager.data_dir)).get('snapshot') or {}
+        latest_date = str(snapshot.get('latest_date') or '-')
         
         return jsonify({
             'success': True,
@@ -3922,12 +3940,9 @@ def get_index_kline():
             return jsonify({'success': False, 'error': 'months 必须是整数'}), 400
         months = max(1, min(months, 120))
         store = _tushare_ext_store()
-        cache_result = _ensure_tushare_index_cache(store=store)
         payload = build_index_kline_payload(store, symbol, months=months)
-        if cache_result.get('warning'):
-            payload['warning'] = cache_result['warning']
-        if not payload.get('candles') and cache_result.get('warning'):
-            return jsonify({'success': False, 'error': cache_result['warning']}), 503
+        if not payload.get('candles'):
+            payload['warning'] = '指数缓存为空，请执行数据更新或等待启动预热完成。'
         return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -3943,7 +3958,6 @@ def get_index_detail(symbol):
         limit_arg = _normalize_csv_value(request.args.get('limit')) or '260'
         indicator_lookback = _parse_indicator_lookback(request.args.get('indicator_lookback'))
         store = _tushare_ext_store()
-        cache_result = _ensure_tushare_index_cache(store=store, symbols=DEFAULT_INDEX_SYMBOLS)
         payload = build_index_kline_payload(
             store,
             symbol,
@@ -3953,8 +3967,8 @@ def get_index_detail(symbol):
             max_limit=STOCK_DETAIL_MAX_LIMIT,
             indicator_lookback=indicator_lookback,
         )
-        if cache_result.get('warning'):
-            payload['warning'] = cache_result['warning']
+        if not payload.get('candles'):
+            payload['warning'] = '指数缓存为空，请执行数据更新或等待启动预热完成。'
         return jsonify({'success': True, 'data': payload})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -3972,7 +3986,7 @@ def get_heatmap():
                 'error': '云图强制重建必须使用 POST /api/heatmap/rebuild',
             }), 405
         scope = _normalize_csv_value(request.args.get('scope')) or 'all'
-        if scope not in {'all', 'main', 'chinext', 'star'}:
+        if scope not in {'all', 'main', 'chinext', 'star', 'beijing'}:
             scope = 'all'
 
         metric = _normalize_csv_value(request.args.get('metric')) or 'daily'
@@ -4129,9 +4143,8 @@ def get_update_options():
         )
         data_root = str(_config_value(config, 'data_dir', default='data'))
         active_state = load_active_provider(data_root)
-        latest_date = ensure_market_caches(
-            data_dir=str(_active_data_dir())
-        ).get('snapshot', {}).get('latest_date')
+        cache_bundle = load_market_caches(data_dir=str(_active_data_dir()))
+        latest_date = (cache_bundle.get('snapshot') or {}).get('latest_date')
 
         return jsonify({
             'success': True,
@@ -4201,12 +4214,20 @@ def start_update_job():
                     'job': running_selection,
                 }), 409
             job_id = _create_update_job(provider, max_stocks=max_stocks)
-        thread = Thread(
+        thread = _job_thread(
             target=_run_update_job,
             args=(job_id, provider, tushare_token, max_stocks),
-            daemon=True,
+            name=f'aqs-update-{job_id[:8]}',
         )
-        thread.start()
+        _start_background_job(
+            thread,
+            lambda exc: _update_update_job(
+                job_id,
+                status='error',
+                error=f'后台线程启动失败: {exc}',
+                finished_at=_job_timestamp(),
+            ),
+        )
 
         with update_jobs_lock:
             job = update_jobs.get(job_id)
@@ -4273,11 +4294,20 @@ def start_update_diagnostic(job_id):
                 return jsonify({'success': False, 'error': message, 'diagnostic': existing}), 409
             diagnostic_id = _create_diagnostic_job(update_snapshot, mode)
 
-        Thread(
+        diagnostic_thread = _job_thread(
             target=_run_update_diagnostic_job,
             args=(diagnostic_id, report_path, mode, temporary_token),
-            daemon=True,
-        ).start()
+            name=f'aqs-diagnostic-{diagnostic_id[:8]}',
+        )
+        _start_background_job(
+            diagnostic_thread,
+            lambda exc: _update_diagnostic_job(
+                diagnostic_id,
+                status='error',
+                error=f'后台线程启动失败: {exc}',
+                finished_at=_job_timestamp(),
+            ),
+        )
         with diagnostic_jobs_lock:
             created = diagnostic_jobs.get(diagnostic_id)
         return jsonify({'success': True, 'diagnostic_id': diagnostic_id, 'data': _serialize_job(created)})
@@ -4421,7 +4451,8 @@ def get_watchlist():
     """获取自选股列表。"""
     try:
         with watchlist_lock:
-            rows = _market_watchlist_rows('a_share')
+            stored_rows = _market_watchlist_store().list_all('a_share')
+        rows = _market_watchlist_rows('a_share', rows=stored_rows)
 
         return jsonify({'success': True, 'data': rows})
     except Exception as e:
@@ -4445,11 +4476,12 @@ def add_watchlist_item():
             item = _update_market_watchlist(
                 'a_share', {'query': query, 'note': note}
             )
-            row = next((
-                current
-                for current in _market_watchlist_rows('a_share')
-                if current['symbol'] == item['symbol']
-            ), item)
+            stored_rows = _market_watchlist_store().list_all('a_share')
+        row = next((
+            current
+            for current in _market_watchlist_rows('a_share', rows=stored_rows)
+            if current['symbol'] == item['symbol']
+        ), item)
         return jsonify({'success': True, 'data': row})
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -4518,7 +4550,7 @@ def remove_watchlist_item(code):
 def get_config():
     """获取配置"""
     try:
-        config_file = Path("config/strategy_params.yaml")
+        config_file = project_root / "config" / "strategy_params.yaml"
         if config_file.exists():
             import yaml
             with open(config_file, 'r', encoding='utf-8') as f:
@@ -4552,7 +4584,7 @@ def update_config():
                     'error': '选股任务运行期间不能修改策略配置',
                 }), 409
             with config_write_lock:
-                config_file = Path("config/strategy_params.yaml")
+                config_file = project_root / "config" / "strategy_params.yaml"
                 backup_path = atomic_write_yaml(config_file, new_config)
                 _reload_registry()
         
@@ -4582,7 +4614,7 @@ def update_single_strategy_config(strategy_name):
                         or strategy_name == FORMULA_STRATEGY_NAME
                     ):
                         return jsonify({'success': False, 'error': '策略不存在'}), 404
-                config_file = Path("config/strategy_params.yaml")
+                config_file = project_root / "config" / "strategy_params.yaml"
                 config = {}
                 if config_file.exists():
                     with open(config_file, 'r', encoding='utf-8') as f:
@@ -4747,8 +4779,14 @@ class _AShareEquityWebAdapter:
     @staticmethod
     def instrument_detail(symbol, *, limit=260, adjustment='raw'):
         code = str(symbol).split('.', 1)[0]
-        payload = _response_payload(get_stock_detail(code))
+        response = get_stock_detail(code)
+        payload = response[0].get_json() if isinstance(response, tuple) else response.get_json()
+        if not isinstance(payload, dict) or payload.get('success') is False:
+            raise ValueError((payload or {}).get('error') or '股票详情读取失败')
+        payload.pop('success', None)
         payload['currency'] = 'CNY'
+        payload['adjustment'] = adjustment
+        payload['requested_limit'] = limit
         return payload
 
     @staticmethod
@@ -4764,6 +4802,24 @@ class _AShareEquityWebAdapter:
                 if name != FORMULA_STRATEGY_NAME
             ]
         }
+
+    @staticmethod
+    def strategy_scope(strategy_name):
+        strategy = registry.get_strategy(strategy_name)
+        return getattr(strategy, 'market_scope', None) if strategy is not None else None
+
+    @staticmethod
+    def start_selection(payload):
+        job = _start_a_share_selection(payload)
+        return {'success': True, 'job_id': job.get('job_id'), 'data': job}
+
+    @staticmethod
+    def selection_status(job_id):
+        with selection_jobs_lock:
+            job = _serialize_job(selection_jobs.get(_validate_job_id(job_id)))
+        if not job or job.get('market') == 'hong_kong':
+            raise KeyError('A 股选股任务不存在或已过期')
+        return {'success': True, 'data': job}
 
     @staticmethod
     def watchlist():
@@ -4800,7 +4856,30 @@ class _HongKongEquityWebAdapter:
 
     @staticmethod
     def selection_options():
-        return {'strategies': [], 'warning': '港股策略需显式声明 hong_kong 或 market_neutral scope'}
+        service = domain_service('hong_kong')
+        total = int(service.search('', 1, 0).get('total') or 0)
+        return {
+            'boards': [{'key': 'all', 'label': '全部港股', 'count': total}],
+            'strategies': [],
+            'formula_supported': True,
+            'warning': '港股仅运行显式 market_neutral 条件公式，不套用 A 股板块或涨跌停规则。',
+        }
+
+    @staticmethod
+    def strategy_scope(strategy_name):
+        return 'market_neutral' if strategy_name == FORMULA_STRATEGY_NAME else None
+
+    def start_selection(self, payload):
+        job = _start_hong_kong_selection(payload, self.service)
+        return {'success': True, 'job_id': job.get('job_id'), 'data': job}
+
+    @staticmethod
+    def selection_status(job_id):
+        with selection_jobs_lock:
+            job = _serialize_job(selection_jobs.get(_validate_job_id(job_id)))
+        if not job or job.get('market') != 'hong_kong':
+            raise KeyError('港股选股任务不存在或已过期')
+        return {'success': True, 'data': job}
 
     def watchlist(self):
         with watchlist_lock:

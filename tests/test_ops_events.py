@@ -113,3 +113,20 @@ def test_retention_maintenance_is_periodic_and_preserves_active_jobs(tmp_path):
     assert second == {"ran": False, "deleted": 0, "active_jobs": 0}
     assert third == {"ran": True, "deleted": 0, "active_jobs": 1}
     assert store.query(job_id="active-1", limit=10)["total"] == 1
+
+
+def test_ops_store_serializes_runtime_detail_scalars(tmp_path):
+    store = OpsStore(tmp_path / "ops.sqlite")
+    store.append(OpsEvent.create(message="runtime", details={"at": NOW, "path": tmp_path}))
+
+    details = store.query(limit=1)["items"][0]["details"]
+    assert details["at"] == NOW.isoformat()
+    assert details["path"] == str(tmp_path)
+
+
+def test_redaction_preserves_mapping_keys_with_different_types():
+    from ops.events import redact
+
+    cleaned = redact({1: "integer", "1": "string"})
+
+    assert cleaned == {"int:1": "integer", "str:1": "string"}

@@ -8,6 +8,7 @@ import traceback
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from ops.events import redact
 from utils.platform_paths import runtime_paths
@@ -15,6 +16,7 @@ from utils.platform_paths import runtime_paths
 LOG_DIR = runtime_paths().logs_root
 SYSTEM_LOG_FILE = LOG_DIR / "system.log"
 ERROR_DIR = LOG_DIR / "errors"
+_SYSTEM_LOG_LOCK = Lock()
 
 
 def json_default(value):
@@ -59,8 +61,25 @@ def append_system_log(event: str, message: str, detail=None) -> Path:
     }
     if detail is not None:
         payload["detail"] = sanitize_for_log(detail)
-    with open(SYSTEM_LOG_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False, default=json_default) + "\n")
+    lock_path = SYSTEM_LOG_FILE.with_suffix(".lock")
+    line = json.dumps(payload, ensure_ascii=False, default=json_default) + "\n"
+    with _SYSTEM_LOG_LOCK, lock_path.open("a+b") as lock_file:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        with open(SYSTEM_LOG_FILE, "a", encoding="utf-8") as file:
+            file.write(line)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
     return SYSTEM_LOG_FILE
 
 

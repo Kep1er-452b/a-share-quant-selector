@@ -1,3 +1,4 @@
+(() => {
 'use strict';
 
 const PAGE_TITLES = {
@@ -38,7 +39,8 @@ const STOCK_PERIOD_LABELS = {
     monthly: '月K',
 };
 const STOCK_CHART_LIMIT_OPTIONS = ['260', '520', '1000', 'all'];
-const STOCKS_PAGE_SIZE = 6000;
+const STOCKS_PAGE_SIZE = 500;
+const STOCKS_RENDER_LIMIT = 300;
 const KLINE_PREFERENCES_KEY = 'quantKlinePreferences';
 const DEFAULT_KLINE_PREFERENCES = {
     version: 1,
@@ -125,6 +127,9 @@ const state = {
     stocksLoadingPromise: null,
     stockSearchTimer: null,
     stockSearchRequestId: 0,
+    stockDetailRequestId: 0,
+    indexKlineRequestId: 0,
+    heatmapRequestId: 0,
     strategies: [],
     strategyGroups: [],
     openStrategyGroups: new Set(),
@@ -143,6 +148,7 @@ const state = {
     selectionPollTimer: null,
     selectionPollInFlight: false,
     currentSelectionJobId: null,
+    currentSelectionMarket: 'a_share',
     updatePollTimer: null,
     updatePollInFlight: false,
     updateDiagnosticPollTimer: null,
@@ -323,6 +329,20 @@ function formatWanYuanMarketValue(value) {
     })}亿`;
 }
 
+function formatYuanMarketValue(value) {
+    if (value === null || value === undefined || value === '') {
+        return '--';
+    }
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return '--';
+    }
+    return `${(numeric / 1e8).toLocaleString('zh-CN', {
+        maximumFractionDigits: 2,
+        minimumFractionDigits: 2,
+    })}亿`;
+}
+
 function formatDateTime(value) {
     if (!value) {
         return '--';
@@ -349,8 +369,8 @@ function formatPercent(value, digits = 2) {
     if (!Number.isFinite(numeric)) {
         return '--';
     }
-    const fixed = numeric.toFixed(digits);
-    return `${numeric > 0 ? '+' : ''}${fixed}%`;
+    const sign = numeric > 0 ? '+' : (numeric < 0 ? '-' : '');
+    return `${sign}${Math.abs(numeric).toFixed(digits)}%`;
 }
 
 function buildDefaultTickerText(payload = {}) {
@@ -652,7 +672,7 @@ function startLocalProgressTimer(serverElapsed) {
     stopLocalProgressTimer();
     state.jobStartTime = Date.now();
     state.serverElapsedBase = Number(serverElapsed) || 0;
-    state.localProgressTimer = window.setInterval(updateLocalElapsedTime, 200);
+    state.localProgressTimer = window.setInterval(updateLocalElapsedTime, 1000);
 }
 
 function stopLocalProgressTimer() {
@@ -665,7 +685,7 @@ function stopLocalProgressTimer() {
 }
 
 function updateLocalElapsedTime() {
-    if (!state.jobStartTime) return;
+    if (!state.jobStartTime || state.currentPage !== 'selection') return;
 
     const localElapsed = Math.floor((Date.now() - state.jobStartTime) / 1000);
     const totalElapsed = state.serverElapsedBase + localElapsed;
@@ -770,15 +790,15 @@ function syncWorkspaceLocation(page) {
     if (DOMAIN_WORKSPACE_PAGES.has(page)) {
         const route = `#/${page}`;
         if (window.location.hash !== route) {
-            window.history.pushState({ page }, '', route);
+            window.history.replaceState({ page }, '', route);
         }
         return;
     }
     const marketRoute = window.quantEquityRouter?.marketRouteFor?.(currentEquityMarket());
     if (marketRoute && window.location.hash !== marketRoute) {
-        window.history.pushState({ page, market: currentEquityMarket() }, '', marketRoute);
+        window.history.replaceState({ page, market: currentEquityMarket() }, '', marketRoute);
     } else if (currentWorkspace) {
-        window.history.pushState({ page }, '', `${window.location.pathname}${window.location.search}`);
+        window.history.replaceState({ page }, '', `${window.location.pathname}${window.location.search}`);
     }
 }
 
@@ -1679,7 +1699,7 @@ function renderMarketIndustryModal() {
             <td class="mono price-down">${formatNumber(item.down_count || 0)}</td>
             <td class="mono">${formatNumber(item.flat_count || 0)}</td>
             <td class="mono">${formatNumber(item.stock_count || 0)}</td>
-            <td class="mono">${formatNumber(((Number(item.market_cap) || 0) / 1e8).toFixed(2))}</td>
+            <td class="mono">${escapeHtml(formatYuanMarketValue(item.market_cap))}</td>
         </tr>
     `).join('');
 }
@@ -1874,7 +1894,7 @@ function renderDashboardIndexKline(payload) {
                 }
                 const item = candles[point.dataIndex];
                 return [
-                    `${payload.name || ''} ${item.date}`,
+                    `${escapeHtml(payload.name || '')} ${escapeHtml(item.date)}`,
                     `开盘 ${item.open}  最高 ${item.high}`,
                     `最低 ${item.low}  收盘 ${item.close}`,
                     formatTooltipChangePct(candles, point.dataIndex),
@@ -1950,6 +1970,7 @@ async function loadDashboardIndexKline(symbol = 'sh000001') {
     if (state.systemHalted) {
         return;
     }
+    const requestId = ++state.indexKlineRequestId;
     state.currentIndexSymbol = symbol;
     setDashboardIndexButtons(symbol);
     syncIndexMonthsLabel();
@@ -1961,11 +1982,17 @@ async function loadDashboardIndexKline(symbol = 'sh000001') {
 
     try {
         const result = await apiFetch(`/api/index-kline?symbol=${encodeURIComponent(symbol)}&months=${encodeURIComponent(state.indexMonths)}`);
+        if (requestId !== state.indexKlineRequestId || state.currentIndexSymbol !== symbol) {
+            return;
+        }
         if (!result.success) {
             throw new Error(result.error || '指数K线加载失败');
         }
         renderDashboardIndexKline(result.data || {});
     } catch (error) {
+        if (requestId !== state.indexKlineRequestId || state.currentIndexSymbol !== symbol) {
+            return;
+        }
         if (error.name === 'AbortError' && state.systemHalted) {
             return;
         }
@@ -2145,7 +2172,7 @@ function renderHeatmapChart(groups) {
                     `行业: ${escapeHtml(data.industry || '未分类')}`,
                     `最新价: ${escapeHtml(data.latest_price)}`,
                     `涨跌幅: ${escapeHtml(changeText)}`,
-                    `总市值: ${escapeHtml(formatNumber(((Number(data.market_cap) || 0) / 1e8).toFixed(2)))} 亿`,
+                    `总市值: ${escapeHtml(formatYuanMarketValue(data.market_cap))}`,
                 ].join('<br>');
             },
         },
@@ -2240,11 +2267,20 @@ async function loadHeatmap(forceReload = false) {
     if (state.systemHalted) {
         return;
     }
+    const requestId = ++state.heatmapRequestId;
+    const requestMarket = currentEquityMarket();
+    const requestScope = state.heatmapScope;
+    const requestMetric = state.heatmapMetric;
+    const isCurrentRequest = () => requestId === state.heatmapRequestId
+        && requestMarket === currentEquityMarket()
+        && requestScope === state.heatmapScope
+        && requestMetric === state.heatmapMetric;
     setHeatmapLoading(true, forceReload ? '正在刷新市场云图...' : '正在生成市场云图...');
 
     try {
         if (currentEquityMarket() === 'hong_kong') {
             const data = await apiFetch('/api/equities/hong_kong/heatmap');
+            if (!isCurrentRequest()) return;
             const groups = (data.groups || []).map(group => {
                 const children = (group.items || []).map(item => ({
                     name: item.name,
@@ -2286,6 +2322,7 @@ async function loadHeatmap(forceReload = false) {
             return;
         }
         const health = await loadHeatmapHealth(forceReload);
+        if (!isCurrentRequest()) return;
         const key = heatmapCacheKey(health);
         if (!forceReload && state.heatmapPayloadCache.has(key)) {
             renderHeatmapPayload(state.heatmapPayloadCache.get(key));
@@ -2299,8 +2336,10 @@ async function loadHeatmap(forceReload = false) {
 
         if (forceReload) {
             await apiFetch('/api/heatmap/rebuild', { method: 'POST' });
+            if (!isCurrentRequest()) return;
         }
         const result = await apiFetch(`/api/heatmap?scope=${encodeURIComponent(state.heatmapScope)}&metric=${encodeURIComponent(state.heatmapMetric)}`);
+        if (!isCurrentRequest()) return;
         if (!result.success) {
             const detail = result.data?.errors && Object.keys(result.data.errors).length
                 ? `: ${Object.entries(result.data.errors).map(([key, value]) => `${key}=${value}`).join('; ')}`
@@ -2313,9 +2352,11 @@ async function loadHeatmap(forceReload = false) {
             state.heatmapPayloadCache.clear();
         }
         const cacheHealth = forceReload ? await loadHeatmapHealth(true) : health;
+        if (!isCurrentRequest()) return;
         state.heatmapPayloadCache.set(heatmapCacheKey(cacheHealth), data);
         renderHeatmapPayload(data);
     } catch (error) {
+        if (!isCurrentRequest()) return;
         const container = document.getElementById('heatmap-chart');
         if (container) {
             if (state.heatmapChart) {
@@ -2325,7 +2366,7 @@ async function loadHeatmap(forceReload = false) {
             container.innerHTML = `<div class="state-empty">市场云图加载失败: ${escapeHtml(error.message)}</div>`;
         }
     } finally {
-        setHeatmapLoading(false);
+        if (isCurrentRequest()) setHeatmapLoading(false);
     }
 }
 
@@ -2416,7 +2457,14 @@ function renderStocks(stocks) {
         return;
     }
 
-    tbody.innerHTML = stocks.map(stock => {
+    const visibleStocks = stocks.slice(0, STOCKS_RENDER_LIMIT);
+    const totalLabel = document.getElementById('stocks-total-label');
+    if (totalLabel) {
+        totalLabel.textContent = stocks.length > visibleStocks.length
+            ? `匹配 ${formatNumber(stocks.length)} 只，当前显示前 ${formatNumber(visibleStocks.length)} 只；继续输入可缩小范围`
+            : `当前显示 ${formatNumber(stocks.length)} 只股票`;
+    }
+    tbody.innerHTML = visibleStocks.map(stock => {
         const board = stock.board || classifyBoard(stock.code);
         return `
             <tr>
@@ -2621,6 +2669,7 @@ function rerenderCurrentStockChart() {
             state.currentStockChartData,
             state.currentStockChartPeriod || state.currentStockPeriod || 'daily',
             state.currentStockChartDetail || {},
+            true,
         );
         return;
     }
@@ -2716,6 +2765,8 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
         return;
     }
 
+    const requestId = ++state.stockDetailRequestId;
+    const requestMarket = currentEquityMarket();
     const normalizedPeriod = STOCK_PERIOD_LABELS[period] ? period : 'daily';
     state.currentStockPeriod = normalizedPeriod;
     state.currentStockLimit = normalizeStockChartLimit(state.currentStockLimit);
@@ -2740,6 +2791,7 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
             setStockExportStatus('港股导出暂不支持', 'warning');
             const hongKongLimit = state.currentStockLimit === 'all' ? 1000 : state.currentStockLimit;
             const payload = await apiFetch(`/api/equities/hong_kong/instrument/${encodeURIComponent(code)}?limit=${encodeURIComponent(hongKongLimit)}&adjustment=raw`);
+            if (requestId !== state.stockDetailRequestId || requestMarket !== currentEquityMarket()) return;
             const instrument = payload.instrument || {};
             const kline = payload.kline || {};
             const resolvedSymbol = kline.symbol || instrument.symbol || code;
@@ -2756,6 +2808,7 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
             return;
         }
         const result = await apiFetch(`/api/stock/${code}?period=${encodeURIComponent(normalizedPeriod)}&limit=${encodeURIComponent(state.currentStockLimit)}&indicator_lookback=${encodeURIComponent(indicatorLookback())}`);
+        if (requestId !== state.stockDetailRequestId || requestMarket !== currentEquityMarket()) return;
         if (!result.success) {
             throw new Error(result.error || '个股详情加载失败');
         }
@@ -2782,6 +2835,7 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
         }
         renderStockChart(chartData, resolvedPeriod, result);
     } catch (error) {
+        if (requestId !== state.stockDetailRequestId || requestMarket !== currentEquityMarket()) return;
         if (error.name === 'AbortError' && state.systemHalted) {
             return;
         }
@@ -2789,7 +2843,7 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
     }
 }
 
-function renderStockChart(data, period = 'daily', detail = {}) {
+function renderStockChart(data, period = 'daily', detail = {}, preserveZoom = false) {
     if (!data.length) {
         document.getElementById('stock-info').innerHTML = '<div class="state-empty">暂无图表数据</div>';
         return;
@@ -2877,21 +2931,23 @@ function renderStockChart(data, period = 'daily', detail = {}) {
         return;
     }
 
-    if (state.chartInstance) {
-        if (typeof state.chartInstance.dispose === 'function') {
-            state.chartInstance.dispose();
-        } else if (typeof state.chartInstance.destroy === 'function') {
-            state.chartInstance.destroy();
-        }
-        state.chartInstance = null;
-    }
-
     if (!window.echarts) {
         document.getElementById('stock-info').innerHTML = '<div class="state-empty">ECharts 加载失败，无法渲染个股走势。</div>';
         return;
     }
 
-    state.chartInstance = window.echarts.init(chartEl);
+    let zoomRange = null;
+    if (preserveZoom && state.chartInstance?.getOption) {
+        const existingZoom = state.chartInstance.getOption()?.dataZoom?.[0];
+        if (existingZoom) {
+            zoomRange = { start: existingZoom.start, end: existingZoom.end };
+        }
+    }
+    if (!state.chartInstance || state.chartInstance.isDisposed?.()) {
+        state.chartInstance = window.echarts.init(chartEl);
+    } else {
+        state.chartInstance.clear();
+    }
     state.chartInstance.setOption({
         animation: false,
         backgroundColor: '#0a0a0a',
@@ -3045,7 +3101,12 @@ function renderStockChart(data, period = 'daily', detail = {}) {
             },
         ],
         dataZoom: [
-            { type: 'inside', xAxisIndex: [0, 1, 2, 3], start: 0, end: 100 },
+            {
+                type: 'inside',
+                xAxisIndex: [0, 1, 2, 3],
+                start: Number.isFinite(zoomRange?.start) ? zoomRange.start : 0,
+                end: Number.isFinite(zoomRange?.end) ? zoomRange.end : 100,
+            },
             {
                 type: 'slider',
                 xAxisIndex: [0, 1, 2, 3],
@@ -3056,6 +3117,8 @@ function renderStockChart(data, period = 'daily', detail = {}) {
                 fillerColor: 'rgba(255, 102, 0, 0.12)',
                 handleStyle: { color: '#ff6600' },
                 textStyle: { color: '#777777', fontSize: 9 },
+                start: Number.isFinite(zoomRange?.start) ? zoomRange.start : 0,
+                end: Number.isFinite(zoomRange?.end) ? zoomRange.end : 100,
             },
         ],
         series: [
@@ -3319,6 +3382,7 @@ function closeModal(options = {}) {
         return;
     }
     document.getElementById('stock-modal').classList.remove('active');
+    state.stockDetailRequestId += 1;
     setStockExportStatus('');
     closeExportConfirm();
     state.currentStockChartData = [];
@@ -3559,11 +3623,15 @@ async function removeSelectedWatchlistItems() {
         const isHongKong = currentEquityMarket() === 'hong_kong';
         let removedCodes;
         if (isHongKong) {
-            await Promise.all(items.map(stock => apiFetch('/api/equities/hong_kong/watchlist', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'remove', symbol: stock.code }),
-            })));
+            const batchSize = 8;
+            for (let offset = 0; offset < items.length; offset += batchSize) {
+                const batch = items.slice(offset, offset + batchSize);
+                await Promise.all(batch.map(stock => apiFetch('/api/equities/hong_kong/watchlist', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'remove', symbol: stock.code }),
+                })));
+            }
             removedCodes = items.map(stock => stock.code);
         } else {
             const result = await apiFetch('/api/watchlist/batch', {
@@ -3662,6 +3730,21 @@ function renderWyckoffProgress(job) {
     }
 }
 
+function clearWyckoffResult() {
+    state.currentWyckoffResult = null;
+    const image = document.getElementById('wyckoff-chart-img');
+    if (image) {
+        image.removeAttribute('src');
+        image.style.display = 'none';
+    }
+    const subtitle = document.getElementById('wyckoff-chart-subtitle');
+    if (subtitle) subtitle.textContent = '本次分析未生成图表';
+    const fullscreen = document.getElementById('wyckoff-fullscreen-btn');
+    const reveal = document.getElementById('wyckoff-reveal-btn');
+    if (fullscreen) fullscreen.disabled = true;
+    if (reveal) reveal.disabled = true;
+}
+
 async function pollWyckoffJob() {
     if (!state.wyckoffJobId || state.wyckoffPollInFlight) {
         return;
@@ -3696,6 +3779,7 @@ async function pollWyckoffJob() {
         }
     } catch (error) {
         stopWyckoffProgress();
+        clearWyckoffResult();
         updateGlobalTicker(`WYCKOFF ERROR   ${error.message}`);
         setWyckoffStatus('ERROR', 'down');
         setStatus('error');
@@ -4132,6 +4216,7 @@ async function runWyckoffAnalysis() {
         }
     } catch (error) {
         stopWyckoffProgress();
+        clearWyckoffResult();
         updateGlobalTicker(`WYCKOFF ERROR   ${query}   ${error.message}`);
         setWyckoffStatus('ERROR', 'down');
         setStatus('error');
@@ -4162,7 +4247,7 @@ function openIndustryModal(group) {
             <td>${boardBadge(item.board || item.code)}</td>
             <td class="mono">${escapeHtml(item.latest_price ?? '--')}</td>
             <td class="mono metric-value ${signedClass(item.change_pct)}">${escapeHtml(formatPercent(item.change_pct))}</td>
-            <td class="mono">${escapeHtml(formatNumber(((Number(item.market_cap) || 0) / 1e8).toFixed(2)))}</td>
+            <td class="mono">${escapeHtml(formatYuanMarketValue(item.market_cap))}</td>
         </tr>
     `).join('');
     document.getElementById('industry-modal').classList.add('active');
@@ -4291,15 +4376,6 @@ async function loadUpdateOptions() {
 
 function renderUpdateProviderOptions() {
     const statuses = new Map((state.updateProviderStatuses || []).map(item => [item.provider, item]));
-    const legacy = state.updateLegacyProvider || {};
-    const legacyNote = document.getElementById('update-legacy-note');
-    if (legacyNote) {
-        const count = Number(legacy.stock_count || 0);
-        const latest = legacy.latest_trade_date || '--';
-        const status = count ? '旧数据仓可用' : '旧数据仓为空';
-        const activeText = state.updateActiveProvider === 'legacy' ? '当前系统正在使用旧数据仓。' : '新分仓首次完整更新成功后会自动切换。';
-        legacyNote.textContent = `${status}: ${formatNumber(count)} 只 · 最新交易日 ${latest}。${activeText}`;
-    }
     document.querySelectorAll('.update-provider-btn[data-provider]').forEach(button => {
         const provider = button.dataset.provider;
         const meta = button.querySelector('[data-provider-meta]');
@@ -4904,12 +4980,12 @@ async function loadSelectionOptions(forceReload = false) {
     try {
         if (currentEquityMarket() === 'hong_kong') {
             const result = await apiFetch('/api/equities/hong_kong/selection/options');
-            state.boardOptions = [];
-            state.boardCounts = {};
+            state.boardOptions = result.boards || [];
+            state.boardCounts = Object.fromEntries(state.boardOptions.map(item => [item.key, item.count]));
             state.strategyGroups = [];
             state.strategies = result.strategies || [];
             state.selectionOptionsLoaded = true;
-            document.getElementById('board-filter').innerHTML = '<div class="state-empty">港股不使用 A 股主板/创业板/科创板过滤规则。</div>';
+            renderBoardOptions(state.boardOptions);
             renderStrategyOptions(state.strategies, []);
             if (!state.strategies.length) document.getElementById('strategy-filter').innerHTML = `<div class="state-empty">${escapeHtml(result.warning || '暂无已验证的港股策略')}</div>`;
             updateSelectionSnapshot();
@@ -5333,6 +5409,7 @@ async function runSelection() {
     try {
         stopSelectionPolling();
         state.currentSelectionJobId = null;
+        state.currentSelectionMarket = currentEquityMarket();
 
         const selectionEndpoint = currentEquityMarket() === 'hong_kong'
             ? '/api/equities/hong_kong/selection/start'
@@ -5343,8 +5420,8 @@ async function runSelection() {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                boards: boards.join(','),
-                strategies: strategies.join(','),
+                boards,
+                strategies,
                 formula,
             }),
         });
@@ -5378,7 +5455,10 @@ async function pollSelectionJobStatus() {
 
     state.selectionPollInFlight = true;
     try {
-        const result = await apiFetch(`/api/select/status/${state.currentSelectionJobId}`);
+        const statusEndpoint = state.currentSelectionMarket === 'hong_kong'
+            ? `/api/equities/hong_kong/selection/status/${state.currentSelectionJobId}`
+            : `/api/select/status/${state.currentSelectionJobId}`;
+        const result = await apiFetch(statusEndpoint);
         if (!result.success) {
             throw new Error(result.error || '状态同步失败');
         }
@@ -5648,6 +5728,10 @@ function parseInputValue(rawValue) {
 
 function assignNested(target, path, value) {
     const keys = path.split('.');
+    const blockedKeys = new Set(['__proto__', 'prototype', 'constructor']);
+    if (keys.some(key => blockedKeys.has(key))) {
+        throw new Error('配置字段路径不合法');
+    }
     let current = target;
 
     keys.forEach((key, index) => {
@@ -5730,7 +5814,7 @@ function applyHaltState(message = '全部 Web 功能已停止。重启服务器�
     document.body.classList.add('is-halted');
     stopSelectionPolling();
     abortActiveRequests();
-    closeModal();
+    closeModal({ fromHistory: true });
     closeIndustryModal();
     stopUpdatePolling();
     exitHeatmapFullscreenIfNeeded().catch(() => {});
@@ -5949,7 +6033,6 @@ function bindEvents() {
     });
     window.addEventListener('quant:market-change', () => {
         resetEquityMarketCaches();
-        loadStats();
         switchPage(state.currentPage);
     });
     const handleNavigationClick = event => {
@@ -6373,6 +6456,7 @@ function saveSelectionState() {
             jobId: state.currentSelectionJobId,
             savedAt: Date.now(),
             currentPage: state.currentPage,
+            market: state.currentSelectionMarket,
         }));
     } catch (e) {
         console.warn('Failed to save selection state:', e);
@@ -6514,7 +6598,11 @@ async function restoreSelectionStateIfNeeded() {
     if (!saved) return;
 
     try {
-        const result = await apiFetch(`/api/select/status/${saved.jobId}`, {}, { allowWhenHalted: true });
+        const savedMarket = saved.market === 'hong_kong' ? 'hong_kong' : 'a_share';
+        const statusEndpoint = savedMarket === 'hong_kong'
+            ? `/api/equities/hong_kong/selection/status/${saved.jobId}`
+            : `/api/select/status/${saved.jobId}`;
+        const result = await apiFetch(statusEndpoint, {}, { allowWhenHalted: true });
         if (!result.success || !result.data) {
             clearSavedSelectionState();
             return;
@@ -6540,6 +6628,7 @@ async function restoreSelectionStateIfNeeded() {
         }
 
         state.currentSelectionJobId = saved.jobId;
+        state.currentSelectionMarket = savedMarket;
         setRunButtonsLoading(true);
         setStatus('running');
 
@@ -6562,3 +6651,4 @@ async function restoreSelectionStateIfNeeded() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
+})();

@@ -82,7 +82,13 @@ def create_equities_blueprint(*, services: Mapping[str, Any], capabilities=None)
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
             if status_code is None:
-                raise
+                return error(
+                    "INTERNAL_ERROR",
+                    "equity service request failed",
+                    500,
+                    market=market,
+                    capability=capability_name or method,
+                )
             payload = {
                 "code": getattr(exc, "error_code", "TASK_CONFLICT"),
                 "error": str(exc),

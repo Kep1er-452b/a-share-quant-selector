@@ -39,6 +39,53 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
 LOCAL_PROXY_BYPASS = "127.0.0.1,localhost,::1"
 
 
+class SingleInstanceLock:
+    """Hold an OS file lock for the lifetime of one desktop process."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+b")
+        if self.path.stat().st_size == 0:
+            self.handle.write(b"0")
+            self.handle.flush()
+        try:
+            if os.name == "nt":  # pragma: no cover - Windows packaging path
+                import msvcrt
+
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            self.handle.close()
+            self.handle = None
+            return False
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            if os.name == "nt":  # pragma: no cover - Windows packaging path
+                import msvcrt
+
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+
 def launcher_log_paths() -> tuple[Path, Path, Path]:
     log_dir = runtime_paths().logs_root
     return log_dir, log_dir / "desktop_app_launcher.log", log_dir / "incidents"
@@ -304,14 +351,53 @@ def run_smoke_test() -> int:
         return 1
 
 
+def _shutdown_desktop_backend() -> None:
+    try:
+        from web_server import _prepare_graceful_shutdown
+
+        interrupted = _prepare_graceful_shutdown()
+        if interrupted:
+            logging.info("Waiting for %s interrupted job(s) to stop", interrupted)
+        deadline = time.monotonic() + 30.0
+        prefixes = (
+            "aqs-selection-", "aqs-update-", "aqs-diagnostic-",
+            "aqs-wyckoff-", "aqs-domain-sync",
+        )
+        for worker in list(threading.enumerate()):
+            if not worker.name.startswith(prefixes):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        remaining_workers = [
+            worker.name
+            for worker in threading.enumerate()
+            if worker.name.startswith(prefixes) and worker.is_alive()
+        ]
+        if remaining_workers:
+            logging.warning(
+                "Shutdown deadline reached with workers still alive: %s",
+                remaining_workers,
+            )
+    except Exception:
+        logging.exception("Graceful desktop shutdown preparation failed")
+
+
 def run_gui() -> int:
     configure_local_proxy_bypass()
     setup_logging()
     logging.info("Starting %s desktop launcher at %s", APP_NAME, datetime.now().isoformat())
+    instance_lock = SingleInstanceLock(runtime_paths().data_root / "desktop-instance.lock")
+    if not instance_lock.acquire():
+        logging.info("Desktop instance is already running; refusing a duplicate backend")
+        print(f"{APP_NAME} 已经在运行。")
+        return 0
 
     try:
         import webview
     except Exception as exc:
+        instance_lock.release()
         setup_logging()
         print(f"pywebview 无法导入: {exc}")
         return 1
@@ -355,17 +441,12 @@ def run_gui() -> int:
     icon_path = runtime_icon_path()
     if icon_path is not None:
         start_options["icon"] = str(icon_path)
-    webview.start(**start_options)
-    if backend_started.is_set():
-        try:
-            from web_server import _prepare_graceful_shutdown
-
-            interrupted = _prepare_graceful_shutdown()
-            if interrupted:
-                logging.info("Waiting for %s interrupted job(s) to stop", interrupted)
-                time.sleep(1.5)
-        except Exception:
-            logging.exception("Graceful desktop shutdown preparation failed")
+    try:
+        webview.start(**start_options)
+    finally:
+        if backend_started.is_set():
+            _shutdown_desktop_backend()
+        instance_lock.release()
     return 0
 
 

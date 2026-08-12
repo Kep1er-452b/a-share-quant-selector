@@ -46,7 +46,7 @@ class HealthService:
                 storage_bytes += int(raw.get("db_size_bytes") or 0)
                 stores[name] = raw
             except Exception as exc:
-                stores[name] = {"status": "error", "error": str(exc)}
+                stores[name] = self._safe_error(exc)
 
         datasets = {}
         for dataset, metadata in self.datasets.items():
@@ -58,7 +58,7 @@ class HealthService:
             try:
                 state = self.stores[store_name].get_sync_state(dataset, scope)
             except Exception as exc:
-                error = str(exc)
+                error = self._safe_error(exc)["error"]
             datasets[dataset] = self._dataset_health(
                 frequency=frequency,
                 state=state,
@@ -72,7 +72,7 @@ class HealthService:
                 payload.pop("db_path", None)
                 checks[name] = payload
             except Exception as exc:
-                checks[name] = {"status": "error", "error": str(exc)}
+                checks[name] = self._safe_error(exc)
         warning_states = {"warning", "error", "critical", "open"}
         has_warning = any(item.get("status") == "error" for item in stores.values())
         has_warning = has_warning or any(
@@ -86,6 +86,14 @@ class HealthService:
             "storage_bytes": storage_bytes,
             "deep": bool(deep),
             **checks,
+        }
+
+    @staticmethod
+    def _safe_error(exc: Exception) -> dict:
+        return {
+            "status": "error",
+            "error": "本地健康检查失败；请查看仅限本机的系统日志。",
+            "error_code": exc.__class__.__name__,
         }
 
     def _dataset_health(self, *, frequency, state, error):

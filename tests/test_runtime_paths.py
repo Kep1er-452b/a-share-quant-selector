@@ -40,6 +40,8 @@ def test_external_wyckoff_chart_is_served_from_runtime_output_root(tmp_path, mon
     chart_url = web_server._wyckoff_chart_url(chart_path)
     response = web_server.app.test_client().get(chart_url)
 
-    assert chart_url == "/outputs/wyckoff/files/%E6%B5%8B%E8%AF%95%E8%82%A1%E7%A5%A8-000001/run/charts/chart.png"
+    assert chart_url.startswith(
+        "/outputs/wyckoff/files/%E6%B5%8B%E8%AF%95%E8%82%A1%E7%A5%A8-000001/run/charts/chart.png?session="
+    )
     assert response.status_code == 200
     assert response.data == b"png"
