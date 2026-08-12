@@ -24,6 +24,7 @@ wheels/
 venv/
 ENV/
 env/
+.venv/
 
 # IDE
 .vscode/
@@ -45,6 +46,11 @@ logs/ops.sqlite*
 *.sqlite-shm
 *.sqlite-journal
 outputs/
+nohup.out
+
+# Local agent/editor state and backup files
+.superpowers/
+*.bak
 
 # External projects kept outside this repository
 android-app/
@@ -53,6 +59,7 @@ android-app/
 config/config.yaml
 config/config_local.yaml
 config/github.yaml
+config/*.local.yaml
 
 # OS
 .DS_Store
