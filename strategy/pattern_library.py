@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.pattern_config import B1_PERFECT_CASES, SIMILARITY_WEIGHTS, MIN_SIMILARITY_SCORE
 from strategy.pattern_feature_extractor import PatternFeatureExtractor
 from strategy.pattern_matcher import PatternMatcher
+from utils.atomic_io import atomic_write_json
 
 
 class B1PatternLibrary:
@@ -42,7 +43,7 @@ class B1PatternLibrary:
         
         for case in B1_PERFECT_CASES:
             try:
-                df = self.csv_manager.read_stock(case["code"])
+                df = self.csv_manager.read_stock_for_analysis(case["code"])
                 
                 if df.empty:
                     print(f"  ⚠️ 跳过 {case['name']}({case['code']}): 无数据")
@@ -93,7 +94,14 @@ class B1PatternLibrary:
         # 取breakout_date之前lookback_days天
         return filtered.head(lookback_days)
     
-    def find_best_match(self, stock_code: str, stock_df: pd.DataFrame, lookback_days: int = 25, as_of_date=None) -> dict:
+    def find_best_match(
+        self,
+        stock_code: str,
+        stock_df: pd.DataFrame,
+        lookback_days: int = 25,
+        as_of_date=None,
+        min_similarity: float = MIN_SIMILARITY_SCORE,
+    ) -> dict:
         """
         为单只股票找到最匹配的B1完美图形案例
         
@@ -129,7 +137,7 @@ class B1PatternLibrary:
                     case_data["features"]
                 )
                 
-                matches.append({
+                match = {
                     "case_id": case_id,
                     "case_name": case_data["meta"]["name"],
                     "case_date": case_data["meta"]["breakout_date"],
@@ -137,7 +145,9 @@ class B1PatternLibrary:
                     "similarity_score": similarity["total_score"],
                     "breakdown": similarity["breakdown"],
                     "tags": case_data["meta"].get("tags", []),
-                })
+                }
+                if match["similarity_score"] >= float(min_similarity):
+                    matches.append(match)
             except Exception as e:
                 print(f"  ⚠️ 匹配 {case_id} 失败: {e}")
                 continue
@@ -243,8 +253,7 @@ class B1PatternLibrary:
                     "features": self._serialize_features(case_data["features"]),
                 }
             
-            with open(self.CACHE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            atomic_write_json(self.CACHE_FILE, cache_data, ensure_ascii=False, indent=2)
                 
         except Exception as e:
             print(f"⚠️ 缓存保存失败: {e}")

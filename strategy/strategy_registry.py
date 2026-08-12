@@ -30,6 +30,8 @@ class StrategyRegistry:
         :param name: 策略名称（默认使用类名）
         """
         strategy_name = name or strategy_class.__name__
+        if strategy_name in self.strategies:
+            raise ValueError(f"重复策略名称: {strategy_name}")
         
         # 获取该策略的参数
         params = self.params.get(strategy_name, {})
@@ -77,7 +79,8 @@ class StrategyRegistry:
                     attr = getattr(module, attr_name)
                     if (isinstance(attr, type) and 
                         issubclass(attr, BaseStrategy) and 
-                        attr is not BaseStrategy):
+                        attr is not BaseStrategy and
+                        attr.__module__ == module.__name__):
                         if getattr(attr, "runtime_only", False):
                             continue
                         

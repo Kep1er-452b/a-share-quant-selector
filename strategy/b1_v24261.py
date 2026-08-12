@@ -10,7 +10,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
 from utils.strategy_labels import is_invalid_stock_name
-from utils.technical import COUNT, HHV, KDJ, LLV, MA, REF, SMA, SUM
+from utils.technical import (
+    COUNT, HHV, KDJ, LLV, MA, REF, SUM, ensure_b1_trend_features,
+    finite_number, numeric_column,
+)
 
 
 B1_V24261_DEFAULT_PARAMS = {
@@ -22,6 +25,7 @@ B1_V24261_DEFAULT_PARAMS = {
     "PLRY_VOL_RATIO": 1.95,
     "HALF_DOWN_VOL_RATIO": 0.5,
     "TOP_RANGE_RATIO": 0.95,
+    "GOOD28_WINDOW": 28,
     "FD15_VOL_RATIO": 1.2,
     "B1_TREND_TOLERANCE": 0.995,
 }
@@ -35,21 +39,7 @@ def b1_v24261_default_params(extra=None) -> dict:
 
 
 def ensure_b1_v24261_trend(result: pd.DataFrame) -> pd.DataFrame:
-    if "HMSHORTWL" not in result.columns:
-        result["HMSHORTWL"] = SMA(SMA(result["close"], 40, 4), 100, 50)
-    if "HMLONGYL" not in result.columns:
-        result["HMLONGYL"] = 0.5 * (
-            0.2 * MA(result["close"], 12)
-            + 0.3 * MA(result["close"], 24)
-            + 0.3 * MA(result["close"], 52)
-            + 0.2 * MA(result["close"], 108)
-        ) + 0.5 * (
-            0.4 * MA(result["close"], 20)
-            + 0.25 * MA(result["close"], 40)
-            + 0.25 * MA(result["close"], 80)
-            + 0.1 * MA(result["close"], 160)
-        )
-    return result
+    return ensure_b1_trend_features(result)
 
 
 def apply_b1_v24261_signal(result: pd.DataFrame, params, j_ok_series=None) -> pd.DataFrame:
@@ -101,8 +91,11 @@ def build_b1_v24261_signal(
     return {
         "date": latest["date"],
         "close": round(float(latest["close"]), 2),
-        "J": round(float(latest["J"]), 2),
-        "market_cap": round(float(latest["MV"]), 2),
+        "J": round(finite_number(latest.get("J"), 0.0), 2),
+        "market_cap": (
+            round(finite_number(latest.get("MV")), 2)
+            if finite_number(latest.get("MV")) is not None else None
+        ),
         "reasons": reasons or [fallback_reason],
         "category": category,
         "yangyin_ratio_28": _volume_ratio(latest, "VOL_YANG1", "VOL_YIN1"),
@@ -127,8 +120,8 @@ class B1V24261Strategy(BaseStrategy):
     def __init__(self, params=None):
         super().__init__("B1 (V2.42.61)", b1_v24261_default_params(params))
 
-    def calculate_indicators(self, df) -> pd.DataFrame:
-        result = df.copy()
+    def calculate_indicators(self, df, *, apply_signal=True) -> pd.DataFrame:
+        result = df.copy(deep=False)
 
         ref_close_1 = result["ref_close_1"] if "ref_close_1" in result.columns else REF(result["close"], 1)
         ref_vol_1 = result["ref_vol_1"] if "ref_vol_1" in result.columns else REF(result["volume"], 1)
@@ -169,7 +162,7 @@ class B1V24261Strategy(BaseStrategy):
         )
 
         # 本项目 CSV 仅保存总市值，沿用现有 B1/B2 对通达信 CAPITAL 的统一映射。
-        market_cap = pd.to_numeric(result.get("market_cap", 0), errors="coerce").fillna(0)
+        market_cap = numeric_column(result, "market_cap").fillna(0)
         result["MV"] = market_cap / 1e8
         result["MVOK"] = result["MV"] >= self.params["MV_MIN_BILLION"]
 
@@ -182,7 +175,9 @@ class B1V24261Strategy(BaseStrategy):
             & (result["close"] <= result["open"])
             & (result["volume"] >= self.params["FD15_VOL_RATIO"] * ref_vol_1)
         )
-        result["CNT28"] = COUNT(result["TOP15O"] & result["FD15"], 14)
+        result["CNT28"] = COUNT(
+            result["TOP15O"] & result["FD15"], int(self.params["GOOD28_WINDOW"])
+        )
         result["GOOD28"] = result["CNT28"] <= 0
 
         result["AVG40"] = (
@@ -215,7 +210,9 @@ class B1V24261Strategy(BaseStrategy):
         result["MAX14_OK"] = COUNT(result["MAX14_BAD"], 14) == 0
 
         result = ensure_b1_v24261_trend(result)
-        return apply_b1_v24261_signal(result, self.params)
+        if apply_signal:
+            result = apply_b1_v24261_signal(result, self.params)
+        return result
 
     def select_stocks(self, df, stock_name="") -> list:
         if df.empty or (stock_name and is_invalid_stock_name(stock_name)):

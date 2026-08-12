@@ -7,6 +7,52 @@ import numpy as np
 from utils import quant_core
 
 
+def numeric_column(frame: pd.DataFrame, column: str, default=0.0) -> pd.Series:
+    """Return a numeric Series even when an optional input column is absent."""
+    if column not in frame.columns:
+        return pd.Series(default, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors='coerce')
+
+
+def finite_number(value, default=None):
+    """Convert a scalar for strict JSON output without leaking NaN/Infinity."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if np.isfinite(number) else default
+
+
+def min_j_feature_column(j_valley_max=55, long_offset=10) -> str:
+    """Return the stable shared-feature column for one Min-J parameter pair."""
+    return f"MIN_J_SHARED_{float(j_valley_max):g}_{float(long_offset):g}"
+
+
+def calculate_min_j(df, j_valley_max=55, long_offset=10) -> pd.Series:
+    """Calculate the dynamic Min-J line without copying the complete frame."""
+    shared_column = min_j_feature_column(j_valley_max, long_offset)
+    if shared_column in df.columns:
+        return pd.to_numeric(df[shared_column], errors="coerce").fillna(0)
+
+    j = pd.to_numeric(df["J"], errors="coerce")
+    k = pd.to_numeric(df["K"], errors="coerce")
+    d = pd.to_numeric(df["D"], errors="coerce")
+    valley = (
+        (j < REF(j, 1))
+        & (j < j.shift(1))
+        & (j < j_valley_max)
+        & (j < d)
+        & (j < k)
+        & (k < d)
+    ).fillna(False)
+    j_mask = j.where(valley, 0).fillna(0)
+    count_mask = valley.astype(int)
+    short = SUM(j_mask, 28) / SUM(count_mask, 28).clip(lower=1)
+    mid = SUM(j_mask, 57) / SUM(count_mask, 57).clip(lower=1)
+    long = SUM(j_mask, 114) / SUM(count_mask, 114).clip(lower=1) + long_offset
+    return ((short + mid + long) / 3.0).fillna(0).set_axis(df.index)
+
+
 def _numeric_array(series) -> np.ndarray:
     numeric = pd.to_numeric(series, errors='coerce')
     if hasattr(numeric, 'to_numpy'):
@@ -308,6 +354,7 @@ def KDJ(df, n=9, m1=3, m2=3):
     valid_mask = (
         (np.arange(length) >= n - 1)
         & np.isfinite(range_val)
+        & (range_val != 0)
         & np.isfinite(close_arr)
         & np.isfinite(low_min)
     )
@@ -446,15 +493,35 @@ _B1_B2_SHARED_STRATEGIES = {
 }
 
 
+def ensure_b1_trend_features(result: pd.DataFrame) -> pd.DataFrame:
+    """Attach the shared B1 HMSHORTWL/HMLONGYL formula exactly once."""
+    if 'HMSHORTWL' not in result.columns:
+        result['HMSHORTWL'] = SMA(SMA(result['close'], 40, 4), 100, 50)
+    if 'HMLONGYL' not in result.columns:
+        result['HMLONGYL'] = 0.5 * (
+            0.2 * MA(result['close'], 12) +
+            0.3 * MA(result['close'], 24) +
+            0.3 * MA(result['close'], 52) +
+            0.2 * MA(result['close'], 108)
+        ) + 0.5 * (
+            0.4 * MA(result['close'], 20) +
+            0.25 * MA(result['close'], 40) +
+            0.25 * MA(result['close'], 80) +
+            0.1 * MA(result['close'], 160)
+        )
+    return result
+
+
 def prepare_strategy_shared_features(df: pd.DataFrame, strategy_names=None) -> pd.DataFrame:
     """
     Precompute rolling columns shared by the high-volume selection strategies.
     """
-    names = set(strategy_names or [])
+    strategies = strategy_names or {}
+    names = set(strategies)
     if names and not (names & _B1_B2_SHARED_STRATEGIES):
         return df
 
-    result = df.copy()
+    result = df.copy(deep=False)
     if result.empty:
         return result
 
@@ -484,20 +551,32 @@ def prepare_strategy_shared_features(df: pd.DataFrame, strategy_names=None) -> p
         if hhv_column not in result.columns:
             result[hhv_column] = HHV(result['open'], window)
 
-    if 'HMSHORTWL' not in result.columns:
-        result['HMSHORTWL'] = SMA(SMA(result['close'], 40, 4), 100, 50)
-    if 'HMLONGYL' not in result.columns:
-        result['HMLONGYL'] = 0.5 * (
-            0.2 * MA(result['close'], 12) +
-            0.3 * MA(result['close'], 24) +
-            0.3 * MA(result['close'], 52) +
-            0.2 * MA(result['close'], 108)
-        ) + 0.5 * (
-            0.4 * MA(result['close'], 20) +
-            0.25 * MA(result['close'], 40) +
-            0.25 * MA(result['close'], 80) +
-            0.1 * MA(result['close'], 160)
-        )
+    result = ensure_b1_trend_features(result)
+
+    min_j_names = {
+        'B1MinJSimpleStrategy',
+        'B1MinJComplexStrategy',
+        'B1MinJ61ComplexStrategy',
+    }
+    if names & min_j_names:
+        parameter_pairs = {(55, 10)}
+        if hasattr(strategies, 'items'):
+            parameter_pairs = {
+                (
+                    strategy.params.get('J_VALLEY_MAX', 55),
+                    strategy.params.get('LONG_OFFSET', 10),
+                )
+                for name, strategy in strategies.items()
+                if name in min_j_names
+            } or parameter_pairs
+        for j_valley_max, long_offset in parameter_pairs:
+            column = min_j_feature_column(j_valley_max, long_offset)
+            if column not in result.columns:
+                result[column] = calculate_min_j(
+                    result,
+                    j_valley_max=j_valley_max,
+                    long_offset=long_offset,
+                )
 
     return result
 
@@ -618,13 +697,12 @@ def calculate_zhixing_main_overlay(df):
     high_max_9 = high.rolling(window=9, min_periods=1).max()
     rsv_range = (high_max_9 - low_min_9).replace(0, np.nan)
     rsv = ((close - low_min_9) / rsv_range * 100).fillna(50)
-    k = pd.Series(index=df_calc.index, dtype=float)
-    d = pd.Series(index=df_calc.index, dtype=float)
-    k.iloc[0] = 50.0
-    d.iloc[0] = 50.0
-    for index in range(1, len(df_calc)):
-        k.iloc[index] = (rsv.iloc[index] + k.iloc[index - 1] * 2) / 3
-        d.iloc[index] = (k.iloc[index] + d.iloc[index - 1] * 2) / 3
+    seeded_rsv = rsv.copy()
+    seeded_rsv.iloc[0] = 50.0
+    k = seeded_rsv.ewm(alpha=1 / 3, adjust=False).mean()
+    seeded_k = k.copy()
+    seeded_k.iloc[0] = 50.0
+    d = seeded_k.ewm(alpha=1 / 3, adjust=False).mean()
     j = 3 * k - 2 * d
 
     pc = ((close - ref_close_1) / ref_close_1.replace(0, np.nan)).fillna(0)

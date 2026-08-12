@@ -155,7 +155,8 @@ def is_invalid_stock_name(name, missing_name_is_invalid=True):
         return False
     if any(keyword in text for keyword in INVALID_STOCK_NAME_KEYWORDS):
         return True
-    return text.startswith("ST") or text.startswith("*ST")
+    normalized = text.upper().replace(" ", "")
+    return normalized.startswith(("ST", "*ST", "S*ST", "SST"))
 
 
 def fallback_stock_name(code):

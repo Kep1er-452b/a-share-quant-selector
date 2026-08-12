@@ -21,6 +21,9 @@ def resolve_deepseek_api_key(config: dict | None = None) -> str | None:
     env_token = os.getenv("DEEPSEEK_API_KEY")
     if env_token:
         return env_token.strip()
+    configured = (config or {}).get("wyckoff_ai", {}).get("deepseek_api_key")
+    if configured:
+        return str(configured).strip()
     local_config = load_local_config_file()
     token = local_config.get("wyckoff_ai", {}).get("deepseek_api_key")
     if token:
@@ -100,7 +103,7 @@ class DeepSeekWyckoffClient:
 
         client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout_seconds)
         attempts = [
-            ("json_mode", True, False, messages),
+            ("json_mode_thinking", True, True, messages),
             (
                 "json_mode_retry",
                 True,

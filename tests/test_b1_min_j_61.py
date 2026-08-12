@@ -9,9 +9,11 @@ import numpy as np
 import pandas as pd
 
 from strategy.b1_min_j_61_complex import B1MinJ61ComplexStrategy
+from strategy.b1_min_j_complex import B1MinJComplexStrategy
 from strategy.b1_min_j_simple import B1MinJSimpleStrategy
 from strategy.strategy_registry import StrategyRegistry
 from utils.technical import prepare_selection_features, prepare_strategy_shared_features
+import utils.technical as technical
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,3 +84,24 @@ def test_min_j_61_complex_is_registered_without_replacing_old_strategies():
     assert strategy is not None
     assert strategy.params["YANGYIN_RATIO_57"] == 1.2
     assert strategy.params["B1_TREND_TOLERANCE"] == 0.995
+
+
+def test_min_j_strategies_share_one_parameterized_feature(monkeypatch):
+    strategies = {
+        "B1MinJSimpleStrategy": B1MinJSimpleStrategy(),
+        "B1MinJComplexStrategy": B1MinJComplexStrategy(),
+        "B1MinJ61ComplexStrategy": B1MinJ61ComplexStrategy(),
+    }
+    prepared = prepare_selection_features(_price_frame())
+    original = technical.calculate_min_j
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(technical, "calculate_min_j", counted)
+    shared = prepare_strategy_shared_features(prepared, strategies)
+
+    assert len(calls) == 1
+    assert technical.min_j_feature_column(55, 10) in shared.columns

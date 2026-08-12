@@ -10,6 +10,7 @@ import hashlib
 import base64
 import urllib.parse
 import multiprocessing
+import threading
 from datetime import datetime
 from pathlib import Path
 from utils.strategy_labels import (
@@ -51,13 +52,18 @@ class RateLimiter:
         self.max_per_minute = max_per_minute
         self.min_interval = min_interval
         self.send_times = []  # 记录每次发送的时间戳
-        self._lock_time = 0   # 锁定时间（遇到限速错误时延长）"
+        self._lock_time = 0   # 锁定时间（遇到限速错误时延长）
+        self._lock = threading.Lock()
     
     def acquire(self):
         """
         获取发送许可，必要时阻塞等待
         Returns: 实际等待的秒数
         """
+        with self._lock:
+            return self._acquire_locked()
+
+    def _acquire_locked(self):
         now = time.time()
         
         # 清理1分钟前的记录
@@ -101,9 +107,9 @@ class RateLimiter:
             retry_count: 当前重试次数
         """
         backoff = min(2 ** retry_count, 30)  # 最大等待30秒
-        self._lock_time = time.time() + backoff
+        with self._lock:
+            self._lock_time = max(self._lock_time, time.time() + backoff)
         print(f"    ⏱️ 遇到限速，退避等待{backoff}秒...")
-        time.sleep(backoff)
 
 
 class DingTalkNotifier:
@@ -314,7 +320,7 @@ class DingTalkNotifier:
                             try:
                                 chunk = chunk_bytes[:-k].decode('utf-8') if k < len(chunk_bytes) else chunk_bytes.decode('utf-8', errors='ignore')
                                 break
-                            except:
+                            except UnicodeDecodeError:
                                 continue
                         else:
                             chunk = chunk_bytes.decode('utf-8', errors='ignore')
@@ -575,7 +581,7 @@ class DingTalkNotifier:
                             try:
                                 chunk = chunk_bytes[:-k].decode('utf-8') if k < len(chunk_bytes) else chunk_bytes.decode('utf-8', errors='ignore')
                                 break
-                            except:
+                            except UnicodeDecodeError:
                                 continue
                         else:
                             chunk = chunk_bytes.decode('utf-8', errors='ignore')
@@ -757,6 +763,7 @@ class DingTalkNotifier:
             print(f"✗ 图片文件不存在: {image_path}")
             return False
 
+        success = False
         try:
             # 读取图片
             with open(image_path, 'rb') as f:
@@ -796,11 +803,14 @@ class DingTalkNotifier:
             print(f"✗ 图片发送失败: {e}")
             return False
         finally:
-            try:
-                Path(image_path).unlink(missing_ok=True)
-                print(f"✓ 已清理本地临时图片: {image_path}")
-            except OSError as exc:
-                print(f"⚠️ 清理本地临时图片失败: {exc}")
+            if success:
+                try:
+                    Path(image_path).unlink(missing_ok=True)
+                    print(f"✓ 已清理已发送的临时图片: {image_path}")
+                except OSError as exc:
+                    print(f"⚠️ 清理本地临时图片失败: {exc}")
+            else:
+                print(f"⚠️ 图片未发送，已保留本地文件: {image_path}")
 
     def _format_stock_info_message(self, stock_code, stock_name, category, params, signal):
         """
@@ -891,17 +901,15 @@ class DingTalkNotifier:
                         category_count[cat] = category_count.get(cat, 0) + 1
         
         # 发送汇总消息
-        summary = f"🎯 BowlReboundStrategy:\n"
-        summary += f"N: {params.get('N', 4)} (成交量倍数)\n"
-        summary += f"M: {params.get('M', 15)} (回溯天数)\n"
-        summary += f"CAP: {params.get('CAP', 4000000000)} (40亿市值门槛)\n"
-        summary += f"J_VAL: {params.get('J_VAL', 30)} (J值上限)\n"
-        summary += f"duokong_pct: {params.get('duokong_pct', 3)}\n"
-        summary += f"short_pct: {params.get('short_pct', 2)}\n"
-        summary += f"M1: {params.get('M1', 14)} (MA周期)\n"
-        summary += f"M2: {params.get('M2', 28)} (MA周期)\n"
-        summary += f"M3: {params.get('M3', 57)} (MA周期)\n"
-        summary += f"M4: {params.get('M4', 114)} (MA周期)\n\n"
+        strategy_names = "、".join(str(name) for name in results) or "未命名策略"
+        summary = f"🎯 量化策略: {strategy_names}\n"
+        if params:
+            summary += "参数: " + " · ".join(
+                f"{key}={value}"
+                for key, value in sorted(params.items())
+                if isinstance(value, (str, int, float, bool))
+            ) + "\n"
+        summary += "\n"
         
         summary += f"⏰ {now}\n"
         if category_filter != 'all':
@@ -965,7 +973,8 @@ class DingTalkNotifier:
                                 )
                                 title = f"{code} {name}"
                                 print(f"    发送文字...")
-                                self.send_markdown(title, info_message)
+                                if not self.send_markdown(title, info_message):
+                                    total_failed += 1
                                 # 限流器会自动控制间隔，无需手动sleep
                                 
                                 print(f"    生成K线图...")
@@ -990,6 +999,8 @@ class DingTalkNotifier:
                                 # 发送图片（标题简化）
                                 if self.send_image(chart_path, f"{code} K线图"):
                                     chart_count += 1
+                                else:
+                                    total_failed += 1
                                 t1 = time.time()
                                 print(f"    发送图片耗时: {t1-t0:.2f}秒")
                             else:
@@ -1011,11 +1022,14 @@ class DingTalkNotifier:
                                 title = f"{code} {name} - {cat_name}"
                                 if self.send_image(chart_path, title):
                                     chart_count += 1
+                                else:
+                                    total_failed += 1
 
                             # 限流器会自动控制间隔，无需手动sleep
                             
                         except Exception as e:
                             print(f"✗ 生成 {code} 的K线图失败: {e}")
+                            total_failed += 1
                             continue
         
         # 发送普通文本详情（作为备份）
@@ -1023,7 +1037,7 @@ class DingTalkNotifier:
 
         print(f"\n✓ 已发送 {chart_count} 张K线图到钉钉")
 
-        return text_result
+        return bool(text_result and total_failed == 0)
 
 
     def send_b1_match_results(self, results: list, total_selected: int):

@@ -9,13 +9,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
-from strategy.b1_min_j_simple import calculate_min_j
 from strategy.b1_v24261 import (
     apply_b1_v24261_signal,
     b1_v24261_default_params,
     build_b1_v24261_signal,
 )
 from utils.strategy_labels import is_invalid_stock_name
+from utils.technical import calculate_min_j
 
 
 class B1MinJ61ComplexStrategy(BaseStrategy):
@@ -31,13 +31,14 @@ class B1MinJ61ComplexStrategy(BaseStrategy):
         if params:
             default_params.update(params)
         super().__init__("B1 Min J 61 Complex", default_params)
-
-    def calculate_indicators(self, df) -> pd.DataFrame:
         from strategy.b1_v24261 import B1V24261Strategy
 
         base_params = dict(self.params)
         base_params["J_MAX"] = 13
-        result = B1V24261Strategy(base_params).calculate_indicators(df)
+        self._base_strategy = B1V24261Strategy(base_params)
+
+    def calculate_indicators(self, df) -> pd.DataFrame:
+        result = self._base_strategy.calculate_indicators(df, apply_signal=False)
         result["MIN_J"] = calculate_min_j(
             result,
             j_valley_max=self.params["J_VALLEY_MAX"],

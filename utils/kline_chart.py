@@ -101,10 +101,7 @@ def generate_kline_chart(
     
     # 准备数据 - 确保按日期正序排列（从早到晚）
     df = df.copy()
-    if pd.api.types.is_datetime64_any_dtype(df['date']):
-        df['date'] = pd.to_datetime(df['date'])
-    else:
-        df['date'] = pd.to_datetime(df['date'])
+    df['date'] = pd.to_datetime(df['date'])
     
     # 按日期排序（正序）- 注意：需要在排序后重新计算趋势线
     df = df.sort_values('date').reset_index(drop=True)
@@ -300,9 +297,11 @@ def generate_kline_chart(
     
     # 无文字版本使用更低DPI进一步压缩
     save_dpi = 50 if show_text else 40
-    plt.savefig(filepath, dpi=save_dpi, bbox_inches='tight', facecolor='white', edgecolor='none', 
-                pil_kwargs={'optimize': True})
-    plt.close(fig)
+    try:
+        fig.savefig(filepath, dpi=save_dpi, bbox_inches='tight', facecolor='white', edgecolor='none',
+                    pil_kwargs={'optimize': True})
+    finally:
+        plt.close(fig)
     
     # 使用PIL二次压缩
     compress_image(str(filepath), MAX_FILE_SIZE)

@@ -55,7 +55,6 @@ _BINARY_OPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
     ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
 }
 
@@ -93,7 +92,8 @@ def _preprocess_formula(source: str) -> str:
     if len(text) > 2000:
         raise FormulaError("公式长度不能超过 2000 个字符")
 
-    text = re.sub(r"//.*", "", text)
+    if "//" in text:
+        raise FormulaError("公式不支持整除运算符 //")
     text = text.replace("&&", " AND ").replace("||", " OR ")
     text = re.sub(r"(?<![<>=!])!(?!=)", " not ", text)
     text = re.sub(r"(?<![<>=!])=(?!=)", "==", text)
@@ -115,7 +115,10 @@ def _ensure_series(value: Any, index: pd.Index) -> pd.Series:
 
 
 def _as_bool_series(value: Any, index: pd.Index) -> pd.Series:
-    return _ensure_series(value, index).fillna(False).astype(bool)
+    series = _ensure_series(value, index)
+    if pd.api.types.is_numeric_dtype(series):
+        series = series.replace([np.inf, -np.inf], np.nan)
+    return series.fillna(False).astype(bool)
 
 
 def _elementwise_reduce(args: tuple[Any, ...], index: pd.Index, op: str) -> pd.Series:
@@ -150,6 +153,8 @@ class CompiledFormula:
             value = evaluator.eval(self.tree.body)
         except RecursionError as exc:
             raise FormulaError("公式嵌套层级过深") from exc
+        except (ArithmeticError, FloatingPointError) as exc:
+            raise FormulaError(f"公式算术错误: {exc}") from exc
         return _as_bool_series(value, evaluator.index)
 
 
@@ -190,7 +195,22 @@ class _FormulaEvaluator:
             op_func = _BINARY_OPS.get(type(node.op))
             if op_func is None:
                 raise FormulaError("不支持的算术运算符")
-            return op_func(self.eval(node.left), self.eval(node.right))
+            left = self.eval(node.left)
+            right = self.eval(node.right)
+            try:
+                with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                    result = op_func(left, right)
+            except (ArithmeticError, FloatingPointError) as exc:
+                raise FormulaError(f"公式算术错误: {exc}") from exc
+            if isinstance(result, pd.Series):
+                return result.replace([np.inf, -np.inf], np.nan)
+            if isinstance(result, np.ndarray):
+                result = np.asarray(result, dtype=float)
+                result[~np.isfinite(result)] = np.nan
+                return result
+            if isinstance(result, (int, float, np.number)) and not np.isfinite(result):
+                return np.nan
+            return result
 
         if isinstance(node, ast.UnaryOp):
             operand = self.eval(node.operand)
@@ -253,6 +273,24 @@ class _FormulaEvaluator:
         if function is None:
             raise FormulaError(f"不支持的函数: {node.func.id}")
         args = [self.eval(arg) for arg in node.args]
+        if function_name in {"MA", "EMA", "LLV", "HHV", "REF", "EXIST", "COUNT", "SUM", "SMA"}:
+            if len(args) < 2 or isinstance(args[1], (pd.Series, np.ndarray)):
+                raise FormulaError(f"{function_name} 的窗口参数必须是整数常量")
+            try:
+                window = int(args[1])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise FormulaError(f"{function_name} 的窗口参数必须是整数") from exc
+            if window <= 0 or window > len(self.index) or float(args[1]) != window:
+                raise FormulaError(
+                    f"{function_name} 的窗口参数必须在 1 到 {len(self.index)} 之间"
+                )
+            if function_name == "SMA" and len(args) >= 3:
+                try:
+                    weight = int(args[2])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise FormulaError("SMA 权重参数必须是整数") from exc
+                if weight <= 0 or weight > window or float(args[2]) != weight:
+                    raise FormulaError("SMA 权重参数必须在 1 到窗口长度之间")
         try:
             return function(*args)
         except FormulaError:
@@ -270,6 +308,12 @@ def _validate_node(node: ast.AST) -> None:
             raise FormulaError("公式中只允许数字和布尔常量")
         return
     if isinstance(node, ast.Name):
+        normalized = node.id.upper()
+        if (
+            normalized not in _COLUMN_ALIASES
+            and normalized not in {"TRUE", "FALSE"}
+        ):
+            raise FormulaError(f"未知字段或变量: {node.id}")
         return
     if isinstance(node, ast.BinOp):
         if type(node.op) not in _BINARY_OPS:

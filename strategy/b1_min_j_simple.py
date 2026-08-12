@@ -8,53 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
-from utils.technical import KDJ, REF, SUM, calculate_zhixing_trend
+from utils.technical import KDJ, calculate_min_j, calculate_zhixing_trend
 from utils.strategy_labels import is_invalid_stock_name
-
-
-def calculate_min_j(df, j_valley_max=55, long_offset=10) -> pd.Series:
-    """
-    按原 Min J 指标思路确认历史 J 坑底。
-
-    本项目行情数据最新日期在前；REF(J, 1) 是前一交易日，shift(1) 是后一交易日。
-    因此最新一根 K 线自身不会被判断为坑底，但可以用今天的数据确认昨天的坑底。
-    """
-    j = pd.to_numeric(df["J"], errors="coerce")
-    k = pd.to_numeric(df["K"], errors="coerce")
-    d = pd.to_numeric(df["D"], errors="coerce")
-
-    j_prev = REF(j, 1)
-    j_next = j.shift(1)
-
-    valley = (
-        (j < j_prev) &
-        (j < j_next) &
-        (j < j_valley_max) &
-        (j < d) &
-        (j < k) &
-        (k < d)
-    ).fillna(False)
-
-    result = df.copy()
-    result["J_VALLEY"] = valley
-    result["J_MASK"] = j.where(valley, 0).fillna(0)
-    result["C_MASK"] = valley.astype(int)
-
-    sum_j_short = SUM(result["J_MASK"], 28)
-    count_short = SUM(result["C_MASK"], 28)
-
-    sum_j_mid = SUM(result["J_MASK"], 57)
-    count_mid = SUM(result["C_MASK"], 57)
-
-    sum_j_long = SUM(result["J_MASK"], 114)
-    count_long = SUM(result["C_MASK"], 114)
-
-    val_short = sum_j_short / count_short.clip(lower=1)
-    val_mid = sum_j_mid / count_mid.clip(lower=1)
-    val_long = (sum_j_long / count_long.clip(lower=1)) + long_offset
-
-    min_j = (val_short + val_mid + val_long) / 3.0
-    return min_j.fillna(0).set_axis(df.index)
 
 
 class B1MinJSimpleStrategy(BaseStrategy):
@@ -71,7 +26,7 @@ class B1MinJSimpleStrategy(BaseStrategy):
         super().__init__("B1MinJSimple", default_params)
 
     def calculate_indicators(self, df) -> pd.DataFrame:
-        result = df.copy()
+        result = df.copy(deep=False)
 
         if not {"K", "D", "J"}.issubset(result.columns):
             kdj_df = KDJ(result, n=9, m1=3, m2=3)

@@ -22,6 +22,8 @@ def merge_indicator_frames(base_df, frames):
     for frame in frames:
         if frame is None or frame.empty:
             continue
+        if len(frame) != len(merged) or not frame.index.equals(merged.index):
+            raise ValueError("策略指标帧与行情数据的长度或索引不一致")
         for column in frame.columns:
             if column not in merged.columns:
                 merged[column] = frame[column].values
@@ -118,6 +120,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
     indicators_dict = {}
     category_count = {}
     error_counts = {strategy_name: 0 for strategy_name in strategies}
+    strategy_valid_counts = {strategy_name: 0 for strategy_name in strategies}
     error_details = []
     processed_count = 0
     valid_count = 0
@@ -145,7 +148,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
 
         valid_count += 1
         prepared_df = prepare_selection_features(df)
-        prepared_df = prepare_strategy_shared_features(prepared_df, strategies.keys())
+        prepared_df = prepare_strategy_shared_features(prepared_df, strategies)
         indicator_frames = []
 
         for strategy_name, strategy in strategies.items():
@@ -157,9 +160,14 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
             )
             if len(prepared_df) < minimum_history:
                 continue
+            strategy_valid_counts[strategy_name] += 1
             try:
                 df_with_indicators = strategy.calculate_indicators(prepared_df)
                 signal_list = strategy.select_stocks(df_with_indicators, name)
+                if return_data:
+                    # Validate here so one malformed strategy is reported and
+                    # skipped instead of crashing the complete worker chunk.
+                    merge_indicator_frames(prepared_df, [df_with_indicators])
             except Exception as exc:
                 error_counts[strategy_name] += 1
                 if len(error_details) < 20:
@@ -201,6 +209,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
         "indicators_dict": indicators_dict,
         "category_count": category_count,
         "error_counts": error_counts,
+        "strategy_valid_counts": strategy_valid_counts,
         "error_details": error_details,
         "last_processed_code": last_processed_code,
         "last_processed_name": last_processed_name,

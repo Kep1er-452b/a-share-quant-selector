@@ -9,7 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
-from utils.technical import COUNT, EMA, HHV, LLV, MA, REF, SUM, KDJ
+from utils.technical import (
+    COUNT, EMA, HHV, LLV, MA, REF, SUM, KDJ, finite_number, numeric_column,
+)
 from utils.strategy_labels import is_invalid_stock_name
 
 
@@ -39,7 +41,7 @@ class B2BetaStrategy(BaseStrategy):
         super().__init__("B2选股Beta版", default_params)
 
     def calculate_indicators(self, df) -> pd.DataFrame:
-        result = df.copy()
+        result = df.copy(deep=False)
 
         ref_close_1 = result["ref_close_1"] if "ref_close_1" in result.columns else REF(result["close"], 1)
         ref_vol_1 = result["ref_vol_1"] if "ref_vol_1" in result.columns else REF(result["volume"], 1)
@@ -73,7 +75,7 @@ class B2BetaStrategy(BaseStrategy):
         result["YANGYIN_OK"] = result["VOL_YANG"] > self.params["YANGYIN_RATIO_14"] * result["VOL_YIN"]
 
         mv_min = self.params["MV_MIN_BILLION"] * 1e8
-        market_cap = pd.to_numeric(result.get("market_cap", 0), errors="coerce").fillna(0)
+        market_cap = numeric_column(result, "market_cap").fillna(0)
         result["MV"] = market_cap / 1e8
         result["MVOK"] = market_cap >= max(mv_min, 1e8)
 
@@ -171,8 +173,11 @@ class B2BetaStrategy(BaseStrategy):
         return [{
             "date": latest["date"],
             "close": round(float(latest["close"]), 2),
-            "J": round(float(latest["J"]), 2),
-            "market_cap": round(float(latest["market_cap"]) / 1e8, 2) if pd.notna(latest.get("market_cap")) else 0,
+            "J": round(finite_number(latest.get("J"), 0.0), 2),
+            "market_cap": (
+                round(finite_number(latest.get("market_cap")) / 1e8, 2)
+                if finite_number(latest.get("market_cap")) is not None else None
+            ),
             "reasons": reasons or ["满足 B2 选股条件"],
             "category": "b2_beta",
             "wl": round(float(latest["WL"]), 2),

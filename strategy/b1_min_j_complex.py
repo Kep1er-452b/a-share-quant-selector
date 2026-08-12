@@ -8,7 +8,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.base_strategy import BaseStrategy
-from strategy.b1_min_j_simple import calculate_min_j
 from strategy.b1_v242p import (
     apply_b1_v242p_signal,
     build_b1_v242p_signal,
@@ -16,6 +15,7 @@ from strategy.b1_v242p import (
     calculate_b1_v242p_indicators,
 )
 from utils.strategy_labels import is_invalid_stock_name
+from utils.technical import calculate_min_j
 
 
 class B1MinJComplexStrategy(BaseStrategy):
@@ -32,8 +32,9 @@ class B1MinJComplexStrategy(BaseStrategy):
         super().__init__("B1MinJComplex", default_params)
 
     def calculate_indicators(self, df) -> pd.DataFrame:
-        result = df.copy()
-        result = calculate_b1_v242p_indicators(result, self.params)
+        result = calculate_b1_v242p_indicators(
+            df, self.params, apply_signal=False
+        )
         result["MIN_J"] = calculate_min_j(
             result,
             j_valley_max=self.params["J_VALLEY_MAX"],

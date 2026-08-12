@@ -18,6 +18,7 @@ class FormulaStrategy(BaseStrategy):
     """Evaluate a user-provided formula against the latest bar."""
 
     runtime_only = True
+    market_scope = "market_neutral"
 
     def __init__(self, params=None):
         default_params = {
@@ -32,7 +33,7 @@ class FormulaStrategy(BaseStrategy):
         self._compiled_formula = compile_formula(self.formula) if self.formula else None
 
     def calculate_indicators(self, df) -> pd.DataFrame:
-        result = df.copy()
+        result = df.copy(deep=False)
         if not self._compiled_formula:
             result["FORMULA_MATCH"] = False
             return result

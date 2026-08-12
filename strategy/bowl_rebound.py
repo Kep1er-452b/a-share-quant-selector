@@ -43,6 +43,7 @@ from utils.strategy_labels import is_invalid_stock_name
 
 class BowlReboundStrategy(BaseStrategy):
     """碗口反弹策略 - 分类标记版"""
+    MIN_HISTORY_DAYS = 160
     
     def __init__(self, params=None):
         # 默认参数
@@ -69,7 +70,7 @@ class BowlReboundStrategy(BaseStrategy):
         """
         计算碗口反弹策略所需的所有指标
         """
-        result = df.copy()
+        result = df.copy(deep=False)
 
         default_periods = (14, 28, 57, 114)
         current_periods = (
@@ -185,11 +186,6 @@ class BowlReboundStrategy(BaseStrategy):
         
         # 检查最新一天是否有有效交易
         if latest['volume'] <= 0 or pd.isna(latest['close']):
-            return []
-        
-        # 过滤数据异常的股票
-        recent_df = df.head(30)
-        if recent_df['J'].abs().mean() > 80:
             return []
         
         # ========== 核心条件检查 ==========

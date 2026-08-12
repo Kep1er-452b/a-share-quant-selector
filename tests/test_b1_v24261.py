@@ -60,7 +60,7 @@ def test_b1_v24261_matches_formula_windows_and_thresholds():
         & (prepared["close"] <= prepared["open"])
         & (prepared["volume"] >= 1.2 * ref_vol_1)
     )
-    expected_good = COUNT((prepared["open"] >= o85) & fd15, 14) <= 0
+    expected_good = COUNT((prepared["open"] >= o85) & fd15, 28) <= 0
     pd.testing.assert_series_equal(result["GOOD28"], expected_good, check_names=False)
 
     plry = (

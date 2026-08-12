@@ -33,25 +33,18 @@ class PatternFeatureExtractor:
         # 使用指定的回看天数或默认值
         days = lookback_days if lookback_days is not None else self.lookback_days
         
-        # 取回看期数据
-        window_df = df.head(days).copy()
-        
-        # 按日期正序排列（便于计算趋势）
-        window_df = window_df.sort_values('date').reset_index(drop=True)
-        
-        # 计算知行指标
-        trend_df = calculate_zhixing_trend(window_df)
-        # calculate_zhixing_trend 的标准输出保持“最新在前”，而本提取器在
-        # 日期升序窗口上继续计算斜率和最新值，因此恢复升序后再按位置赋值。
-        trend_df = trend_df.iloc[::-1].reset_index(drop=True)
-        window_df['short_term_trend'] = trend_df['short_term_trend'].to_numpy()
-        window_df['bull_bear_line'] = trend_df['bull_bear_line'].to_numpy()
-        
-        # 计算KDJ
-        kdj_df = KDJ(window_df, n=9, m1=3, m2=3)
-        window_df['K'] = kdj_df['K']
-        window_df['D'] = kdj_df['D']
-        window_df['J'] = kdj_df['J']
+        # Calculate long-memory indicators on the complete history first, then
+        # slice the requested feature window. Computing MA114/KDJ on only 25
+        # rows creates a different feature distribution from live selection.
+        full_df = df.sort_values('date', ascending=False).reset_index(drop=True).copy()
+        trend_df = calculate_zhixing_trend(full_df)
+        kdj_df = KDJ(full_df, n=9, m1=3, m2=3)
+        full_df['short_term_trend'] = trend_df['short_term_trend'].to_numpy()
+        full_df['bull_bear_line'] = trend_df['bull_bear_line'].to_numpy()
+        full_df['K'] = kdj_df['K'].to_numpy()
+        full_df['D'] = kdj_df['D'].to_numpy()
+        full_df['J'] = kdj_df['J'].to_numpy()
+        window_df = full_df.head(days).sort_values('date').reset_index(drop=True)
         
         features = {
             "trend_structure": self._extract_trend_features(window_df),

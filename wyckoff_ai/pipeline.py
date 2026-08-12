@@ -147,8 +147,14 @@ class WyckoffPipeline:
                 "source": stock["source"],
             },
         )
-        timeout_seconds = float(self.config.get("wyckoff_ai", {}).get("timeout_seconds", 90))
-        client = DeepSeekWyckoffClient(api_key=api_key, timeout_seconds=timeout_seconds)
+        ai_config = self.config.get("wyckoff_ai", {})
+        timeout_seconds = float(ai_config.get("timeout_seconds", 90))
+        client = DeepSeekWyckoffClient(
+            api_key=api_key,
+            base_url=str(ai_config.get("base_url") or "https://api.deepseek.com"),
+            model=str(ai_config.get("model") or "deepseek-v4-pro"),
+            timeout_seconds=timeout_seconds,
+        )
         emit("deepseek", "DeepSeek 正在分析供需背景、阶段、关键事件与后续场景。", 48)
         raw_payload, raw_text = client.analyze(messages)
         emit("validate", "已收到模型 JSON，正在校验日期、事件价格与结构字段。", 76)
@@ -158,18 +164,9 @@ class WyckoffPipeline:
             f"{stock.get('name') or stock['symbol']}({stock['symbol']}) "
             f"{data_date} 威科夫结构: {analysis.get('mode')} / {analysis.get('current_phase')}"
         )
-        emit("render", "结构校验通过，正在调用本地可信渲染器生成 PNG 图表。", 86)
-        render_source = stock.get("csv_path")
-        if render_source is None:
-            render_source = Path(paths["run_dir"]) / "source" / f"{stock['symbol']}-ohlcv.csv"
-            render_source.parent.mkdir(parents=True, exist_ok=True)
-            source_frame = df[["date", "open", "high", "low", "close", "volume"]].copy()
-            source_frame["date"] = pd.to_datetime(source_frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            source_frame.to_csv(render_source, index=False)
-        chart_path = render_chart(render_source, analysis, paths["chart_path"], title)
-
         result = {
             "success": True,
+            "render_status": "pending",
             "generated_at": generated_at,
             "model": DEEPSEEK_MODEL,
             "stock": {
@@ -191,12 +188,10 @@ class WyckoffPipeline:
             "analysis_text": self._format_analysis_text(analysis),
             "paths": {
                 **paths,
-                "chart_path": chart_path,
-                "source_path": str(render_source),
+                "chart_path": str(paths["chart_path"]),
+                "source_path": str(stock.get("csv_path") or ""),
             },
         }
-        emit("save", "正在保存分析 JSON、PNG 图表与调试记录。", 96)
-        Path(paths["analysis_path"]).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         debug_payload = {
             "generated_at": generated_at,
             "model": DEEPSEEK_MODEL,
@@ -204,7 +199,45 @@ class WyckoffPipeline:
             "raw_model_json": raw_payload,
             "raw_model_text": raw_text,
         }
+        # Persist the paid model result before any local rendering work. A
+        # missing font/backend or a corrupt renderer must not discard analysis
+        # that was already received and validated.
+        emit("save", "结构校验通过，正在先保存分析结果与调试记录。", 82)
+        Path(paths["analysis_path"]).write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         Path(paths["debug_path"]).write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        emit("render", "分析结果已保存，正在调用本地可信渲染器生成 PNG 图表。", 90)
+        render_source = stock.get("csv_path")
+        try:
+            if render_source is None:
+                render_source = Path(paths["run_dir"]) / "source" / f"{stock['symbol']}-ohlcv.csv"
+                render_source.parent.mkdir(parents=True, exist_ok=True)
+                source_frame = df[["date", "open", "high", "low", "close", "volume"]].copy()
+                source_frame["date"] = pd.to_datetime(
+                    source_frame["date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                source_frame.to_csv(render_source, index=False)
+            chart_path = render_chart(render_source, analysis, paths["chart_path"], title)
+        except Exception as exc:
+            result["render_status"] = "failed"
+            result["render_error"] = f"{type(exc).__name__}: {exc}"
+            result["paths"]["source_path"] = str(render_source or "")
+            Path(paths["analysis_path"]).write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            raise WyckoffPipelineError(
+                f"分析结果已保存，但图表渲染失败: {exc}"
+            ) from exc
+
+        result["render_status"] = "completed"
+        result["paths"]["chart_path"] = chart_path
+        result["paths"]["source_path"] = str(render_source)
+        emit("save", "正在更新分析文件中的图表路径。", 96)
+        Path(paths["analysis_path"]).write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         emit("done", "威科夫分析完成，图表与分析文件已保存。", 100)
         return result
 

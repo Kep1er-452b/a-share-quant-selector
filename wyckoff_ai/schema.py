@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 import pandas as pd
@@ -397,8 +396,7 @@ def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, An
     if mode not in VALID_MODES:
         raise WyckoffSchemaError(f"不支持的威科夫结构: {mode}")
 
-    normalized = deepcopy(payload)
-    normalized["mode"] = mode
+    normalized = {"mode": mode}
     normalized["current_phase"] = str(payload.get("current_phase") or "unclear").strip()[:32]
     normalized["summary_text"] = _require_text(payload, "summary_text")
     normalized["background_text"] = str(payload.get("background_text") or "").strip()[:240]
@@ -407,8 +405,7 @@ def validate_analysis(payload: dict[str, Any], df: pd.DataFrame) -> dict[str, An
     normalized["ranges"] = _validate_ranges(payload.get("ranges"), available_dates)
     normalized["phases"] = _validate_phases(payload.get("phases"), available_dates)
     normalized["key_levels"] = _validate_key_levels(payload.get("key_levels"), df)
-    scenarios = payload.get("scenarios") or []
-    normalized["scenarios"] = scenarios if isinstance(scenarios, list) else [str(scenarios)]
+    normalized["scenarios"] = _coerce_text_list(payload.get("scenarios"), limit=6)
     normalized["book_judgment"] = _validate_book_judgment(
         payload.get("book_judgment"),
         payload,

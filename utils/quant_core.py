@@ -119,7 +119,7 @@ def _library() -> ctypes.CDLL:
     try:
         lib = ctypes.CDLL(str(path))
         _configure(lib)
-    except OSError as exc:
+    except (OSError, AttributeError) as exc:
         _LOAD_ERROR = str(exc)
         raise QuantCoreUnavailable(str(exc)) from exc
     _LIB = lib
