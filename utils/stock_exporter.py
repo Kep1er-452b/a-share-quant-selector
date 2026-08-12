@@ -9,6 +9,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -22,6 +23,19 @@ from utils.strategy_labels import fallback_stock_name
 
 
 DOWNLOADS_DIR = Path.home() / "Downloads"
+_SEARCH_CACHE_LOCK = RLock()
+_NAMES_CACHE = {}
+_SEARCH_INDEX_CACHE = {}
+
+
+def _data_signature(data_dir):
+    root = Path(data_dir)
+    paths = [root / "stock_names.json", root / "tushare_stock_map.json"]
+    paths.extend(path for path in root.glob("[0-9][0-9]") if path.is_dir())
+    return tuple(
+        (str(path), path.stat().st_mtime_ns, path.stat().st_size)
+        for path in paths if path.exists()
+    )
 
 
 try:
@@ -32,6 +46,12 @@ except ImportError:  # pragma: no cover - dependency is declared, fallback keeps
 
 
 def load_stock_names(data_dir: str = "data") -> Dict[str, str]:
+    cache_key = str(Path(data_dir).resolve())
+    signature = _data_signature(data_dir)
+    with _SEARCH_CACHE_LOCK:
+        cached = _NAMES_CACHE.get(cache_key)
+        if cached and cached[0] == signature:
+            return dict(cached[1])
     result = {}
     names_file = Path(data_dir) / "stock_names.json"
     if names_file.exists():
@@ -57,6 +77,8 @@ def load_stock_names(data_dir: str = "data") -> Dict[str, str]:
                     result[normalized_code] = str(name).strip()
         except Exception:
             pass
+    with _SEARCH_CACHE_LOCK:
+        _NAMES_CACHE[cache_key] = (signature, dict(result))
     return result
 
 
@@ -116,10 +138,18 @@ def classify_board(stock_code: str) -> str:
         return "star"
     if code.startswith(("300", "301")):
         return "chinext"
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return "beijing"
     return "main"
 
 
 def build_stock_search_index(data_dir: str = "data", include_hidden: bool = False) -> List[StockMatch]:
+    cache_key = (str(Path(data_dir).resolve()), bool(include_hidden))
+    signature = _data_signature(data_dir)
+    with _SEARCH_CACHE_LOCK:
+        cached = _SEARCH_INDEX_CACHE.get(cache_key)
+        if cached and cached[0] == signature:
+            return list(cached[1])
     csv_manager = CSVManager(data_dir)
     stock_names = load_stock_names(data_dir)
     codes = sorted(set(csv_manager.list_all_stocks()) | set(stock_names.keys()))
@@ -138,6 +168,8 @@ def build_stock_search_index(data_dir: str = "data", include_hidden: bool = Fals
             initials=initials,
         ))
 
+    with _SEARCH_CACHE_LOCK:
+        _SEARCH_INDEX_CACHE[cache_key] = (signature, tuple(matches))
     return matches
 
 

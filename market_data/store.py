@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -46,21 +47,36 @@ class DomainStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._ensure_schema()
+
+    def _connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            self._local.connection = conn
+        return conn
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn = self._connection()
         try:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout = 30000")
             yield conn
-            conn.commit()
+            if conn.in_transaction:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if conn.in_transaction:
+                conn.rollback()
             raise
-        finally:
+
+    def close(self) -> None:
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
             conn.close()
+            self._local.connection = None
 
     def _ensure_schema(self) -> None:
         # Compatibility must be checked before changing journaling mode or
@@ -268,6 +284,84 @@ class DomainStore:
             _observe_db_duration("query_rows", started_at)
         return [json.loads(row["payload_json"]) for row in rows]
 
+    def query_all_rows(
+        self,
+        dataset: str,
+        *,
+        symbol: str | None = None,
+        max_rows: int = 100_000,
+        descending: bool = True,
+    ) -> list[dict]:
+        """Read a deliberately bounded dataset through one shared pager."""
+
+        maximum = int(max_rows)
+        if maximum < 1:
+            raise ValueError("max_rows must be positive")
+        rows: list[dict] = []
+        offset = 0
+        while offset < maximum:
+            page_limit = min(MAX_QUERY_LIMIT, maximum - offset)
+            page = self.query_rows(
+                dataset,
+                symbol=symbol,
+                limit=page_limit,
+                offset=offset,
+                descending=descending,
+            )
+            rows.extend(page)
+            if len(page) < page_limit:
+                return rows
+            offset += len(page)
+        if self.count_rows(dataset, symbol=symbol) > len(rows):
+            raise RuntimeError(f"{dataset} exceeds the bounded row limit {maximum}")
+        return rows
+
+    def count_rows(
+        self,
+        dataset: str,
+        *,
+        symbol: str | None = None,
+    ) -> int:
+        dataset_id = self._required_text(dataset, "dataset")
+        clauses = ["dataset = ?"]
+        params: list[object] = [dataset_id]
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(str(symbol))
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM dataset_rows WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def max_data_date(self, dataset: str, *, symbol: str | None = None) -> str | None:
+        dataset_id = self._required_text(dataset, "dataset")
+        clauses = ["dataset = ?", "data_date IS NOT NULL"]
+        params: list[object] = [dataset_id]
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(str(symbol))
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT MAX(data_date) FROM dataset_rows WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return self._optional_text(row[0]) if row else None
+
+    def storage_signature(self) -> tuple[tuple[str, int, int], ...]:
+        """Return a cheap signature that changes when the SQLite store changes."""
+
+        paths = (self.db_path, Path(f"{self.db_path}-wal"))
+        result = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                result.append((path.name, int(stat.st_mtime_ns), int(stat.st_size)))
+            except FileNotFoundError:
+                result.append((path.name, 0, 0))
+        return tuple(result)
+
     def query_latest_rows(
         self,
         dataset: str,
@@ -310,22 +404,23 @@ class DomainStore:
                 GROUP BY symbol
                 ORDER BY symbol ASC
                 LIMIT ? OFFSET ?
-            ), ranked AS (
-                SELECT rows.payload_json,
-                       rows.symbol,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY rows.symbol
-                           ORDER BY rows.data_date DESC, rows.row_key DESC
-                       ) AS row_rank
-                FROM dataset_rows AS rows
-                INNER JOIN selected_symbols AS selected
-                    ON selected.symbol = rows.symbol
-                WHERE rows.dataset = ?{date_filter.replace("data_date", "rows.data_date")}
+            ), latest AS (
+                SELECT rows.payload_json, rows.symbol, rows.data_date, rows.row_key
+                FROM selected_symbols AS selected
+                INNER JOIN dataset_rows AS rows
+                    ON rows.rowid IN (
+                        SELECT candidate.rowid
+                        FROM dataset_rows AS candidate
+                        WHERE candidate.dataset = ?
+                          AND candidate.symbol = selected.symbol
+                          {"AND candidate.data_date <= ?" if end_text else ""}
+                        ORDER BY candidate.data_date DESC, candidate.row_key DESC
+                        LIMIT ?
+                    )
             )
             SELECT payload_json
-            FROM ranked
-            WHERE row_rank <= ?
-            ORDER BY symbol ASC, row_rank ASC
+            FROM latest
+            ORDER BY symbol ASC, data_date DESC, row_key DESC
         """
         selected_args = [dataset_id]
         if end_text:
@@ -448,6 +543,15 @@ class DomainStore:
             else:
                 row_count = None
                 dataset_count = None
+        sidecar_size = sum(
+            path.stat().st_size
+            for path in (
+                Path(f"{self.db_path}-wal"),
+                Path(f"{self.db_path}-shm"),
+            )
+            if path.exists()
+        )
+        main_size = self.db_path.stat().st_size if self.db_path.exists() else 0
         return {
             "integrity": str(integrity),
             "integrity_checked": bool(deep),
@@ -455,6 +559,8 @@ class DomainStore:
             "journal_mode": str(journal_mode).lower(),
             "dataset_count": int(dataset_count) if dataset_count is not None else None,
             "row_count": int(row_count) if row_count is not None else None,
-            "db_size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
+            "db_size_bytes": main_size + sidecar_size,
+            "db_main_size_bytes": main_size,
+            "db_sidecar_size_bytes": sidecar_size,
             "db_path": str(self.db_path),
         }

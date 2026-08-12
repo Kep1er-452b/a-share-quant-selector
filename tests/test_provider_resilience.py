@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from collections import deque
+from functools import partial
 from threading import Lock
 
 import pandas as pd
@@ -25,7 +26,7 @@ def test_csv_manager_lists_only_current_warehouse(tmp_path):
     assert CSVManager(root).list_all_stocks() == ["000002"]
 
 
-def test_tushare_proxy_fallback_clears_proxy_env(monkeypatch):
+def test_tushare_proxy_fallback_does_not_mutate_proxy_env(monkeypatch):
     fetcher = TushareFetcher.__new__(TushareFetcher)
     fetcher.proxy_fallback_lock = Lock()
 
@@ -33,18 +34,27 @@ def test_tushare_proxy_fallback_clears_proxy_env(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
 
+    class FakePro:
+        def query(self, api_name, **kwargs):
+            raise AssertionError("environment-routed client must not be used")
+
     observed = {}
 
-    def probe():
-        observed.update({key: os.environ.get(key) for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")})
-        return "ok"
+    class FakeDirectApi:
+        def query(self, api_name, **kwargs):
+            observed.update({
+                key: os.environ.get(key)
+                for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+            })
+            return api_name
 
-    assert fetcher._call_without_proxy(probe) == "ok"
+    fetcher.pro = FakePro()
+    fetcher._direct_api = FakeDirectApi()
+    assert fetcher._call_without_proxy(partial(fetcher.pro.query, "daily")) == "daily"
     assert observed == {
-        "HTTP_PROXY": None,
-        "HTTPS_PROXY": None,
-        "ALL_PROXY": None,
-        "NO_PROXY": "*",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "ALL_PROXY": "http://127.0.0.1:9",
     }
     assert os.environ.get("HTTP_PROXY") == "http://127.0.0.1:9"
 

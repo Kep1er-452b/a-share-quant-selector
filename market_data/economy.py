@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import calendar
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from typing import Any, Iterable
@@ -399,7 +400,10 @@ def _bound_for_frequency(value: object, frequency: str, *, end: bool) -> str | N
         if frequency == "quarterly":
             return text
         month = quarter * 3 if end else (quarter - 1) * 3 + 1
-        return f"{year}{month:02d}" + ("31" if end and frequency == "daily" else "01" if frequency == "daily" else "")
+        if frequency == "daily":
+            day = calendar.monthrange(int(year), month)[1] if end else 1
+            return f"{year}{month:02d}{day:02d}"
+        return f"{year}{month:02d}"
 
     digits = "".join(character for character in text if character.isdigit())
     if len(digits) < 4:
@@ -414,7 +418,8 @@ def _bound_for_frequency(value: object, frequency: str, *, end: bool) -> str | N
         return f"{year}{month:02d}"
     if len(digits) >= 8:
         return digits[:8]
-    return f"{year}{month:02d}{'31' if end else '01'}"
+    day = calendar.monthrange(int(year), month)[1] if end else 1
+    return f"{year}{month:02d}{day:02d}"
 
 
 def _stable_bucket_sample(points: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:

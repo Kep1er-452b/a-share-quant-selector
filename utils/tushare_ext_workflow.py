@@ -49,7 +49,7 @@ def extension_store_for_data_root(data_root=None) -> TushareExtStore:
 def recent_tushare_extension_trade_dates(store, latest_text, count=2) -> list[str]:
     dates = []
     try:
-        for row in store.query_rows("trade_cal", end_date=latest_text, descending=True):
+        for row in store.query_rows("trade_cal", end_date=latest_text, limit=max(count * 4, 10), descending=True):
             cal_date = str(row.get("cal_date") or row.get("trade_date") or "").strip()
             if not cal_date or cal_date > latest_text:
                 continue
@@ -188,10 +188,16 @@ def refresh_tushare_extension_data(
         results["prices"] = skipped_extension_stage(PRICE_SKIP_REASON)
         emit_log(f"Tushare 扩展数据 prices 已跳过: {PRICE_SKIP_REASON}。")
 
+    existing_valuation = store.latest_trade_date("daily_basic")
+    valuation_count = 1
+    if existing_valuation and existing_valuation < latest_text:
+        gap_days = max((pd.to_datetime(latest_text) - pd.to_datetime(existing_valuation)).days, 1)
+        valuation_count = min(max(gap_days + 2, 3), 20)
+    valuation_dates = recent_tushare_extension_trade_dates(store, latest_text, count=valuation_count)
     run_stage(
         "valuation",
         lambda: sync.sync_valuation_snapshot(
-            [latest_text],
+            valuation_dates,
             progress_callback=emit_progress,
             halt_checker=extension_halted,
         ),

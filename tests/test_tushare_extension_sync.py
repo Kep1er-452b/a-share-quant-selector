@@ -153,7 +153,7 @@ def test_sync_index_cache_fetches_incrementally_after_latest_local_date(tmp_path
     assert pro.calls[0][1]["start_date"] == "20200622"
 
 
-def test_sync_index_cache_stays_incremental_when_history_is_deep_enough(tmp_path):
+def test_sync_index_cache_repairs_history_that_does_not_reach_target_start(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     rows = [
         {
@@ -173,8 +173,7 @@ def test_sync_index_cache_stays_incremental_when_history_is_deep_enough(tmp_path
 
     sync.ensure_index_cache(symbols=["000001.SH"], today=date(2026, 7, 1))
 
-    latest = rows[-1]["trade_date"]
-    expected = (pd.to_datetime(latest) + pd.Timedelta(days=1)).strftime("%Y%m%d")
+    expected = (pd.Timestamp("2026-07-01") - pd.Timedelta(days=2200)).strftime("%Y%m%d")
     assert pro.calls[0][1]["start_date"] == expected
 
 

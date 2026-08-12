@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Iterable
 
 import pandas as pd
@@ -433,7 +433,11 @@ def build_market_trading_summary(
     current_moneyflow = _rows_for_date(store, "moneyflow", latest)
     previous_moneyflow = _rows_for_date(store, "moneyflow", previous) if previous else []
     margin_date = _latest_dataset_date(store, "margin", latest)
-    previous_margin_date = _latest_dataset_date(store, "margin", str(int(margin_date) - 1)) if margin_date else None
+    margin_cutoff = (
+        (pd.to_datetime(margin_date) - timedelta(days=1)).strftime("%Y%m%d")
+        if margin_date else None
+    )
+    previous_margin_date = _latest_dataset_date(store, "margin", margin_cutoff) if margin_cutoff else None
     current_margin = _rows_for_date(store, "margin", margin_date) if margin_date else []
     previous_margin = _rows_for_date(store, "margin", previous_margin_date) if previous_margin_date else []
 
@@ -504,7 +508,8 @@ def _pick(row: dict, fields: Iterable[str]) -> dict:
     output = {}
     for field in fields:
         if field in row and row.get(field) not in (None, ""):
-            output[field] = _to_number(row.get(field))
+            value = row.get(field)
+            output[field] = _date_text(value) if field.endswith("date") else _to_number(value)
     return output
 
 

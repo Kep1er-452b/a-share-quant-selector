@@ -34,6 +34,7 @@ BOARD_LABELS = {
     "main": "主板",
     "chinext": "创业板",
     "star": "科创板",
+    "beijing": "北交所",
 }
 
 MAX_REASONABLE_MARKET_CAP_YUAN = 20_000_000_000_000
@@ -328,7 +329,6 @@ class BaseDataProvider:
         """抓取单只股票的增量数据（线程安全）。"""
         code = item["code"]
         name = item.get("name", "")
-        existing_df = self.csv_manager.read_stock(code)
         latest_local = status_map[code].get("latest_date")
         latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
         missing_trade_dates = self.get_missing_trade_dates(latest_local_date, latest_trade_date)
@@ -338,33 +338,35 @@ class BaseDataProvider:
         if df is not None and not df.empty:
             if write_guard and not write_guard():
                 return {"code": code, "name": name, "ok": False, "cancelled": True}
-            if self._qfq_anchor_changed(existing_df, df):
-                return {
-                    "code": code,
-                    "name": name,
-                    "ok": False,
-                    "fallback_full": True,
-                    "qfq_anchor_changed": True,
-                }
-            prepared_new_df = self.csv_manager._preserve_existing_metrics(existing_df, df)
-            merged_df = pd.concat([existing_df, prepared_new_df], ignore_index=True)
-            adjustment_gaps = detect_adjustment_gaps(
-                merged_df,
-                stock_code=code,
-                list_date=item.get("list_date"),
-                board=item.get("board"),
+            def validate_merge(existing_df, prepared_new_df, merged_df):
+                if self._qfq_anchor_changed(existing_df, prepared_new_df):
+                    return {"qfq_anchor_changed": True}
+                adjustment_gaps = detect_adjustment_gaps(
+                    merged_df,
+                    stock_code=code,
+                    list_date=item.get("list_date"),
+                    board=item.get("board"),
+                )
+                if adjustment_gaps:
+                    return {"adjustment_gap": True, "gaps": adjustment_gaps[:5]}
+                return None
+
+            merge_result = self.csv_manager.merge_stock(
+                code,
+                df,
+                validator=validate_merge,
+                write_guard=write_guard,
             )
-            if adjustment_gaps:
+            rejection = merge_result.get("rejection") or {}
+            if rejection:
                 return {
                     "code": code,
                     "name": name,
                     "ok": False,
                     "fallback_full": True,
-                    "adjustment_gap": True,
-                    "gaps": adjustment_gaps[:5],
+                    **rejection,
                 }
-            self.csv_manager.update_stock(code, df, write_guard=write_guard)
-            refreshed = self._inspect_local_stock(code, latest_trade_date)
+            refreshed = self._inspect_local_stock(code, latest_trade_date, metadata=item)
             refreshed["status"] = "incremental_updated"
             refreshed["reason"] = "incremental_ok"
             return {"code": code, "name": name, "ok": True, "refreshed": refreshed, "rows": len(df)}
@@ -386,8 +388,9 @@ class BaseDataProvider:
         if df is not None and not df.empty:
             if write_guard and not write_guard():
                 return {"code": code, "name": name, "ok": False, "cancelled": True}
+            prepared_df = self.csv_manager._preserve_existing_metrics(existing_df, df)
             adjustment_gaps = detect_adjustment_gaps(
-                df,
+                prepared_df,
                 stock_code=code,
                 list_date=item.get("list_date"),
                 board=item.get("board"),
@@ -401,8 +404,8 @@ class BaseDataProvider:
                     "preserved_existing": bool(existing_df is not None and not existing_df.empty),
                     "gaps": adjustment_gaps[:5],
                 }
-            self.csv_manager.write_stock(code, df, write_guard=write_guard)
-            refreshed = self._inspect_local_stock(code, latest_trade_date)
+            self.csv_manager.write_stock(code, prepared_df, write_guard=write_guard)
+            refreshed = self._inspect_local_stock(code, latest_trade_date, metadata=item)
             refreshed["status"] = "full_refreshed"
             refreshed["reason"] = "full_refresh_ok"
             return {"code": code, "name": name, "ok": True, "refreshed": refreshed, "rows": len(df)}
@@ -512,7 +515,9 @@ class BaseDataProvider:
                     )
         finally:
             cancel_event.set()
-            pool.shutdown(wait=False, cancel_futures=True)
+            # Provider HTTP calls carry socket timeouts. Waiting here prevents
+            # timed-out batch workers from leaking into the next fallback batch.
+            pool.shutdown(wait=True, cancel_futures=True)
         return ok_list, fallback_list
 
     def _sync_full_parallel_batch(
@@ -605,7 +610,7 @@ class BaseDataProvider:
                     )
         finally:
             cancel_event.set()
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=True, cancel_futures=True)
         return ok_list, failed_list
 
     @staticmethod
@@ -733,6 +738,8 @@ class BaseDataProvider:
             return "star"
         if market in {"创业板"}:
             return "chinext"
+        if market in {"北交所", "北京证券交易所"} or metadata.get("exchange") == "BSE":
+            return "beijing"
         if market in {"主板", "中小板"}:
             return "main"
 
@@ -741,6 +748,8 @@ class BaseDataProvider:
             return "star"
         if code.startswith("30"):
             return "chinext"
+        if code.startswith(("43", "83", "87", "88", "92")):
+            return "beijing"
         return "main"
 
     def get_stock_universe(self, max_retries: int = 3) -> List[dict]:
@@ -818,7 +827,7 @@ class BaseDataProvider:
         except Exception:
             return 0
 
-    def _inspect_local_stock(self, stock_code: str, latest_trade_date) -> dict:
+    def _inspect_local_stock(self, stock_code: str, latest_trade_date, metadata: Optional[dict] = None) -> dict:
         path = self.csv_manager.get_stock_path(stock_code)
         latest_trade_date = pd.to_datetime(latest_trade_date).date() if latest_trade_date else None
         result = {
@@ -868,9 +877,15 @@ class BaseDataProvider:
             return result
 
         if result["row_count"] < 60:
-            result["status"] = "full_refresh"
-            result["reason"] = f"too_short:{result['row_count']}"
-            return result
+            list_date = pd.to_datetime((metadata or {}).get("list_date"), errors="coerce")
+            recent_listing = pd.notna(list_date) and latest_trade_date and (
+                latest_trade_date - list_date.date()
+            ).days <= 120
+            if not recent_listing:
+                result["status"] = "full_refresh"
+                result["reason"] = f"too_short:{result['row_count']}"
+                return result
+            result["reason"] = f"recent_listing:{result['row_count']}"
 
         if latest_trade_date and latest_date >= latest_trade_date:
             result["status"] = "up_to_date"
@@ -923,6 +938,13 @@ class BaseDataProvider:
                 for code, info in status_map.items()
             },
         }
+        if len(profiles) > 8:
+            ordered_keys = sorted(
+                profiles,
+                key=lambda key: str((profiles.get(key) or {}).get("updated_at") or ""),
+                reverse=True,
+            )
+            state["profiles"] = {key: profiles[key] for key in ordered_keys[:8]}
         self._save_fetch_state(state)
 
     def _write_provider_state(
@@ -992,7 +1014,7 @@ class BaseDataProvider:
         }
         for item in target_universe:
             code = item["code"]
-            info = self._inspect_local_stock(code, latest_trade_date)
+            info = self._inspect_local_stock(code, latest_trade_date, metadata=item)
             status_map[code] = info
             if info["status"] in summary:
                 summary[info["status"]] += 1
@@ -1118,7 +1140,7 @@ class BaseDataProvider:
 
         for item in target_universe:
             code = item["code"]
-            info = self._inspect_local_stock(code, latest_trade_date)
+            info = self._inspect_local_stock(code, latest_trade_date, metadata=item)
             status_map[code] = info
             if info["status"] == "up_to_date":
                 up_to_date.append(item)

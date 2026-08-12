@@ -129,6 +129,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_daily",
                     full_start="19860101",
                     years_per_window=10,
                     allowed=("trade_date",),
@@ -148,6 +149,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_daily_adj",
                     full_start="19860101",
                     years_per_window=10,
                     allowed=("trade_date",),
@@ -167,6 +169,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_adjfactor",
                     full_start="19860101",
                     years_per_window=10,
                     allowed=("trade_date",),
@@ -178,7 +181,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 dataset_id="hk_income",
                 domain=DOMAIN,
                 method="hk_income",
-                key_fields=("ts_code", "end_date", "ind_name"),
+                key_fields=("ts_code", "end_date", "ind_name", "report_type"),
                 symbol_field="ts_code",
                 date_field="end_date",
                 required=False,
@@ -186,6 +189,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_income",
                     full_start="19900101",
                     years_per_window=15,
                     allowed=("period", "ind_name", "report_type"),
@@ -197,7 +201,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 dataset_id="hk_balancesheet",
                 domain=DOMAIN,
                 method="hk_balancesheet",
-                key_fields=("ts_code", "end_date", "ind_name"),
+                key_fields=("ts_code", "end_date", "ind_name", "report_type"),
                 symbol_field="ts_code",
                 date_field="end_date",
                 required=False,
@@ -205,6 +209,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_balancesheet",
                     full_start="19900101",
                     years_per_window=15,
                     allowed=("period", "ind_name", "report_type"),
@@ -216,7 +221,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 dataset_id="hk_cashflow",
                 domain=DOMAIN,
                 method="hk_cashflow",
-                key_fields=("ts_code", "end_date", "ind_name"),
+                key_fields=("ts_code", "end_date", "ind_name", "report_type"),
                 symbol_field="ts_code",
                 date_field="end_date",
                 required=False,
@@ -224,6 +229,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_cashflow",
                     full_start="19900101",
                     years_per_window=15,
                     allowed=("period", "ind_name", "report_type"),
@@ -243,6 +249,7 @@ def hong_kong_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="hk_basic",
                     source_field="ts_code",
+                    target_dataset="hk_fina_indicator",
                     full_start="19900101",
                     years_per_window=15,
                     allowed=("period", "ind_name", "report_type"),

@@ -77,6 +77,8 @@ def _valid_day(value: Any) -> str:
 
 
 def _all_store_rows(store, dataset: str) -> list[dict[str, Any]]:
+    if hasattr(store, "query_all_rows"):
+        return store.query_all_rows(dataset, max_rows=100_000)
     rows: list[dict[str, Any]] = []
     offset = 0
     while offset < 100_000:
@@ -110,14 +112,23 @@ def _futures_daily_planner(request, state, store):
     today = date.today().strftime("%Y%m%d")
     supplied_start = _valid_day(request.params.get("start_date"))
     supplied_end = _valid_day(request.params.get("end_date"))
-    stored_cursor = _valid_day((state or {}).get("cursor"))
+    resume_cursor = _valid_day((state or {}).get("cursor"))
     pages = []
     for row in sorted(rows, key=lambda item: item["ts_code"]):
         symbol = row["ts_code"]
         list_date = _valid_day(row.get("active_from") or row.get("list_date"))
         delist_date = _valid_day(row.get("active_to") or row.get("delist_date"))
+        symbol_cursor = (
+            _valid_day(store.max_data_date("fut_daily", symbol=symbol))
+            if hasattr(store, "max_data_date")
+            else ""
+        )
         start_date = supplied_start or max(
-            (value for value in (stored_cursor, list_date, "19900101") if value),
+            (
+                value
+                for value in (symbol_cursor, resume_cursor, list_date, "19900101")
+                if value
+            ),
             default="19900101",
         )
         end_date = supplied_end or min(
@@ -148,14 +159,7 @@ def _futures_mapping_planner(request, state, store):
     if requested:
         symbols = (requested,)
     else:
-        rows = []
-        offset = 0
-        while offset < 100_000:
-            page = store.query_rows("fut_basic", limit=2000, offset=offset)
-            rows.extend(page)
-            if len(page) < 2000:
-                break
-            offset += len(page)
+        rows = _all_store_rows(store, "fut_basic")
         symbols = tuple(
             sorted(
                 {
@@ -168,14 +172,24 @@ def _futures_mapping_planner(request, state, store):
         )
     if not symbols:
         raise ValueError("sync planning requires populated fut_basic metadata")
-    start_date = str(request.params.get("start_date") or "19900101")
     end_date = str(request.params.get("end_date") or date.today().strftime("%Y%m%d"))
     return tuple(
         FetchPage(
-            cursor=f"{symbol}:{start_date}-{end_date}",
-            params={"ts_code": symbol, "start_date": start_date, "end_date": end_date},
+            cursor=f"{symbol}:{start}-{end_date}",
+            params={"ts_code": symbol, "start_date": start, "end_date": end_date},
         )
         for symbol in symbols
+        for start in (
+            str(
+                request.params.get("start_date")
+                or (
+                    store.max_data_date("fut_mapping", symbol=symbol)
+                    if hasattr(store, "max_data_date")
+                    else None
+                )
+                or "19900101"
+            ),
+        )
     )
 
 
@@ -440,7 +454,12 @@ class FuturesService:
             }
             for row in rows
         ]
-        return {"symbol": canonical, "candles": candles, "limit": limit, "total": len(candles)}
+        total = (
+            self.store.count_rows("fut_daily", symbol=canonical)
+            if hasattr(self.store, "count_rows")
+            else len(candles)
+        )
+        return {"symbol": canonical, "candles": candles, "limit": limit, "total": total}
 
 
 __all__ = [

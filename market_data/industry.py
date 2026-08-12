@@ -58,7 +58,7 @@ def industry_catalog() -> DatasetCatalog:
                 dataset_id="index_member_all",
                 domain="industry",
                 method="index_member_all",
-                key_fields=("ts_code", "in_date"),
+                key_fields=("index_code", "ts_code", "in_date"),
                 symbol_field="ts_code",
                 date_field="in_date",
                 request_planner=source_partition_planner(
@@ -80,6 +80,7 @@ def industry_catalog() -> DatasetCatalog:
                 request_planner=symbol_calendar_planner(
                     source_dataset="index_classify",
                     source_field="index_code",
+                    target_dataset="sw_daily",
                     full_start="19900101",
                     years_per_window=10,
                     source_filter=lambda row: str(row.get("src") or "").upper() == "SW2021",
@@ -136,8 +137,11 @@ class IndustryService:
 
     def __init__(self, store) -> None:
         self.store = store
+        self._coverage_cache = None
 
     def _all_rows(self, dataset: str, *, symbol: str | None = None) -> list[dict]:
+        if hasattr(self.store, "query_all_rows"):
+            return self.store.query_all_rows(dataset, symbol=symbol, max_rows=20_000)
         rows: list[dict] = []
         offset = 0
         while offset < 20_000:
@@ -157,8 +161,19 @@ class IndustryService:
             )
         return rows
 
-    def _coverage(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        classifications = self._all_rows("index_classify")
+    def _coverage(
+        self,
+        classifications: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        signature = (
+            self.store.storage_signature()
+            if hasattr(self.store, "storage_signature")
+            else None
+        )
+        if self._coverage_cache and self._coverage_cache[0] == signature:
+            coverage, unclassified = self._coverage_cache[1]
+            return dict(coverage), [dict(item) for item in unclassified]
+        classifications = classifications or self._all_rows("index_classify")
         known = {_text(row.get("index_code")) for row in classifications}
         members = _current_members(self._all_rows("index_member_all"))
         by_symbol = {row["ts_code"]: row for row in members}
@@ -184,7 +199,9 @@ class IndustryService:
             "total": total,
             "ratio": round(len(mapped) / total, 6) if total else 0.0,
         }
-        return coverage, unclassified
+        result = (coverage, unclassified)
+        self._coverage_cache = (signature, result)
+        return dict(coverage), [dict(item) for item in unclassified]
 
     def classifications(self, level: str | None = None) -> dict[str, Any]:
         level_key = _text(level).upper()
@@ -203,7 +220,7 @@ class IndustryService:
                 }
             )
         items.sort(key=lambda item: item["industry_id"])
-        coverage, unclassified = self._coverage()
+        coverage, unclassified = self._coverage(rows)
         return {
             "items": items,
             "level": level_key or None,
@@ -259,7 +276,7 @@ class IndustryService:
         )
         candles.reverse()
         candle_state = self._index_candle_state(candles)
-        coverage, unclassified = self._coverage()
+        coverage, unclassified = self._coverage(classifications)
         return {
             "industry": {
                 "industry_id": industry_key,

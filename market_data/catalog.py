@@ -176,6 +176,8 @@ def calendar_window_planner(
 
 
 def _all_store_rows(store, dataset: str) -> list[dict[str, Any]]:
+    if hasattr(store, "query_all_rows"):
+        return store.query_all_rows(dataset, max_rows=100_000)
     rows: list[dict[str, Any]] = []
     offset = 0
     while offset < 100_000:
@@ -238,6 +240,7 @@ def symbol_calendar_planner(
     *,
     source_dataset: str,
     source_field: str,
+    target_dataset: str,
     provider_field: str = "ts_code",
     full_start: str,
     years_per_window: int = 10,
@@ -272,13 +275,6 @@ def symbol_calendar_planner(
             raise ValueError(
                 f"sync planning requires populated {source_dataset} metadata"
             )
-        completed_cursor = (
-            str((state or {}).get("cursor") or "")
-            if (state or {}).get("status") == "completed"
-            else ""
-        )
-        cursor_digits = "".join(character for character in completed_cursor if character.isdigit())
-        start = supplied.get(start_key) or (cursor_digits if len(cursor_digits) == 8 else full_start)
         end = supplied.get(end_key) or date.today().strftime("%Y%m%d")
         base = {
             key: value
@@ -287,6 +283,17 @@ def symbol_calendar_planner(
         }
         pages = []
         for symbol in symbols:
+            symbol_cursor = (
+                store.max_data_date(target_dataset, symbol=symbol)
+                if hasattr(store, "max_data_date")
+                else None
+            )
+            cursor_digits = "".join(
+                character for character in str(symbol_cursor or "") if character.isdigit()
+            )
+            start = supplied.get(start_key) or (
+                cursor_digits if len(cursor_digits) == 8 else full_start
+            )
             pages.extend(
                 _calendar_pages(
                     start=start,

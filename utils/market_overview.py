@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Optional
 import pandas as pd
 
 from utils.atomic_io import atomic_write_json
+from utils.csv_manager import CSVManager
 from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, get_config_value, normalize_market_cap_yuan
 from utils.local_config import load_config_file
 from utils.price_adjustment import repair_adjustment_gaps
@@ -29,6 +30,9 @@ INDEX_TARGETS = [
     {"symbol": "sh000688", "code": "000688", "name": "科创50"},
     {"symbol": "sh000300", "code": "000300", "name": "沪深300"},
 ]
+_LOCAL_STATUS_CACHE_TTL_SECONDS = 60.0
+_LOCAL_STATUS_CACHE = {}
+_LOCAL_STATUS_CACHE_LOCK = Lock()
 
 CNINFO_STANDARD_PRIORITY = [
     "申银万国行业分类标准",
@@ -49,7 +53,7 @@ INDUSTRY_READY_MAX_UNMAPPED = 100
 INDUSTRY_READY_MAX_UNMAPPED_RATIO = 0.02
 INDUSTRY_FETCH_TIMEOUT_SECONDS = 12
 INDUSTRY_FETCH_MAX_SECONDS = 120
-HEATMAP_SCOPES = ("all", "main", "chinext", "star")
+HEATMAP_SCOPES = ("all", "main", "chinext", "star", "beijing")
 HEATMAP_METRICS = ("daily", "weekly", "monthly", "five_day")
 SNAPSHOT_SCHEMA_VERSION = 3
 HEATMAP_PAYLOAD_SCHEMA_VERSION = 3
@@ -79,6 +83,8 @@ def _classify_board(stock_code: str) -> str:
         return "star"
     if code.startswith(("300", "301")):
         return "chinext"
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return "beijing"
     return "main"
 
 
@@ -124,28 +130,30 @@ def _metric_base_close(df: pd.DataFrame, metric: str) -> Optional[float]:
         return _safe_float(valid_df.iloc[1]["close"])
 
     if metric == "five_day":
-        if len(valid_df) < 5:
+        if len(valid_df) < 6:
             return None
-        return _safe_float(valid_df.iloc[4]["close"])
+        return _safe_float(valid_df.iloc[5]["close"])
 
     if metric == "weekly":
         iso = latest_date.isocalendar()
-        scoped = valid_df[
+        previous_period = valid_df[
             (valid_df["date"].dt.isocalendar().year == iso.year)
             & (valid_df["date"].dt.isocalendar().week == iso.week)
         ]
-        if scoped.empty:
+        previous_period = valid_df.drop(previous_period.index)
+        if previous_period.empty:
             return None
-        return _safe_float(scoped.iloc[-1]["close"])
+        return _safe_float(previous_period.iloc[0]["close"])
 
     if metric == "monthly":
-        scoped = valid_df[
+        current_period = valid_df[
             (valid_df["date"].dt.year == latest_date.year)
             & (valid_df["date"].dt.month == latest_date.month)
         ]
-        if scoped.empty:
+        previous_period = valid_df.drop(current_period.index)
+        if previous_period.empty:
             return None
-        return _safe_float(scoped.iloc[-1]["close"])
+        return _safe_float(previous_period.iloc[0]["close"])
 
     return None
 
@@ -316,7 +324,10 @@ def load_heatmap_payload_cache(data_dir: str = "data", scope: str = "all", metri
 
 
 def _stock_csv_files(data_dir: str = "data") -> List[Path]:
-    return sorted(Path(data_dir).glob("[0-9][0-9]/*.csv"))
+    return sorted(
+        path for path in Path(data_dir).glob("[0-9][0-9]/*.csv")
+        if CSVManager.STOCK_CODE_PATTERN.fullmatch(path.stem)
+    )
 
 
 def _load_related_industry_items(data_path: Path, csv_codes: set[str]) -> tuple[Dict[str, str], Dict[str, str]]:
@@ -348,6 +359,12 @@ def _load_related_industry_items(data_path: Path, csv_codes: set[str]) -> tuple[
 
 def _local_stock_data_status(data_dir: str = "data") -> dict:
     data_path = Path(data_dir)
+    cache_key = str(data_path.resolve())
+    now = time.monotonic()
+    with _LOCAL_STATUS_CACHE_LOCK:
+        cached = _LOCAL_STATUS_CACHE.get(cache_key)
+        if cached and now - cached[0] <= _LOCAL_STATUS_CACHE_TTL_SECONDS:
+            return dict(cached[1])
     stock_names = _load_json(data_path / "stock_names.json", {})
     latest_date = None
     readable_count = 0
@@ -356,22 +373,29 @@ def _local_stock_data_status(data_dir: str = "data") -> dict:
         if is_hidden_market_stock(code, stock_names.get(code, "")):
             continue
         try:
-            df = pd.read_csv(csv_path, usecols=["date"], nrows=1)
+            df = pd.read_csv(csv_path, usecols=["date", "open", "high", "low", "close"], nrows=1)
         except Exception:
             continue
         if df.empty:
             continue
         date_value = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
-        if pd.isna(date_value):
+        ohlc = pd.to_numeric(df.iloc[0][["open", "high", "low", "close"]], errors="coerce")
+        if pd.isna(date_value) or ohlc.isna().any() or (ohlc <= 0).any():
             continue
         readable_count += 1
         date_text = date_value.strftime("%Y-%m-%d")
         if latest_date is None or date_text > latest_date:
             latest_date = date_text
-    return {
+    result = {
         "latest_date": latest_date,
         "stock_count": readable_count,
     }
+    with _LOCAL_STATUS_CACHE_LOCK:
+        _LOCAL_STATUS_CACHE[cache_key] = (now, dict(result))
+        if len(_LOCAL_STATUS_CACHE) > 8:
+            oldest_key = min(_LOCAL_STATUS_CACHE, key=lambda key: _LOCAL_STATUS_CACHE[key][0])
+            _LOCAL_STATUS_CACHE.pop(oldest_key, None)
+    return result
 
 
 def snapshot_cache_needs_refresh(data_dir: str = "data") -> bool:
@@ -968,6 +992,8 @@ def _stock_limit_rate(stock: dict) -> Optional[float]:
 
     board = stock.get("board")
     name = _safe_text(stock.get("name")).upper().replace(" ", "")
+    if board == "beijing":
+        return 0.30
     if board in {"chinext", "star"}:
         return 0.20
     if name.startswith("ST") or name.startswith("*ST"):
@@ -1111,7 +1137,7 @@ def _build_heatmap_payload_from_caches(caches: dict, scope: str = "all", metric:
         stock for stock in snapshot.get("stocks", [])
         if not is_hidden_market_stock(stock.get("code"), stock.get("name"))
     ]
-    if scope in {"main", "chinext", "star"}:
+    if scope in {"main", "chinext", "star", "beijing"}:
         stocks = [stock for stock in stocks if stock.get("board") == scope]
 
     groups = _group_stocks_by_industry(stocks, industry_cache.get("items", {}), metric)

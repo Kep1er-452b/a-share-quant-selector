@@ -12,17 +12,23 @@ from market_data.models import DatasetSpec, DatasetSyncResult, FetchPage, SyncRe
 from market_data.tushare_client import classify_provider_error
 
 
+STATE_CHECKPOINT_INTERVAL = 10
+
+
 @dataclass(frozen=True)
 class _WriteOutcome:
     rows_written: int
     cancelled: bool = False
+    skipped_rows: int = 0
+    processed_rows: int = 0
 
 
 class _WriteFailure(RuntimeError):
-    def __init__(self, cause: Exception, rows_written: int):
+    def __init__(self, cause: Exception, rows_written: int, processed_rows: int = 0):
         super().__init__(str(cause) or cause.__class__.__name__)
         self.cause = cause
         self.rows_written = rows_written
+        self.processed_rows = processed_rows
 
 
 @dataclass(frozen=True)
@@ -137,7 +143,7 @@ class SyncEngine:
                 issue = planned.result
                 results[spec.dataset_id] = issue
                 total_written += issue.rows_written
-                if issue.status == "warning":
+                if issue.status in {"warning", "completed_with_warnings"}:
                     warnings.append(issue.warning or "planned dataset warning")
                     continue
                 if planned.terminal_status is not None:
@@ -216,11 +222,14 @@ class SyncEngine:
             except _WriteFailure as exc:
                 total_written += exc.rows_written
                 message = self._message(exc.cause)
+                partial_cursor = self._next_cursor(
+                    spec, rows[: exc.processed_rows], None, state
+                )
                 state_error = self._safe_set_state(
                     spec,
                     request,
                     status="failed",
-                    cursor=(state or {}).get("cursor"),
+                    cursor=partial_cursor,
                     error=message,
                     row_count=exc.rows_written,
                 )
@@ -237,12 +246,25 @@ class SyncEngine:
                 )
 
             total_written += write.rows_written
+            cursor = self._next_cursor(
+                spec,
+                rows[: write.processed_rows],
+                explicit_cursor if write.processed_rows >= len(rows) else None,
+                state,
+            )
+            row_warning = (
+                f"{spec.dataset_id}: skipped {write.skipped_rows} rows with missing key fields"
+                if write.skipped_rows
+                else None
+            )
+            if row_warning:
+                warnings.append(row_warning)
             if write.cancelled or cancel_event.is_set():
                 state_error = self._safe_set_state(
                     spec,
                     request,
                     status="cancelled",
-                    cursor=(state or {}).get("cursor"),
+                    cursor=cursor,
                     row_count=write.rows_written,
                 )
                 status = "failed" if state_error else "cancelled"
@@ -259,7 +281,6 @@ class SyncEngine:
                     emitter, request, status, results, total_written, warnings, message
                 )
 
-            cursor = self._next_cursor(spec, rows, explicit_cursor, state)
             if self.cache_refresher is None:
                 self._emit(
                     emitter,
@@ -293,7 +314,7 @@ class SyncEngine:
                         spec,
                         request,
                         status="failed",
-                        cursor=(state or {}).get("cursor"),
+                        cursor=cursor,
                         error=message,
                         row_count=write.rows_written,
                     )
@@ -320,7 +341,7 @@ class SyncEngine:
                     spec,
                     request,
                     status="cancelled",
-                    cursor=(state or {}).get("cursor"),
+                    cursor=cursor,
                     row_count=write.rows_written,
                 )
                 message = f"sync state write failed: {state_error}" if state_error else None
@@ -338,16 +359,19 @@ class SyncEngine:
                 emitter,
                 request,
                 phase="quality",
-                status="completed",
+                status="warning" if row_warning else "completed",
                 dataset=spec.dataset_id,
                 row_count=write.rows_written,
+                skipped_rows=write.skipped_rows,
+                warning=row_warning,
             )
             state_error = self._safe_set_state(
                 spec,
                 request,
-                status="completed",
+                status="completed_with_warnings" if row_warning else "completed",
                 cursor=cursor,
                 row_count=write.rows_written,
+                warning=row_warning,
             )
             if state_error:
                 message = f"sync state write failed: {state_error}"
@@ -363,9 +387,10 @@ class SyncEngine:
                 )
             results[spec.dataset_id] = DatasetSyncResult(
                 spec.dataset_id,
-                "completed",
+                "completed_with_warnings" if row_warning else "completed",
                 rows_written=write.rows_written,
                 cursor=cursor,
+                warning=row_warning,
             )
 
         if cancel_event.is_set():
@@ -391,7 +416,14 @@ class SyncEngine:
                 raise ValueError(
                     f"sync plan for {spec.dataset_id} exceeds {spec.max_fetch_pages} pages"
                 )
-            pages = tuple(self._fetch_page(item) for item in raw_pages)
+            base_params = self._parameters(spec, request, state)
+            pages = tuple(
+                FetchPage(
+                    cursor=page.cursor,
+                    params={**base_params, **dict(page.params)},
+                )
+                for page in (self._fetch_page(item) for item in raw_pages)
+            )
             if not pages:
                 raise ValueError(f"sync plan for {spec.dataset_id} is empty")
             if any(not page.params for page in pages):
@@ -414,9 +446,13 @@ class SyncEngine:
             )
             if matched is not None:
                 start_index = matched + 1 if resume_complete else matched
+            else:
+                resume_offset = 0
+                resume_complete = False
 
         data_cursor = (state or {}).get("cursor")
         rows_written = 0
+        skipped_rows = 0
         completed_pages = start_index
         last_rows: list[dict[str, Any]] = []
         fetch_calls = 0
@@ -510,6 +546,12 @@ class SyncEngine:
                     write = self._write_rows(spec, rows, cancel_event)
                 except _WriteFailure as exc:
                     rows_written += exc.rows_written
+                    data_cursor = self._next_cursor(
+                        spec,
+                        rows[: exc.processed_rows],
+                        None,
+                        {"cursor": data_cursor},
+                    )
                     return self._planned_failure(
                         spec,
                         request,
@@ -521,6 +563,7 @@ class SyncEngine:
                         offset,
                     )
                 rows_written += write.rows_written
+                skipped_rows += write.skipped_rows
                 data_cursor = self._next_cursor(
                     spec,
                     rows,
@@ -533,19 +576,29 @@ class SyncEngine:
                     or len(rows) < spec.fetch_page_size
                 )
                 next_offset = 0 if page_complete else offset + spec.fetch_page_size
-                state_error = self._safe_set_state(
-                    spec,
-                    request,
-                    status="running",
-                    cursor=data_cursor,
-                    row_count=rows_written,
-                    details={
-                        "method": spec.method,
-                        "plan_cursor": page.cursor,
-                        "page_offset": next_offset,
-                        "page_complete": page_complete and not write.cancelled,
-                    },
+                # Provider pages are idempotent upserts. Persist a precise
+                # checkpoint at slice boundaries and every bounded batch,
+                # avoiding one extra SQLite commit for every remote page.
+                checkpoint_due = (
+                    page_complete
+                    or write.cancelled
+                    or fetch_calls % STATE_CHECKPOINT_INTERVAL == 0
                 )
+                state_error = None
+                if checkpoint_due:
+                    state_error = self._safe_set_state(
+                        spec,
+                        request,
+                        status="running",
+                        cursor=data_cursor,
+                        row_count=rows_written,
+                        details={
+                            "method": spec.method,
+                            "plan_cursor": page.cursor,
+                            "page_offset": next_offset,
+                            "page_complete": page_complete and not write.cancelled,
+                        },
+                    )
                 if state_error:
                     message = f"sync state write failed: {state_error}"
                     return _PlannedOutcome(
@@ -615,16 +668,27 @@ class SyncEngine:
             emitter,
             request,
             phase="quality",
-            status="completed",
+            status="warning" if skipped_rows else "completed",
             dataset=spec.dataset_id,
             row_count=rows_written,
+            skipped_rows=skipped_rows,
+            warning=(
+                f"{spec.dataset_id}: skipped {skipped_rows} rows with missing key fields"
+                if skipped_rows
+                else None
+            ),
         )
         state_error = self._safe_set_state(
             spec,
             request,
-            status="completed",
+            status="completed_with_warnings" if skipped_rows else "completed",
             cursor=data_cursor,
             row_count=rows_written,
+            warning=(
+                f"{spec.dataset_id}: skipped {skipped_rows} rows with missing key fields"
+                if skipped_rows
+                else None
+            ),
             details={"method": spec.method, "completed_plan_pages": completed_pages},
         )
         if state_error:
@@ -642,9 +706,14 @@ class SyncEngine:
         return _PlannedOutcome(
             DatasetSyncResult(
                 spec.dataset_id,
-                "completed",
+                "completed_with_warnings" if skipped_rows else "completed",
                 rows_written=rows_written,
                 cursor=data_cursor,
+                warning=(
+                    f"{spec.dataset_id}: skipped {skipped_rows} rows with missing key fields"
+                    if skipped_rows
+                    else None
+                ),
             )
         )
 
@@ -906,15 +975,31 @@ class SyncEngine:
 
     def _write_rows(self, spec, rows, cancel_event) -> _WriteOutcome:
         written = 0
+        skipped = 0
+        processed = 0
         for start in range(0, len(rows), spec.batch_size):
             if cancel_event.is_set():
-                return _WriteOutcome(written, cancelled=True)
+                return _WriteOutcome(
+                    written, cancelled=True, skipped_rows=skipped, processed_rows=processed
+                )
             batch = rows[start : start + spec.batch_size]
+            valid_batch = []
+            for row in batch:
+                if not isinstance(row, Mapping) or any(
+                    not str(row.get(field) or "").strip()
+                    for field in spec.key_fields
+                ):
+                    skipped += 1
+                    continue
+                valid_batch.append(row)
+            if not valid_batch:
+                processed += len(batch)
+                continue
             try:
                 written += int(
                     self.store.upsert_rows(
                         spec.dataset_id,
-                        batch,
+                        valid_batch,
                         key_fields=spec.key_fields,
                         symbol_field=spec.symbol_field,
                         date_field=spec.date_field,
@@ -922,10 +1007,13 @@ class SyncEngine:
                     or 0
                 )
             except Exception as exc:
-                raise _WriteFailure(exc, written) from exc
+                raise _WriteFailure(exc, written, processed) from exc
+            processed += len(batch)
             if cancel_event.is_set():
-                return _WriteOutcome(written, cancelled=True)
-        return _WriteOutcome(written)
+                return _WriteOutcome(
+                    written, cancelled=True, skipped_rows=skipped, processed_rows=processed
+                )
+        return _WriteOutcome(written, skipped_rows=skipped, processed_rows=processed)
 
     @staticmethod
     def _next_cursor(spec, rows, explicit_cursor, state):

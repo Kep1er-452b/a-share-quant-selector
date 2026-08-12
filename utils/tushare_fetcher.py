@@ -9,16 +9,49 @@ import re
 import tempfile
 import time
 import urllib.request
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from threading import Lock
 
 import numpy as np
 import pandas as pd
+import requests
 
 from utils.data_provider import BaseDataProvider, DataProviderError
+
+
+class _DirectTushareApi:
+    """Minimal DataApi-compatible client using an isolated direct session."""
+
+    def __init__(self, token, timeout=30):
+        self.token = token
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.trust_env = False
+
+    def query(self, api_name, fields="", **kwargs):
+        payload = {
+            "api_name": api_name,
+            "token": self.token,
+            "params": kwargs,
+            "fields": fields,
+        }
+        response = self.session.post("https://api.tushare.pro", json=payload, timeout=self.timeout)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") != 0:
+            raise RuntimeError(str(result.get("msg") or "Tushare API error"))
+        data = result.get("data") or {}
+        return pd.DataFrame(data.get("items") or [], columns=data.get("fields") or [])
+
+    def __getattr__(self, api_name):
+        return partial(self.query, api_name)
+
+    def close(self):
+        self.session.close()
 
 
 class TushareProviderError(DataProviderError):
@@ -78,7 +111,15 @@ class TushareFetcher(BaseDataProvider):
             raise DataProviderError("未安装 tushare，请先执行 `pip install -r requirements.txt`。") from exc
 
         self.ts = ts
-        self.pro = self.ts.pro_api(self.token)
+        self.request_timeout = max(5, min(int(tushare_config.get("request_timeout", 30)), 120))
+        try:
+            self.pro = self.ts.pro_api(self.token, timeout=self.request_timeout)
+        except TypeError:
+            self.pro = self.ts.pro_api(self.token)
+            try:
+                setattr(self.pro, "_DataApi__timeout", self.request_timeout)
+            except Exception:
+                pass
         self.stock_meta_file = Path(data_dir) / "tushare_stock_map.json"
         self.stock_meta_refresh_file = Path(data_dir) / "tushare_stock_map_state.json"
         self.daily_basic_calls = deque()
@@ -94,6 +135,7 @@ class TushareFetcher(BaseDataProvider):
         self._sync_max_workers = min(self._sync_max_workers, int(tushare_config.get("max_workers", 8)))
         self.proxy_fallback_lock = Lock()
         self._prefer_direct_network = False
+        self._direct_api = None
         self.daily_basic_cache_lock = Lock()
         self.daily_basic_by_date_cache = {}
         self.daily_basic_by_date_failures = set()
@@ -107,7 +149,7 @@ class TushareFetcher(BaseDataProvider):
         self.trade_calendar_cache_file = Path(data_dir) / "trade_calendar_cache.json"
         self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
         self.trade_calendar_cache = {}
-        self.trade_calendar_range_cache = {}
+        self.trade_calendar_range_cache = OrderedDict()
         self._trade_calendar_warning_emitted = False
         self._api_stats = Counter()
         self._diagnostic_lock = Lock()
@@ -211,24 +253,22 @@ class TushareFetcher(BaseDataProvider):
 
     def _call_without_proxy(self, func, *args, **kwargs):
         with self.proxy_fallback_lock:
-            proxy_keys = (
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                "http_proxy", "https_proxy", "all_proxy",
-                "NO_PROXY", "no_proxy",
-            )
-            previous = {key: os.environ.get(key) for key in proxy_keys}
-            for key in proxy_keys:
-                os.environ.pop(key, None)
-            os.environ["NO_PROXY"] = "*"
-            os.environ["no_proxy"] = "*"
-            try:
-                return func(*args, **kwargs)
-            finally:
-                for key, value in previous.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
+            if self._direct_api is None:
+                timeout = getattr(self.pro, "_DataApi__timeout", 30)
+                self._direct_api = _DirectTushareApi(self.token, timeout=timeout)
+
+            bound_query = getattr(func, "func", None)
+            query_owner = getattr(bound_query, "__self__", None)
+            query_args = getattr(func, "args", ())
+            if query_owner is self.pro and query_args and isinstance(query_args[0], str):
+                return self._direct_api.query(query_args[0], *args, **kwargs)
+
+            if getattr(func, "__name__", "") == "pro_bar":
+                direct_kwargs = dict(kwargs)
+                direct_kwargs["api"] = self._direct_api
+                return func(*args, **direct_kwargs)
+
+            raise DataProviderError("该 Tushare 调用不支持安全的直连回退")
 
     def _call_with_proxy_fallback(self, func, *args, retry_on_none=False, **kwargs):
         if self._prefer_direct_network:
@@ -468,7 +508,9 @@ class TushareFetcher(BaseDataProvider):
         if stock_code in metadata and metadata[stock_code].get("ts_code"):
             return metadata[stock_code]["ts_code"]
 
-        if stock_code.startswith(("60", "68", "88")):
+        if stock_code.startswith(("43", "83", "87", "88", "92")):
+            return f"{stock_code}.BJ"
+        if stock_code.startswith(("60", "68")):
             return f"{stock_code}.SH"
         return f"{stock_code}.SZ"
 
@@ -515,6 +557,7 @@ class TushareFetcher(BaseDataProvider):
 
         cache_key = (start.isoformat(), end.isoformat())
         if cache_key in self.trade_calendar_range_cache:
+            self.trade_calendar_range_cache.move_to_end(cache_key)
             return self.trade_calendar_range_cache[cache_key]
 
         try:
@@ -529,30 +572,36 @@ class TushareFetcher(BaseDataProvider):
             if df is not None and not df.empty and {"cal_date", "is_open"}.issubset(df.columns):
                 open_days = df[df["is_open"].astype(int) == 1]["cal_date"]
                 trade_dates = list(pd.to_datetime(open_days).dt.date)
-                self.trade_calendar_range_cache[cache_key] = trade_dates
+                self._cache_trade_date_range(cache_key, trade_dates)
                 return trade_dates
         except TushareProviderError:
             raise
         except Exception as e:
             cached_trade_dates = self._get_cached_trade_dates_between(start, end)
             if cached_trade_dates:
-                self.trade_calendar_range_cache[cache_key] = cached_trade_dates
+                self._cache_trade_date_range(cache_key, cached_trade_dates)
                 self._warn_trade_calendar_fallback(str(e), used_cache=True)
                 return cached_trade_dates
 
             trade_dates = super().get_trade_dates_between(start, end)
-            self.trade_calendar_range_cache[cache_key] = trade_dates
+            self._cache_trade_date_range(cache_key, trade_dates)
             self._warn_trade_calendar_fallback(str(e), used_cache=False)
             return trade_dates
 
         cached_trade_dates = self._get_cached_trade_dates_between(start, end)
         if cached_trade_dates:
-            self.trade_calendar_range_cache[cache_key] = cached_trade_dates
+            self._cache_trade_date_range(cache_key, cached_trade_dates)
             return cached_trade_dates
 
         trade_dates = super().get_trade_dates_between(start, end)
-        self.trade_calendar_range_cache[cache_key] = trade_dates
+        self._cache_trade_date_range(cache_key, trade_dates)
         return trade_dates
+
+    def _cache_trade_date_range(self, cache_key, trade_dates):
+        self.trade_calendar_range_cache[cache_key] = trade_dates
+        self.trade_calendar_range_cache.move_to_end(cache_key)
+        while len(self.trade_calendar_range_cache) > 64:
+            self.trade_calendar_range_cache.popitem(last=False)
 
     def _resolve_update_start_date(self, days: int, end_date):
         """
@@ -645,8 +694,6 @@ class TushareFetcher(BaseDataProvider):
                     wait_seconds = self.pro_bar_rate_limit_wait
                     print(f"  daily/adj_factor 命中限流，等待 {wait_seconds} 秒后重试...")
                     time.sleep(wait_seconds)
-                    with self.pro_bar_lock:
-                        self.pro_bar_calls.clear()
                     continue
                 if attempt < 3:
                     with self._diagnostic_lock:
@@ -679,7 +726,6 @@ class TushareFetcher(BaseDataProvider):
                     wait_seconds = self.daily_basic_rate_limit_wait
                     print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
                     time.sleep(wait_seconds)
-                    self.daily_basic_calls.clear()
                     continue
                 if attempt < 3:
                     with self._diagnostic_lock:
@@ -696,6 +742,9 @@ class TushareFetcher(BaseDataProvider):
     def _fetch_daily_basic_trade_date(self, trade_date):
         date_key = self._trade_date_key(trade_date)
         with self.daily_basic_cache_lock:
+            if date_key in self.daily_basic_by_date_failures:
+                self.daily_basic_cache_hits += 1
+                return pd.DataFrame()
             if date_key in self.daily_basic_by_date_cache:
                 self.daily_basic_cache_hits += 1
                 return self.daily_basic_by_date_cache[date_key].copy()
@@ -713,7 +762,8 @@ class TushareFetcher(BaseDataProvider):
                 owns_request = False
 
         if not owns_request:
-            return inflight.result().copy()
+            wait_timeout = max(float(getattr(self, "request_timeout", 30)), 1) * 5
+            return inflight.result(timeout=wait_timeout).copy()
 
         last_error = None
         try:
@@ -727,6 +777,10 @@ class TushareFetcher(BaseDataProvider):
                         df = pd.DataFrame()
                     with self.daily_basic_cache_lock:
                         self.daily_basic_by_date_cache[date_key] = df.copy()
+                        cache_limit = max(getattr(self, "daily_basic_date_cache_max_days", 40), 1)
+                        while len(self.daily_basic_by_date_cache) > cache_limit:
+                            oldest_key = min(self.daily_basic_by_date_cache)
+                            self.daily_basic_by_date_cache.pop(oldest_key, None)
                     inflight.set_result(df.copy())
                     return df
                 except TushareProviderError as exc:
@@ -738,18 +792,25 @@ class TushareFetcher(BaseDataProvider):
                         wait_seconds = self.daily_basic_rate_limit_wait
                         print(f"  daily_basic 命中限流，等待 {wait_seconds} 秒后重试...")
                         time.sleep(wait_seconds)
-                        self.daily_basic_calls.clear()
                         continue
                     if attempt < 3:
                         time.sleep(0.5 * (attempt + 1))
 
             with self.daily_basic_cache_lock:
                 self.daily_basic_by_date_failures.add(date_key)
+                cache_limit = max(getattr(self, "daily_basic_date_cache_max_days", 40), 1)
+                if len(self.daily_basic_by_date_failures) > cache_limit:
+                    oldest_key = min(self.daily_basic_by_date_failures)
+                    self.daily_basic_by_date_failures.discard(oldest_key)
             if last_error is not None:
                 print(f"  获取 {date_key} daily_basic 失败: {last_error}")
             empty = pd.DataFrame()
             inflight.set_result(empty)
             return empty
+        except Exception as exc:
+            if not inflight.done():
+                inflight.set_exception(exc)
+            raise
         finally:
             with self.daily_basic_cache_lock:
                 self.daily_basic_inflight.pop(date_key, None)
@@ -1186,7 +1247,7 @@ class TushareFetcher(BaseDataProvider):
         前复权，按日期倒序排列
         """
         ts_code = self._to_ts_code(stock_code)
-        end_date = datetime.now()
+        end_date = pd.Timestamp(self.get_latest_trade_date() or datetime.now().date())
         start_date = end_date - timedelta(days=365 * years)
         start_str = start_date.strftime("%Y%m%d")
         end_str = end_date.strftime("%Y%m%d")

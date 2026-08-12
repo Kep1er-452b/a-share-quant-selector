@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -18,21 +19,23 @@ class TushareExtStore:
         path = Path(base_path)
         self.db_path = path if path.suffix else path / "tushare_ext.sqlite"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._ensure_schema()
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        try:
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            self._local.connection = conn
+        try:
             yield conn
-            conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
 
     def _ensure_schema(self) -> None:
         with self.connect() as conn:
@@ -45,6 +48,7 @@ class TushareExtStore:
                     ts_code TEXT,
                     trade_date TEXT,
                     payload_json TEXT NOT NULL,
+                    payload_hash TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (dataset, row_key)
                 );
@@ -65,8 +69,20 @@ class TushareExtStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (dataset, scope)
                 );
+
+                CREATE TABLE IF NOT EXISTS ext_dataset_revision (
+                    dataset TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (dataset, trade_date)
+                );
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(ext_dataset_rows)")}
+            if "payload_hash" not in columns:
+                conn.execute("ALTER TABLE ext_dataset_rows ADD COLUMN payload_hash TEXT")
+            conn.commit()
 
     @staticmethod
     def _now() -> str:
@@ -97,16 +113,21 @@ class TushareExtStore:
         updated_at = self._now()
         for row in rows or []:
             payload = dict(row)
-            row_key = "|".join(self._normalize_value(payload.get(field)) for field in key_fields)
-            if not row_key.strip("|"):
+            key_values = [self._normalize_value(payload.get(field)) for field in key_fields]
+            if not any(key_values):
                 continue
+            row_key = hashlib.sha256(
+                json.dumps(key_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
             prepared.append(
                 (
                     dataset,
                     row_key,
                     self._normalize_value(payload.get(ts_code_field)) or None,
                     self._normalize_value(payload.get(trade_date_field)) or None,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                    payload_json,
+                    hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
                     updated_at,
                 )
             )
@@ -117,16 +138,29 @@ class TushareExtStore:
             conn.executemany(
                 """
                 INSERT INTO ext_dataset_rows
-                    (dataset, row_key, ts_code, trade_date, payload_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (dataset, row_key, ts_code, trade_date, payload_json, payload_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dataset, row_key) DO UPDATE SET
                     ts_code = excluded.ts_code,
                     trade_date = excluded.trade_date,
                     payload_json = excluded.payload_json,
+                    payload_hash = excluded.payload_hash,
                     updated_at = excluded.updated_at
                 """,
                 prepared,
             )
+            revision_dates = sorted({str(item[3] or "") for item in prepared})
+            conn.executemany(
+                """
+                INSERT INTO ext_dataset_revision(dataset, trade_date, revision, updated_at)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(dataset, trade_date) DO UPDATE SET
+                    revision = ext_dataset_revision.revision + 1,
+                    updated_at = excluded.updated_at
+                """,
+                ((dataset, trade_date, updated_at) for trade_date in revision_dates),
+            )
+            conn.commit()
         return len(prepared)
 
     def query_rows(
@@ -162,14 +196,21 @@ class TushareExtStore:
             return [json.loads(row["payload_json"]) for row in conn.execute(sql, params)]
 
     def get_row(self, dataset: str, row_key: str) -> dict | None:
+        candidate_keys = [str(row_key)]
+        key_values = str(row_key).split("|")
+        candidate_keys.append(hashlib.sha256(
+            json.dumps(key_values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest())
+        placeholders = ",".join("?" for _ in candidate_keys)
         with self.connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT payload_json
                 FROM ext_dataset_rows
-                WHERE dataset = ? AND row_key = ?
+                WHERE dataset = ? AND row_key IN ({placeholders})
+                LIMIT 1
                 """,
-                (dataset, row_key),
+                (dataset, *candidate_keys),
             ).fetchone()
         return json.loads(row["payload_json"]) if row else None
 
@@ -210,10 +251,15 @@ class TushareExtStore:
         dataset_placeholders = ",".join("?" for _ in selected_datasets)
         date_placeholders = ",".join("?" for _ in selected_dates)
         sql = (
-            "SELECT dataset, row_key, trade_date, updated_at, payload_json "
-            "FROM ext_dataset_rows "
-            f"WHERE dataset IN ({dataset_placeholders}) AND trade_date IN ({date_placeholders}) "
-            "ORDER BY dataset, trade_date, row_key"
+            "SELECT rows.dataset, rows.trade_date, COUNT(*) AS row_count, "
+            "MAX(rows.updated_at) AS latest_update, MAX(rows.row_key) AS max_row_key, "
+            "COALESCE(MAX(revisions.revision), 0) AS revision "
+            "FROM ext_dataset_rows AS rows "
+            "LEFT JOIN ext_dataset_revision AS revisions "
+            "ON revisions.dataset = rows.dataset AND revisions.trade_date = rows.trade_date "
+            f"WHERE rows.dataset IN ({dataset_placeholders}) "
+            f"AND rows.trade_date IN ({date_placeholders}) "
+            "GROUP BY rows.dataset, rows.trade_date ORDER BY rows.dataset, rows.trade_date"
         )
         params = [*selected_datasets, *selected_dates]
         with self.connect() as conn:
@@ -223,11 +269,13 @@ class TushareExtStore:
             digest.update(b"\0")
             digest.update(str(row["trade_date"]).encode("utf-8"))
             digest.update(b"\0")
-            digest.update(str(row["row_key"]).encode("utf-8"))
+            digest.update(str(row["row_count"]).encode("utf-8"))
             digest.update(b"\0")
-            digest.update(str(row["updated_at"]).encode("utf-8"))
+            digest.update(str(row["latest_update"] or "").encode("utf-8"))
             digest.update(b"\0")
-            digest.update(str(row["payload_json"]).encode("utf-8"))
+            digest.update(str(row["max_row_key"] or "").encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(row["revision"] or 0).encode("utf-8"))
             digest.update(b"\n")
         return digest.hexdigest()
 
@@ -270,15 +318,19 @@ class TushareExtStore:
                     self._now(),
                 ),
             )
+            conn.commit()
 
-    def list_warnings(self) -> list[dict]:
+    def list_warnings(self, *, limit: int = 20, max_age_days: int = 30) -> list[dict]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT dataset, scope, status, start_date, end_date, warning
                 FROM ext_sync_state
                 WHERE warning IS NOT NULL AND warning != ''
-                ORDER BY dataset, scope
-                """
+                  AND updated_at >= datetime('now', ?)
+                ORDER BY updated_at DESC, dataset, scope
+                LIMIT ?
+                """,
+                (f"-{max(int(max_age_days), 1)} days", max(int(limit), 1)),
             ).fetchall()
         return [dict(row) for row in rows]

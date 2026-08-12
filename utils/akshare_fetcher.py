@@ -3,6 +3,7 @@ A股数据抓取模块 - 使用 akshare / 直接HTTP请求
 """
 import akshare as ak
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import time
 import sys
@@ -18,18 +19,13 @@ from threading import Lock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.csv_manager import CSVManager
 from utils.atomic_io import atomic_write_json
-from utils.data_provider import BaseDataProvider, DataProviderError, normalize_market_cap_yuan
-
-# 设置请求会话
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/javascript, */*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Referer': 'https://quote.eastmoney.com/',
-    'Connection': 'keep-alive',
-})
-
+from utils.data_provider import (
+    BaseDataProvider,
+    DataProviderError,
+    MAX_REASONABLE_MARKET_CAP_YUAN,
+    MIN_REASONABLE_MARKET_CAP_YUAN,
+    normalize_market_cap_yuan,
+)
 
 # 备选A股股票列表（当网络获取失败时使用）
 DEFAULT_STOCK_LIST = {
@@ -204,6 +200,41 @@ class AKShareFetcher(BaseDataProvider):
         self._akshare_direct_route = "unknown"
         self._akshare_primary_lock = Lock()
         self._akshare_primary_route = "unknown"
+        self._http_session_lock = Lock()
+        self._http_sessions = {}
+
+    def _http_session(self, trust_env=True):
+        """Reuse connection pools without sharing proxy policy between routes."""
+        key = bool(trust_env)
+        with self._http_session_lock:
+            request_session = self._http_sessions.get(key)
+            if request_session is None:
+                request_session = requests.Session()
+                request_session.trust_env = key
+                default_headers = {
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ),
+                    'Accept': 'application/json, text/javascript, */*',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'Referer': 'https://quote.eastmoney.com/',
+                    'Connection': 'keep-alive',
+                }
+                session_headers = getattr(request_session, 'headers', None)
+                if session_headers is not None:
+                    session_headers.update(default_headers)
+                self._http_sessions[key] = request_session
+            return request_session
+
+    def close(self):
+        with self._http_session_lock:
+            sessions = list(self._http_sessions.values())
+            self._http_sessions.clear()
+        for request_session in sessions:
+            close_session = getattr(request_session, 'close', None)
+            if callable(close_session):
+                close_session()
 
     @staticmethod
     def _coerce_number(value, default, cast=float):
@@ -347,8 +378,7 @@ class AKShareFetcher(BaseDataProvider):
             for mode, trust_env in attempts:
                 if self._is_tencent_quote_url(url):
                     self._wait_for_tencent_request_slot()
-                request_session = requests.Session()
-                request_session.trust_env = trust_env
+                request_session = self._http_session(trust_env=trust_env)
                 try:
                     response = request_session.get(
                         url,
@@ -375,10 +405,6 @@ class AKShareFetcher(BaseDataProvider):
                 except requests.RequestException as exc:
                     last_error = exc
                     self._note_runtime_stat(f"http_{mode}_error")
-                finally:
-                    close_session = getattr(request_session, "close", None)
-                    if callable(close_session):
-                        close_session()
             if attempt + 1 < max(self.network_retries, 1):
                 time.sleep(min(0.5 * (attempt + 1), 2.0))
         raise last_error
@@ -389,7 +415,7 @@ class AKShareFetcher(BaseDataProvider):
             try:
                 with open(self.stock_names_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
         return {}
     
@@ -437,7 +463,7 @@ class AKShareFetcher(BaseDataProvider):
                                 cap = normalize_market_cap_yuan(parts[44], source_unit="hundred_million")
                                 if cap:
                                     market_cap_map[code] = cap
-                        except:
+                        except Exception:
                             continue
                 
                 if i % 500 == 0 and i > 0:
@@ -452,7 +478,7 @@ class AKShareFetcher(BaseDataProvider):
     @staticmethod
     def _filter_a_share_stock_dict(stocks):
         filtered = {}
-        code_pattern = re.compile(r'^(00|30|60|68|88)\d{4}$')
+        code_pattern = re.compile(r'^(00|30|43|60|68|83|87|88|92)\d{4}$')
         exclude_keywords = ['债', '基', 'ETF', 'LOF', '基金', '理财', '信托', 'B股', '指数', '国债', '企债', '转债', '回购', 'R-', 'GC']
         for code, name in (stocks or {}).items():
             code_text = str(code).zfill(6)
@@ -505,13 +531,29 @@ class AKShareFetcher(BaseDataProvider):
 
         try:
             spot_df = ak.stock_zh_a_spot_em()
-            for _, row in spot_df.iterrows():
-                code = str(row['代码']).zfill(6)
-                if code not in stock_codes:
-                    continue
-                cap = normalize_market_cap_yuan(row['总市值'], source_unit="auto")
-                if cap:
-                    market_cap_map[code] = cap
+            requested = set(stock_codes)
+            codes = spot_df['代码'].astype(str).str.zfill(6)
+            caps = pd.to_numeric(spot_df['总市值'], errors='coerce')
+            scoped = pd.DataFrame({'code': codes, 'cap': caps})
+            scoped = scoped[scoped['code'].isin(requested) & scoped['cap'].gt(0)]
+            oversized = scoped['cap'] > MAX_REASONABLE_MARKET_CAP_YUAN
+            repaired = scoped['cap'] / 1e8
+            scoped.loc[
+                oversized & repaired.between(
+                    MIN_REASONABLE_MARKET_CAP_YUAN,
+                    MAX_REASONABLE_MARKET_CAP_YUAN,
+                ),
+                'cap',
+            ] = repaired
+            scoped = scoped[
+                scoped['cap'].between(
+                    MIN_REASONABLE_MARKET_CAP_YUAN,
+                    MAX_REASONABLE_MARKET_CAP_YUAN,
+                )
+            ]
+            market_cap_map.update(
+                zip(scoped['code'], scoped['cap'].round().astype(int))
+            )
             if market_cap_map:
                 return market_cap_map
         except Exception as e:
@@ -649,7 +691,7 @@ class AKShareFetcher(BaseDataProvider):
                                         current_price = float(parts[3]) if len(parts) > 3 else 0
                                         if current_price <= 0:
                                             is_valid = False
-                                    except:
+                                    except (TypeError, ValueError):
                                         is_valid = False
                                     
                                     # 5. 成交量异常过滤 - 长期无成交量的股票
@@ -657,7 +699,7 @@ class AKShareFetcher(BaseDataProvider):
                                         volume = float(parts[6]) if len(parts) > 6 else 0
                                         if volume <= 0:
                                             is_valid = False
-                                    except:
+                                    except (TypeError, ValueError):
                                         pass
                                     
                                     if is_valid:
@@ -849,8 +891,8 @@ class AKShareFetcher(BaseDataProvider):
                         if '亿' in total_cap:
                             return normalize_market_cap_yuan(total_cap.replace('亿', ''), source_unit="hundred_million")
                         else:
-                            return normalize_market_cap_yuan(total_cap, source_unit="auto")
-                    return normalize_market_cap_yuan(total_cap, source_unit="auto")
+                            return normalize_market_cap_yuan(total_cap, source_unit="yuan")
+                    return normalize_market_cap_yuan(total_cap, source_unit="yuan")
         except Exception as e:
             print(f"  获取总市值失败: {e}")
         return None
@@ -951,6 +993,8 @@ class AKShareFetcher(BaseDataProvider):
         df = df[required]
         df['market_cap'] = 0
         df['date'] = pd.to_datetime(df['date'])
+        completed_date = pd.Timestamp(self.get_latest_trade_date())
+        df = df[df['date'].dt.normalize() <= completed_date.normalize()]
         df = df.sort_values('date', ascending=False)
         return self._mark_data_source(df, source)
 
@@ -968,8 +1012,7 @@ class AKShareFetcher(BaseDataProvider):
             "beg": start_date,
             "end": end_date,
         }
-        direct_session = requests.Session()
-        direct_session.trust_env = False
+        direct_session = self._http_session(trust_env=False)
         response = direct_session.get(url, params=params, timeout=self.akshare_direct_retry_timeout)
         response.raise_for_status()
         payload = response.json()
@@ -997,6 +1040,8 @@ class AKShareFetcher(BaseDataProvider):
         for column in ["open", "close", "high", "low", "volume", "amount", "turnover"]:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.dropna(subset=["date", "open", "close", "high", "low"])
+        completed_date = pd.Timestamp(self.get_latest_trade_date())
+        frame = frame[frame["date"].dt.normalize() <= completed_date.normalize()]
         if frame.empty:
             return None
         frame["market_cap"] = 0
@@ -1149,7 +1194,6 @@ class AKShareFetcher(BaseDataProvider):
         print("  ✗ 真实历史数据不可用，已拒绝写入模拟行情")
         self._note_runtime_stat('history_fetch_failed')
         return None
-    
     def _fetch_stock_update_http(self, stock_code, days=10, source='tencent:fqkline:update'):
         """
         使用腾讯 HTTP 抓取近期数据。TencentFetcher 会显式调用该路径。
@@ -1210,6 +1254,8 @@ class AKShareFetcher(BaseDataProvider):
                     df['amount'] = np.nan
                     df['turnover'] = np.nan
                     df['market_cap'] = np.nan
+                    completed_date = pd.Timestamp(self.get_latest_trade_date())
+                    df = df[df['date'].dt.normalize() <= completed_date.normalize()]
                     df = df.sort_values('date', ascending=False)
                     return self._mark_data_source(df, source)
             
@@ -1284,279 +1330,3 @@ class AKShareFetcher(BaseDataProvider):
             return fallback_df
         self._note_runtime_stat('update_fetch_failed')
         return None
-    
-    def init_full_data(self, max_stocks=None, skip_failed=True):
-        """
-        首次全量抓取
-        :param max_stocks: 限制抓取数量（用于测试）
-        :param skip_failed: 是否跳过之前失败的股票
-        """
-        import akshare as ak
-        
-        stock_dict = self.get_all_stock_codes()
-        
-        if not stock_dict:
-            print("无法获取股票列表")
-            return
-        
-        stock_codes = list(stock_dict.keys())
-        
-        # 加载之前失败的股票列表
-        failed_stocks_file = self.full_data_dir / 'failed_stocks.json'
-        failed_stocks = set()
-        if skip_failed and failed_stocks_file.exists():
-            try:
-                with open(failed_stocks_file, 'r', encoding='utf-8') as f:
-                    failed_stocks = set(json.load(f))
-                print(f"  将跳过 {len(failed_stocks)} 只之前获取失败的股票")
-                # 从列表中移除失败的股票
-                stock_codes = [c for c in stock_codes if c not in failed_stocks]
-            except:
-                pass
-        
-        if max_stocks:
-            stock_codes = stock_codes[:max_stocks]
-        
-        # 批量获取市值数据（主接口：akshare，备选：腾讯）
-        print("\n正在批量获取市值数据...")
-        market_cap_map = {}
-        
-        # 方法1: 尝试akshare接口
-        try:
-            spot_df = ak.stock_zh_a_spot_em()
-            for _, row in spot_df.iterrows():
-                code = str(row['代码']).zfill(6)
-                cap = normalize_market_cap_yuan(row['总市值'], source_unit="auto")
-                if cap:
-                    market_cap_map[code] = cap
-            print(f"  ✓ akshare接口成功: {len(market_cap_map)} 只股票市值")
-        except Exception as e:
-            print(f"  akshare接口失败: {e}")
-            print("  尝试腾讯备选接口...")
-            # 方法2: 使用腾讯接口备选
-            market_cap_map = self._fetch_market_cap_tencent(stock_codes)
-            if market_cap_map:
-                print(f"  ✓ 腾讯接口成功: {len(market_cap_map)} 只股票市值")
-            else:
-                print(f"  ✗ 腾讯接口也失败，市值数据将缺失")
-        
-        total = len(stock_codes)
-        success = 0
-        failed = 0
-        failed_list = []
-        
-        print(f"\n开始抓取 {total} 只股票的6年历史数据...")
-        print("=" * 60)
-        
-        for i, code in enumerate(stock_codes, 1):
-            print(f"[{i}/{total}] 抓取 {code} {stock_dict.get(code, '')} ...", end=" ")
-            
-            df = self.fetch_stock_history(code, years=6)
-            
-            if df is not None and not df.empty:
-                # 数据校验 - 检查是否有有效价格数据
-                valid_data = True
-                if len(df) < 10:  # 数据太少，可能是新股或数据异常
-                    print(f"⚠ 数据太少({len(df)}条)")
-                    valid_data = False
-                    failed_list.append(code)
-                elif df['close'].mean() <= 0:  # 价格异常
-                    print(f"⚠ 价格异常")
-                    valid_data = False
-                    failed_list.append(code)
-                else:
-                    # 使用批量获取的市值数据
-                    if code in market_cap_map:
-                        df['market_cap'] = market_cap_map[code]
-                    self.csv_manager.write_stock(code, df)
-                    print(f"✓ ({len(df)}条)")
-                    success += 1
-            else:
-                print("✗ 失败")
-                failed += 1
-                failed_list.append(code)
-            
-            # 限速，避免请求过快
-            if i % 10 == 0:
-                time.sleep(1)
-        
-        # 保存失败的股票列表
-        if failed_list:
-            try:
-                with open(failed_stocks_file, 'w', encoding='utf-8') as f:
-                    json.dump(failed_list, f)
-                print(f"\n  已保存 {len(failed_list)} 只获取失败的股票到 failed_stocks.json")
-            except Exception as e:
-                print(f"\n  保存失败列表出错: {e}")
-        
-        print("=" * 60)
-        print(f"完成! 成功: {success}, 失败: {failed + len(failed_list)}")
-        if failed_list and not max_stocks:
-            print(f"提示: 再次运行 init 命令可跳过失败股票，专注于成功获取的数据")
-    
-    def daily_update(self, max_stocks=None):
-        """
-        每日增量更新 - 只获取实际需要的天数
-        优化：使用快速缓存机制，避免重复读取已更新的股票
-        修复：盘中执行时不会将盘中数据误存为收盘数据
-        """
-        from datetime import datetime
-        
-        existing_stocks = self.csv_manager.list_all_stocks()
-        
-        if not existing_stocks:
-            print("没有找到已有数据，请先执行 init")
-            return
-        
-        if max_stocks:
-            existing_stocks = existing_stocks[:max_stocks]
-        
-        total = len(existing_stocks)
-        updated = 0
-        failed = 0
-        skipped = 0
-        
-        print(f"\n开始更新 {total} 只股票的数据...")
-        print("=" * 60)
-        
-        today = datetime.now().date()
-        today_str = today.strftime('%Y-%m-%d')
-        current_time = datetime.now().time()
-        
-        # 判断是否在收盘后（15:00 之后）
-        # A股收盘时间：工作日 15:00
-        market_close_time = datetime.strptime("15:00", "%H:%M").time()
-        is_after_market_close = current_time >= market_close_time
-        
-        if not is_after_market_close and not max_stocks:
-            print(f"⚠️ 当前时间 {current_time.strftime('%H:%M')}，尚未收盘 (15:00)")
-            print("  盘中数据不是收盘价，建议收盘后再执行 update")
-            print("  如需强制更新，请使用 --max-stocks 参数")
-            print("=" * 60)
-            return
-        
-        # 快速缓存：检查上次更新记录
-        update_cache_file = self.full_data_dir / '.update_cache.json'
-        update_cache = {}
-        if update_cache_file.exists():
-            try:
-                with open(update_cache_file, 'r', encoding='utf-8') as f:
-                    update_cache = json.load(f)
-            except:
-                update_cache = {}
-        
-        # 如果今天已经更新过（且已收盘），直接跳过
-        cache_date = update_cache.get('last_update_date')
-        if cache_date == today_str and not max_stocks:
-            print(f"✓ 数据已于 {cache_date} 收盘后更新过，无需重复更新")
-            print("=" * 60)
-            return
-        
-        # 预筛选：快速检查哪些股票需要更新（只读取第一行）
-        stocks_to_update = []
-        print("  正在检查股票更新状态...")
-        
-        for code in existing_stocks:
-            # 快速读取：只读CSV第一行（最新日期）
-            path = self.csv_manager.get_stock_path(code)
-            if not path.exists():
-                stocks_to_update.append((code, 30))  # 默认取30天
-                continue
-            
-            try:
-                # 只读取第一行（header + 第一行数据）
-                df_quick = pd.read_csv(path, nrows=1)
-                if df_quick.empty:
-                    stocks_to_update.append((code, 30))
-                    continue
-                
-                latest_date = pd.to_datetime(df_quick.iloc[0]['date']).date()
-                days_needed = (today - latest_date).days
-                
-                if days_needed > 0:
-                    days_to_fetch = min(days_needed + 2, 60)
-                    stocks_to_update.append((code, days_to_fetch))
-                elif days_needed == 0:
-                    # 最新日期是今天
-                    # 如果是收盘后，或者强制更新模式(max_stocks)，都需要重新获取
-                    if is_after_market_close or max_stocks:
-                        stocks_to_update.append((code, 2))
-                    else:
-                        skipped += 1
-                else:
-                    skipped += 1
-            except Exception:
-                stocks_to_update.append((code, 30))
-        
-        need_update = len(stocks_to_update)
-        print(f"  需要更新: {need_update} 只, 已最新: {skipped} 只")
-        
-        if need_update == 0:
-            # 只有在完整更新（非max_stocks模式）且收盘后才记录缓存
-            if not max_stocks and is_after_market_close:
-                update_cache['last_update_date'] = today_str
-                atomic_write_json(update_cache_file, update_cache, indent=None)
-            print("✓ 所有数据已是最新")
-            print("=" * 60)
-            return
-        
-        # 批量获取最新市值数据（主接口：akshare，备选：腾讯）
-        print("\n正在批量获取最新市值数据...")
-        market_cap_map = {}
-        
-        # 方法1: 尝试akshare接口
-        try:
-            import akshare as ak
-            spot_df = ak.stock_zh_a_spot_em()
-            for _, row in spot_df.iterrows():
-                code = str(row['代码']).zfill(6)
-                cap = normalize_market_cap_yuan(row['总市值'], source_unit="auto")
-                if cap:
-                    market_cap_map[code] = cap
-            print(f"  ✓ akshare接口成功: {len(market_cap_map)} 只股票市值")
-        except Exception as e:
-            print(f"  akshare接口失败: {e}")
-            print("  尝试腾讯备选接口...")
-            # 方法2: 使用腾讯接口备选（只获取需要更新的股票）
-            update_codes = [code for code, _ in stocks_to_update]
-            market_cap_map = self._fetch_market_cap_tencent(update_codes)
-            if market_cap_map:
-                print(f"  ✓ 腾讯接口成功: {len(market_cap_map)} 只股票市值")
-            else:
-                print(f"  ✗ 腾讯接口也失败，市值数据将缺失")
-        
-        print(f"\n开始更新 {need_update} 只股票...")
-        print("=" * 60)
-        
-        for i, (code, days_to_fetch) in enumerate(stocks_to_update, 1):
-            print(f"[{i}/{need_update}] 更新 {code} (需获取 {days_to_fetch} 天数据)...", end=" ")
-            
-            # 重新读取现有数据以获取旧记录数
-            existing_df = self.csv_manager.read_stock(code)
-            old_count = len(existing_df)
-            
-            df = self.fetch_stock_update(code, days=days_to_fetch)
-            
-            if df is not None and not df.empty:
-                # 更新市值数据（和价格数据一起更新）
-                if code in market_cap_map:
-                    df['market_cap'] = market_cap_map[code]
-                self.csv_manager.update_stock(code, df)
-                new_df = self.csv_manager.read_stock(code)
-                new_count = len(new_df)
-                added = new_count - old_count
-                print(f"✓ (新增 {added} 条)")
-                updated += 1
-            else:
-                print("✗ 失败")
-                failed += 1
-            
-            if i % 10 == 0:
-                time.sleep(0.1)  # 降低限速
-        
-        # 更新缓存记录
-        update_cache['last_update_date'] = today_str
-        atomic_write_json(update_cache_file, update_cache, indent=None)
-        
-        print("=" * 60)
-        print(f"完成! 更新成功: {updated}, 跳过: {skipped}, 失败: {failed}")

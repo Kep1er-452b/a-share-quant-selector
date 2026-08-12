@@ -228,7 +228,7 @@ def test_eastmoney_direct_retry_ignores_system_proxy(monkeypatch, tmp_path):
     assert frame.iloc[0]["data_source"] == "akshare:eastmoney:direct:update"
 
 
-def test_request_get_closes_per_request_sessions(monkeypatch, tmp_path):
+def test_request_get_reuses_session_until_fetcher_close(monkeypatch, tmp_path):
     fetcher = AKShareFetcher(data_dir=str(tmp_path))
     closed = []
 
@@ -251,8 +251,12 @@ def test_request_get_closes_per_request_sessions(monkeypatch, tmp_path):
     monkeypatch.setattr(akshare_fetcher.requests, "Session", FakeSession)
 
     response = fetcher._request_get("https://example.test/quote")
+    second_response = fetcher._request_get("https://example.test/quote")
 
     assert response.status_code == 200
+    assert second_response.status_code == 200
+    assert closed == []
+    fetcher.close()
     assert closed == [True]
 
 
@@ -489,3 +493,37 @@ def test_tencent_limited_target_universe_uses_bounded_bootstrap(monkeypatch, tmp
         "board": "main",
         "market": None,
     }]
+
+
+@pytest.mark.parametrize(
+    "method,kwargs",
+    [
+        ("_fetch_stock_history_http", {"years": 1}),
+        ("_fetch_stock_update_http", {"days": 2}),
+    ],
+)
+def test_tencent_http_success_paths_preserve_missing_metrics(
+    monkeypatch, tmp_path, method, kwargs
+):
+    fetcher = AKShareFetcher(data_dir=str(tmp_path))
+
+    class Response:
+        @staticmethod
+        def json():
+            return {
+                "data": {
+                    "sz000001": {
+                        "qfqday": [["2026-06-30", "10", "10.5", "11", "9.8", "12345"]]
+                    }
+                }
+            }
+
+    monkeypatch.setattr(fetcher, "_request_get", lambda *args, **values: Response())
+    monkeypatch.setattr(fetcher, "get_latest_trade_date", lambda: "2026-06-30")
+
+    frame = getattr(fetcher, method)("000001", **kwargs)
+
+    assert frame is not None and len(frame) == 1
+    assert pd.isna(frame.iloc[0]["amount"])
+    assert pd.isna(frame.iloc[0]["turnover"])
+    assert pd.isna(frame.iloc[0]["market_cap"])

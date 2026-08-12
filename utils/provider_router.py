@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,6 +18,8 @@ ACTIVATABLE_PROVIDERS = VALID_PROVIDERS
 ARCHIVED_PROVIDERS = ()
 ACTIVE_PROVIDER_FILE = "active_provider.json"
 PROVIDER_STATE_FILE = "provider_state.json"
+STOCK_CODE_RE = re.compile(r"^\d{6}$")
+STALE_TEMP_SECONDS = 24 * 60 * 60
 
 
 def normalize_provider(provider: Optional[str], default: str = "tushare") -> str:
@@ -71,11 +75,23 @@ def legacy_data_dir(data_dir: str | Path) -> Path:
 
 
 def _stock_csv_files(path: Path) -> list[Path]:
-    return sorted(path.glob("[0-9][0-9]/*.csv"))
+    files = []
+    cutoff = time.time() - STALE_TEMP_SECONDS
+    for csv_path in path.glob("[0-9][0-9]/*.csv"):
+        if STOCK_CODE_RE.fullmatch(csv_path.stem):
+            files.append(csv_path)
+            continue
+        if re.fullmatch(r"\d{6}_.+", csv_path.stem):
+            try:
+                if csv_path.stat().st_mtime < cutoff:
+                    csv_path.unlink()
+            except OSError:
+                pass
+    return sorted(files)
 
 
 def _has_stock_csv_file(path: Path) -> bool:
-    return next(path.glob("[0-9][0-9]/*.csv"), None) is not None
+    return any(STOCK_CODE_RE.fullmatch(item.stem) for item in path.glob("[0-9][0-9]/*.csv"))
 
 
 def _latest_csv_date(path: Path) -> Optional[str]:
@@ -102,8 +118,12 @@ def warehouse_summary(data_dir: str | Path, provider: str) -> dict:
     provider = normalize_provider(provider)
     path = provider_data_dir(data_dir, provider)
     state = _read_json(provider_state_path(data_dir, provider), {})
-    stock_count = len(_stock_csv_files(path)) if path.exists() else 0
-    latest_date = state.get("latest_trade_date") or _latest_csv_date(path)
+    has_stock_data = path.exists() and _has_stock_csv_file(path)
+    state_stock_count = int(state.get("stock_count") or 0)
+    stock_count = state_stock_count if has_stock_data and state_stock_count else (
+        len(_stock_csv_files(path)) if has_stock_data else 0
+    )
+    latest_date = state.get("latest_trade_date") or (_latest_csv_date(path) if has_stock_data else None)
     return {
         "provider": provider,
         "label": provider.upper(),

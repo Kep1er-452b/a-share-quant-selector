@@ -23,6 +23,7 @@ from utils.error_logging import ERROR_DIR, sanitize_for_log
 from utils.local_config import load_config_file
 from utils.provider_router import load_active_provider, provider_data_dir, warehouse_summary
 from utils.tushare_fetcher import TushareProviderError, classify_tushare_error
+from utils.platform_paths import resolve_data_root
 
 
 DIAGNOSTIC_SCHEMA_VERSION = 1
@@ -68,7 +69,7 @@ def resolve_update_error_report(reference, error_dir=None) -> Path:
 
 def _atomic_update_report(path: Path, mutate):
     path = resolve_update_error_report(path)
-    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path = path.parent / ".diagnostics.lock"
     with _REPORT_LOCK:
         lock_path.touch(exist_ok=True)
         lock_file = lock_path.open("r+")
@@ -167,7 +168,7 @@ def attach_auto_snapshot(report_path, *, config=None, project_root=None):
     path = resolve_update_error_report(report_path)
     project_root = Path(project_root or Path(__file__).resolve().parent.parent)
     config = config or load_config_file(project_root / "config" / "config.yaml")
-    data_root = project_root / str(get_config_value(config, "data_dir", default="data"))
+    data_root = resolve_data_root(get_config_value(config, "data_dir", default="data"))
     tushare_dir = provider_data_dir(data_root, "tushare")
     original = json.loads(path.read_text(encoding="utf-8"))
     context = original.get("context") or {}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import random
 from collections import deque
 from datetime import date, datetime, timedelta
 from threading import Lock
@@ -77,6 +78,9 @@ TRADING_ENDPOINTS = {
 class TushareExtSync:
     """Synchronize optional Tushare datasets into the extension store."""
 
+    _shared_call_times = deque()
+    _shared_call_lock = Lock()
+
     def __init__(
         self,
         store: TushareExtStore,
@@ -91,8 +95,8 @@ class TushareExtSync:
         self.pro_bar = pro_bar
         self.calls_per_minute = max(1, int(calls_per_minute))
         self.rate_limit_wait_seconds = max(0.0, float(rate_limit_wait_seconds))
-        self._call_times = deque()
-        self._call_lock = Lock()
+        self._call_times = self.__class__._shared_call_times
+        self._call_lock = self.__class__._shared_call_lock
 
     @staticmethod
     def _date_text(value) -> str:
@@ -141,10 +145,7 @@ class TushareExtSync:
                 last_error = exc
                 if not self._is_rate_limit_error(exc) or attempt >= 3:
                     raise
-                time.sleep(self.rate_limit_wait_seconds)
-                with self._call_lock:
-                    self._call_times.clear()
-        raise last_error
+                time.sleep(self.rate_limit_wait_seconds + random.uniform(0.05, 0.5))
 
     def _call_dataset(
         self,
@@ -216,10 +217,11 @@ class TushareExtSync:
             cached_rows = self.store.query_rows(
                 "index_daily",
                 ts_code=symbol,
-                limit=INDEX_CACHE_MIN_ROWS,
+                limit=1,
                 descending=False,
             )
-            if len(cached_rows) >= INDEX_CACHE_MIN_ROWS and latest:
+            earliest = self._date_text(cached_rows[0].get("trade_date")) if cached_rows else None
+            if earliest and earliest <= target_start and latest:
                 start_date = self._date_text(pd.to_datetime(latest) + pd.Timedelta(days=1))
             else:
                 start_date = target_start

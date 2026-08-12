@@ -4,6 +4,9 @@ CSV 数据管理工具
 import os
 import re
 import tempfile
+import hashlib
+import json
+import weakref
 from contextlib import contextmanager, nullcontext
 from threading import RLock
 import pandas as pd
@@ -19,25 +22,36 @@ class CSVManager:
     REQUIRED_COLUMNS = {"date", "open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"}
     NUMERIC_COLUMNS = ["open", "high", "low", "close", "volume", "amount", "turnover", "market_cap"]
     _locks_guard = RLock()
-    _path_locks = {}
+    _path_locks = weakref.WeakValueDictionary()
     
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._listing_metadata_signature = None
+        self._listing_dates = {}
 
     @classmethod
     def _lock_for_path(cls, path: Path):
         key = str(Path(path).resolve())
         with cls._locks_guard:
-            if key not in cls._path_locks:
-                cls._path_locks[key] = RLock()
-            return cls._path_locks[key]
+            path_lock = cls._path_locks.get(key)
+            if path_lock is None:
+                path_lock = RLock()
+                cls._path_locks[key] = path_lock
+            return path_lock
 
     @staticmethod
     @contextmanager
     def _process_lock_for_path(path: Path):
         """Coordinate CSV writers across Web/CLI processes."""
-        lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
+        path = Path(path).resolve()
+        # Use a bounded lock striping directory. Per-stock ``.csv.lock`` files
+        # accumulate forever in a full-market warehouse, while 256 stable lock
+        # slots retain cross-process safety with only modest false contention.
+        digest = hashlib.sha256(str(path).encode("utf-8")).digest()
+        slot = int.from_bytes(digest[:2], "big") % 256
+        data_root = path.parent.parent if path.parent.name.isdigit() else path.parent
+        lock_path = data_root / ".aqs-locks" / f"{slot:03d}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+b") as handle:
             if os.name == "nt":
@@ -81,33 +95,72 @@ class CSVManager:
     
     def read_stock(self, stock_code):
         """读取股票数据"""
+        path = self.get_stock_path(stock_code, create_dirs=False)
         try:
-            path = self.get_stock_path(stock_code, create_dirs=False)
-            if not path.exists():
+            if not path.exists() or path.stat().st_size == 0:
                 return pd.DataFrame()
-
-            # 检查文件是否为空
-            if path.stat().st_size == 0:
-                return pd.DataFrame()
-
-            with self._lock_for_path(path):
-                df = pd.read_csv(path, parse_dates=['date'])
-            if 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                df = df.dropna(subset=['date']).sort_values('date', ascending=False).reset_index(drop=True)
-            return df
-        except Exception as e:
-            print(f"  读取 {stock_code} 数据失败: {e}")
+        except FileNotFoundError:
+            # The file may disappear between exists() and stat() during an
+            # atomic provider switch. Treat that exactly like a missing file.
             return pd.DataFrame()
+
+        # Real permission, locking, decoding, and I/O failures must propagate.
+        # Returning an empty frame here makes incremental sync mistake a
+        # six-year warehouse for a missing file and replace it with a tiny
+        # update window.
+        with self._lock_for_path(path):
+            df = pd.read_csv(path, parse_dates=['date'])
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df = df.dropna(subset=['date']).sort_values('date', ascending=False).reset_index(drop=True)
+        return df
 
     def read_stock_for_analysis(self, stock_code):
         """读取股票数据并返回技术分析用的复权修复视图。"""
+        stock_code = self.validate_stock_code(stock_code)
         df = self.read_stock(stock_code)
         if df.empty:
             return df
-        repaired, repairs = repair_adjustment_gaps(df)
+        repaired, repairs = repair_adjustment_gaps(
+            df,
+            stock_code=stock_code,
+            list_date=self._listing_date(stock_code),
+            board=self._board_for_code(stock_code),
+        )
         repaired.attrs["adjustment_repairs"] = repairs
         return repaired
+
+    @staticmethod
+    def _board_for_code(stock_code):
+        if stock_code.startswith(("300", "301")):
+            return "chinext"
+        if stock_code.startswith(("688", "689")):
+            return "star"
+        if stock_code.startswith(("43", "83", "87", "88", "92")):
+            return "beijing"
+        return "main"
+
+    def _listing_date(self, stock_code):
+        """Read optional provider metadata once per file revision."""
+        path = self.data_dir / "tushare_stock_map.json"
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+        if signature != self._listing_metadata_signature:
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self._listing_dates = {
+                    str(code): str(item.get("list_date") or "").strip() or None
+                    for code, item in (payload or {}).items()
+                    if isinstance(item, dict)
+                }
+                self._listing_metadata_signature = signature
+            except (OSError, ValueError, TypeError):
+                return None
+        return self._listing_dates.get(stock_code)
 
     def _validate_stock_dataframe(self, df):
         """Validate and normalize stock OHLCV data before writing."""
@@ -239,6 +292,31 @@ class CSVManager:
                 write_guard=write_guard,
                 _process_locked=True,
             )
+
+    def merge_stock(self, stock_code, new_df, validator=None, write_guard=None):
+        """Atomically validate and merge an incremental frame with current data.
+
+        ``validator`` runs while both in-process and cross-process locks are
+        held, so callers never validate one warehouse revision and overwrite a
+        newer revision read by ``update_stock`` later.
+        """
+        path = self.get_stock_path(stock_code)
+        with self._lock_for_path(path), self._process_lock_for_path(path):
+            if write_guard and not write_guard():
+                raise InterruptedError(f"{stock_code} 写入已取消")
+            existing_df = self.read_stock(stock_code)
+            prepared_new_df = self._preserve_existing_metrics(existing_df, new_df)
+            combined = pd.concat([existing_df, prepared_new_df], ignore_index=True)
+            rejection = validator(existing_df, prepared_new_df, combined) if validator else None
+            if rejection:
+                return {"written": False, "rejection": rejection}
+            written_path = self.write_stock(
+                stock_code,
+                combined,
+                write_guard=write_guard,
+                _process_locked=True,
+            )
+            return {"written": True, "path": written_path, "existing_rows": len(existing_df)}
     
     def list_all_stocks(self):
         """列出所有已保存的股票代码"""

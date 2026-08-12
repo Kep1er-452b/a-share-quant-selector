@@ -219,7 +219,8 @@ class Doctor:
 
     def check_full_local_selection(self, config, strategy_names, timeout_seconds=600):
         started = time.monotonic()
-        data_dir = str(self.project_root / str(get_config_value(config, "data_dir", default="data")))
+        data_root = self.project_root / str(get_config_value(config, "data_dir", default="data"))
+        data_dir = str(active_data_dir(data_root))
         manager = CSVManager(data_dir)
         codes = manager.list_all_stocks()
 
