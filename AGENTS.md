@@ -90,7 +90,7 @@ environment variables or ignored local config files, never in committed docs.
 - `utils/runtime_paths.py`: repository-external selection and Wyckoff output paths.
 - `utils/platform_paths.py`: source/package-aware data, log, output, and WebView
   roots for macOS and Windows, with environment-variable overrides.
-- `market_data/`: independent Hong Kong, futures, macro, and industry catalogs,
+- `market_data/`: independent Hong Kong, futures, global-commodity, macro, and industry catalogs,
   SQLite stores, read models, capabilities, Tushare client, and sync engine.
 - `web_api/`: market-explicit equity, domain-data, and operations blueprints.
 - `ops/`: structured events, bounded task registry, health, performance, and
@@ -111,7 +111,7 @@ environment variables or ignored local config files, never in committed docs.
 - `web/static/js/app.js`: frontend state and all page interactions.
 - `web/static/js/market_context.js` and `equity_router.js`: versioned A-share /
   Hong Kong context plus market-explicit instrument deep links.
-- `web/static/js/*_workspace.js`: independent futures, macro, industry, and
+- `web/static/js/*_workspace.js`: independent futures/commodity, macro, industry, and
   system workspace controllers with abortable lifecycles.
 - `web/static/css/style.css`: frontend styling.
 
@@ -221,9 +221,15 @@ Critical rules:
 
 ### Independent Domain Warehouses
 
-- Hong Kong, futures, macro, and industry data use separate SQLite files under
-  the runtime data root's `domains/` directory. They must not be merged into
+- Hong Kong, futures, global commodity observations, macro, and industry data
+  use separate SQLite files under the runtime data root. They must not be merged into
   the A-share provider CSV warehouse or the Tushare extension database.
+- `global_commodities` is a public observation domain: its current four series
+  are explicitly labelled Sina CFD (`brent.sina_cfd`, `gold.sina_cfd`,
+  `copper.sina_cfd`, `silver.sina_cfd`). Do not rename them to ICE/COMEX
+  contracts without a separately verified real-contract adapter. Commodity
+  ratios use explicit units, date intersection by default, and null reasons;
+  they must not forward-fill missing legs or infer copper scale from magnitude.
 - `market_data.store.DomainStore` owns versioned schema checks, WAL mode,
   indexed row/state access, JSON composite keys, and lightweight/deep health.
 - `market_data.sync_engine.SyncEngine` runs explicit preflight, plan, fetch,
@@ -440,7 +446,7 @@ generated runtime artifacts unless the user explicitly wants them versioned.
 
 ## 13. Current Handoff
 
-Baseline commit: `c80e304` on branch `main`; `origin/main` is `c80e304`.
+Baseline commit: `8dcb6c0` on branch `main`; `origin/main` is `8dcb6c0`.
 
 State at handoff:
 
@@ -458,6 +464,20 @@ State at handoff:
   switching with an empty console. The full suite passed (`421 passed in
   7.91s`). The audit report remains an untracked user-supplied document, and no
   changes have been staged or committed.
+
+- The 2026-09-07 audit-remediation batch covers all 17 findings plus N1-N3:
+  exact resumable domain plans, per-symbol futures cursors, bounded trading-date
+  fallback, Hong Kong analysis contracts, market-aware adjustment views, WAL /
+  revision cache invalidation, one-source K-line calculations, HTTPS and HTTP
+  error handling, trusted Host and symbol boundaries, safe watchlist reads,
+  bounded sync payloads, consistent market-day statistics, extension row-limit
+  warnings, and preserved leaderboard identity. It also adds the independent
+  `global_commodities` Sina-CFD observation domain with explicit units and
+  date-aligned gold/oil, gold/silver, and gold/copper ratios. Commodity focused
+  tests plus the full suite pass (`443 passed in 9.41s`); live local API and
+  browser checks covered the domestic/global/ratio view switches, empty-state
+  rendering, selector changes, chart message, and rapid deactivation without
+  console errors. All changes remain unstaged and uncommitted for manual review.
 
 - The current uncommitted K-line fix keeps long moving averages continuous
   when the local period history cannot fully prewarm the selected visible

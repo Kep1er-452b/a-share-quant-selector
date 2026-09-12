@@ -3392,6 +3392,142 @@ body.heatmap-focus-active #heatmap-chart {
     font-size: 9px;
 }
 
+#futures-workspace-root {
+    grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.futures-mode-switch,
+.futures-mode-view {
+    grid-row: auto;
+}
+
+.futures-mode-view {
+    display: none;
+    min-height: 0;
+}
+
+.futures-mode-view.active {
+    display: block;
+}
+
+#futures-domestic-view.active > .domain-split {
+    height: 100%;
+}
+
+#futures-global-view.active {
+    height: 100%;
+    display: grid;
+    grid-template-rows: minmax(138px, 0.34fr) minmax(0, 1fr);
+    gap: 1px;
+    background: var(--grid-line);
+}
+
+.commodity-overview-pane {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+}
+
+.commodity-card-grid {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1px;
+    padding: 1px;
+    overflow: auto;
+    background: var(--grid-line);
+}
+
+.commodity-card {
+    min-width: 0;
+    display: grid;
+    align-content: center;
+    gap: 5px;
+    padding: 10px;
+    border: 0;
+    border-radius: 0;
+    background: var(--bg-void);
+    color: var(--neutral);
+    text-align: left;
+    cursor: pointer;
+}
+
+.commodity-card:hover,
+.commodity-card:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+    background: #101010;
+}
+
+.commodity-card-label {
+    overflow: hidden;
+    color: var(--dim);
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.commodity-card strong {
+    color: var(--white);
+    font-size: 20px;
+    font-weight: 500;
+}
+
+.commodity-card small {
+    color: var(--accent);
+    font-size: 8px;
+    letter-spacing: 0.05em;
+}
+
+.commodity-analysis-grid {
+    height: 100%;
+}
+
+.commodity-browser {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+}
+
+.commodity-control-grid {
+    min-height: 0;
+    overflow: auto;
+}
+
+.commodity-control-grid .domain-field[hidden] {
+    display: none;
+}
+
+.commodity-load-btn {
+    margin: 8px;
+}
+
+.commodity-quality {
+    min-height: 28px;
+    padding: 6px 8px;
+    border-top: 1px solid var(--grid-line);
+    color: var(--dim);
+    font-size: 9px;
+    line-height: 1.45;
+}
+
+.commodity-quality[data-tone="warning"] {
+    color: var(--gold);
+}
+
+.commodity-chart-pane {
+    grid-template-rows: auto minmax(320px, 1fr);
+}
+
+@media (max-width: 1100px) {
+    .commodity-card-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .domain-split-narrow,
+    .domain-split-sidebar {
+        grid-template-columns: minmax(260px, 0.8fr) minmax(420px, 1.2fr);
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .domain-workspace *,
     .domain-workspace *::before,

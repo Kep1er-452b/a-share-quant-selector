@@ -233,10 +233,26 @@ class HongKongService:
         for row in self._latest_rows("hk_daily", rows_per_symbol=2):
             symbol = canonical_hk_symbol(row.get("ts_code"))
             histories.setdefault(symbol, []).append(row)
+        latest_rows = {
+            symbol: max(rows, key=lambda row: _trade_date_key(row.get("trade_date")))
+            for symbol, rows in histories.items()
+            if rows
+        }
+        market_as_of = max(
+            (_trade_date_key(row.get("trade_date")) for row in latest_rows.values()),
+            default=None,
+        )
+        current_rows = {
+            symbol: row
+            for symbol, row in latest_rows.items()
+            if _trade_date_key(row.get("trade_date")) == market_as_of
+        }
         advancers = decliners = unchanged = 0
-        for rows in histories.values():
+        for symbol, rows in histories.items():
+            if symbol not in current_rows:
+                continue
             rows.sort(key=lambda row: str(row.get("trade_date") or ""), reverse=True)
-            row = rows[0]
+            row = current_rows[symbol]
             close = row.get("close")
             pre_close = row.get("pre_close")
             if close is None:
@@ -256,6 +272,13 @@ class HongKongService:
         return {
             "currency": CURRENCY,
             "instrument_count": len(instruments),
+            "market_as_of": market_as_of,
+            "as_of_instrument_count": len(current_rows),
+            "stale_count": max(len(latest_rows) - len(current_rows), 0),
+            "missing_count": max(len(instruments) - len(latest_rows), 0),
+            "coverage_ratio": round(
+                len(current_rows) / len(instruments), 4
+            ) if instruments else 0.0,
             "grouping_mode": (
                 "market_segment" if segment_counts else "performance_distribution"
             ),
@@ -312,10 +335,18 @@ class HongKongService:
                 }
             )
 
-        use_segments = any(item["segment"] for item in items)
+        market_as_of = max(
+            (_trade_date_key(item.get("trade_date")) for item in items),
+            default=None,
+        )
+        current_items = [
+            item for item in items
+            if _trade_date_key(item.get("trade_date")) == market_as_of
+        ]
+        use_segments = any(item["segment"] for item in current_items)
         grouping_mode = "market_segment" if use_segments else "performance_distribution"
         grouped: dict[str, list[dict[str, Any]]] = {}
-        for item in items:
+        for item in current_items:
             group = item["segment"] if use_segments and item["segment"] else item["performance_bucket"]
             grouped.setdefault(group or "未标注板块", []).append(item)
         groups = []
@@ -343,12 +374,22 @@ class HongKongService:
             "industry_coverage": 0,
             "groups": groups,
             "total": len(items),
+            "market_as_of": market_as_of,
+            "as_of_total": len(current_items),
+            "stale_count": max(len(items) - len(current_items), 0),
+            "missing_count": max(len(basics) - len(items), 0),
+            "coverage_ratio": round(len(current_items) / len(basics), 4) if basics else 0.0,
         }
 
 
 from market_data.futures import FuturesService
 from market_data.industry import IndustryService
 from market_data.economy import EconomyService
+
+
+def _trade_date_key(value: object) -> str:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    return digits if len(digits) == 8 else str(value or "").strip()
 
 
 __all__ = ["EconomyService", "FuturesService", "HongKongService", "IndustryService"]

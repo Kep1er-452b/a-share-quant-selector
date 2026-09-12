@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import pandas as pd
 from strategy.strategy_registry import StrategyRegistry
 from strategy.formula_strategy import FORMULA_STRATEGY_NAME
 from utils.csv_manager import CSVManager
@@ -137,18 +138,54 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
         result_code = canonical_symbol if market_id == "hong_kong" else canonical_symbol.split(".", 1)[0]
         last_processed_code = result_code
         last_processed_name = name
-        df = (
-            reader.read_analysis_frame(canonical_symbol)
-            if reader is not None
-            else csv_manager.read_stock_for_analysis(result_code)
-        )
+        try:
+            df = (
+                reader.read_analysis_frame(canonical_symbol)
+                if reader is not None
+                else csv_manager.read_stock_for_analysis(result_code)
+            )
+            if df is None:
+                df = pd.DataFrame()
+            if not df.empty and len(df) >= 60:
+                required_columns = {"date", "open", "high", "low", "close", "volume"}
+                missing_columns = required_columns - set(df.columns)
+                if missing_columns:
+                    raise ValueError(
+                        f"{market_id} analysis data missing required columns: "
+                        f"{', '.join(sorted(missing_columns))}"
+                    )
+            prepared_df = prepare_selection_features(df) if not df.empty and len(df) >= 60 else df
+        except Exception as exc:
+            for strategy_name in strategies:
+                error_counts[strategy_name] += 1
+            if len(error_details) < 20:
+                error_details.append({
+                    "code": result_code,
+                    "name": name,
+                    "strategy": "market_data",
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                })
+            continue
         if df.empty or len(df) < 60:
             skipped_count += 1
             continue
 
         valid_count += 1
-        prepared_df = prepare_selection_features(df)
-        prepared_df = prepare_strategy_shared_features(prepared_df, strategies)
+        try:
+            prepared_df = prepare_strategy_shared_features(prepared_df, strategies)
+        except Exception as exc:
+            for strategy_name in strategies:
+                error_counts[strategy_name] += 1
+            if len(error_details) < 20:
+                error_details.append({
+                    "code": result_code,
+                    "name": name,
+                    "strategy": "shared_features",
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                })
+            continue
         indicator_frames = []
 
         for strategy_name, strategy in strategies.items():

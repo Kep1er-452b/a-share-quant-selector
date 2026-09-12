@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
+from market_data.tushare_client import TushareClientFactory
 from utils.atomic_io import atomic_write_json
 from utils.csv_manager import CSVManager
 from utils.data_provider import MAX_REASONABLE_MARKET_CAP_YUAN, get_config_value, normalize_market_cap_yuan
@@ -166,14 +167,22 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
 
     if df.empty:
         return None
+    adjustment_repairs = []
     if {"date", "open", "high", "low", "close"}.issubset(df.columns):
-        df, _ = repair_adjustment_gaps(df)
+        code = csv_path.stem
+        df, adjustment_repairs = repair_adjustment_gaps(
+            df,
+            stock_code=code,
+            board=_classify_board(code),
+            market="a_share",
+        )
 
     latest_date = pd.to_datetime(df.iloc[0]["date"], errors="coerce")
     latest_close = _safe_float(df.iloc[0]["close"])
     previous_close = _metric_base_close(df, "daily")
     latest_amount = _safe_float(df.iloc[0].get("amount"))
     previous_amount = _safe_float(df.iloc[1].get("amount")) if len(df) > 1 else None
+    previous_date = pd.to_datetime(df.iloc[1]["date"], errors="coerce") if len(df) > 1 else pd.NaT
     market_cap = normalize_market_cap_yuan(df.iloc[0].get("market_cap"), source_unit="yuan") or 0
     if pd.isna(latest_date) or latest_close is None:
         return None
@@ -192,6 +201,7 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
         "name": name,
         "board": _classify_board(code),
         "latest_date": latest_date.strftime("%Y-%m-%d"),
+        "previous_date": previous_date.strftime("%Y-%m-%d") if pd.notna(previous_date) else None,
         "latest_price": round(latest_close, 2),
         "previous_close": round(previous_close, 2) if previous_close is not None else None,
         "amount": round(latest_amount, 2) if latest_amount is not None else None,
@@ -199,6 +209,7 @@ def _read_stock_snapshot(csv_path: Path, stock_names: Dict[str, str]) -> Optiona
         "market_cap": round(market_cap or 0.0, 2),
         "data_count": len(df),
         "metrics": metrics,
+        "adjustment_repairs": adjustment_repairs,
     }
 
 
@@ -275,9 +286,7 @@ def _load_tushare_metadata_industries(
         return mapping, source_map, "missing_tushare_token"
 
     try:
-        import tushare as ts
-
-        pro = ts.pro_api(token)
+        pro = TushareClientFactory(token, "market_overview").client()
         df = pro.stock_basic(
             exchange="",
             list_status="L",
@@ -1073,7 +1082,19 @@ def _market_distribution(stocks: List[dict], values: List[float]) -> List[dict]:
 
 
 def _build_market_stats(stocks: List[dict], metric: str) -> dict:
-    values = [stock.get("metrics", {}).get(metric) for stock in stocks]
+    dates = [
+        str(stock.get("latest_date") or "")
+        for stock in stocks
+        if str(stock.get("latest_date") or "")
+    ]
+    market_as_of = max(dates, default=None)
+    as_of_stocks = [
+        stock for stock in stocks
+        if market_as_of and str(stock.get("latest_date") or "") == market_as_of
+    ]
+    missing_count = len([stock for stock in stocks if not stock.get("latest_date")])
+    stale_count = max(len(stocks) - len(as_of_stocks) - missing_count, 0)
+    values = [stock.get("metrics", {}).get(metric) for stock in as_of_stocks]
     values = [value for value in values if value is not None]
     up_count = len([value for value in values if value > 0])
     down_count = len([value for value in values if value < 0])
@@ -1083,22 +1104,33 @@ def _build_market_stats(stocks: List[dict], metric: str) -> dict:
         "down_count": down_count,
         "flat_count": flat_count,
         "median_change_pct": round(float(median(values)), 2) if values else None,
+        "market_as_of": market_as_of,
+        "as_of_stock_count": len(as_of_stocks),
+        "stale_count": stale_count,
+        "missing_count": missing_count,
+        "coverage_ratio": round(
+            len(as_of_stocks) / len(stocks), 4
+        ) if stocks else 0.0,
     }
-    latest_trade_date = max(
-        (str(stock.get("latest_date") or "") for stock in stocks if stock.get("latest_date")),
-        default="",
-    )
     latest_amounts = []
     previous_amounts = []
-    for stock in stocks:
-        if latest_trade_date and str(stock.get("latest_date") or "") != latest_trade_date:
-            continue
+    previous_dates = [
+        str(stock.get("previous_date") or "")
+        for stock in as_of_stocks
+        if str(stock.get("previous_date") or "")
+    ]
+    previous_as_of = max(previous_dates, default=None)
+    for stock in as_of_stocks:
         amount = _safe_float(stock.get("amount"))
         previous_amount = _safe_float(stock.get("previous_amount"))
         if amount is not None:
             latest_amounts.append(amount)
-        if previous_amount is not None:
+        if previous_amount is not None and (
+            not previous_as_of
+            or str(stock.get("previous_date") or "") == previous_as_of
+        ):
             previous_amounts.append(previous_amount)
+    stats["previous_market_as_of"] = previous_as_of
     stats["market_amount_yi"] = round(sum(latest_amounts) / 100_000_000, 4) if latest_amounts else None
     stats["previous_market_amount_yi"] = round(sum(previous_amounts) / 100_000_000, 4) if previous_amounts else None
     if metric == "daily":
@@ -1140,7 +1172,21 @@ def _build_heatmap_payload_from_caches(caches: dict, scope: str = "all", metric:
     if scope in {"main", "chinext", "star", "beijing"}:
         stocks = [stock for stock in stocks if stock.get("board") == scope]
 
-    groups = _group_stocks_by_industry(stocks, industry_cache.get("items", {}), metric)
+    market_as_of = max(
+        (
+            str(stock.get("latest_date") or "")
+            for stock in stocks
+            if str(stock.get("latest_date") or "")
+        ),
+        default=None,
+    )
+    current_stocks = [
+        stock for stock in stocks
+        if market_as_of and str(stock.get("latest_date") or "") == market_as_of
+    ]
+    groups = _group_stocks_by_industry(
+        current_stocks, industry_cache.get("items", {}), metric
+    )
     stats = _build_market_stats(stocks, metric)
 
     return {
@@ -1151,6 +1197,10 @@ def _build_heatmap_payload_from_caches(caches: dict, scope: str = "all", metric:
         "groups": groups,
         "group_count": len(groups),
         "stock_count": len(stocks),
+        "as_of_date": market_as_of,
+        "as_of_stock_count": len(current_stocks),
+        "stale_stock_count": stats.get("stale_count", 0),
+        "missing_stock_count": stats.get("missing_count", 0),
         "header_indices": index_cache.get("items", []),
         "ticker_stats": stats,
         "cache_status": {

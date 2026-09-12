@@ -240,6 +240,56 @@ class TushareExtStore:
             row = conn.execute(sql, [*selected, str(before_date)]).fetchone()
         return row["latest"] if row and row["latest"] else None
 
+    def storage_signature(self) -> str:
+        """Return a revision-aware signature for cache invalidation.
+
+        SQLite WAL commits may leave the main database's mtime and size
+        unchanged. Include sidecar stats for cheap filesystem visibility and
+        revision aggregates for the authoritative logical update signal.
+        """
+
+        paths = [
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ]
+        file_stats = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                file_stats.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                file_stats.append((str(path), None, None))
+        try:
+            with self.connect() as conn:
+                revision = conn.execute(
+                    """
+                    SELECT COUNT(*) AS row_count,
+                           COALESCE(SUM(revision), 0) AS revision_sum,
+                           COALESCE(MAX(updated_at), '') AS latest_update
+                    FROM ext_dataset_revision
+                    """
+                ).fetchone()
+                sync_state = conn.execute(
+                    """
+                    SELECT COUNT(*) AS row_count,
+                           COALESCE(MAX(updated_at), '') AS latest_update
+                    FROM ext_sync_state
+                    """
+                ).fetchone()
+            logical = (
+                int(revision["row_count"] or 0),
+                int(revision["revision_sum"] or 0),
+                str(revision["latest_update"] or ""),
+                int(sync_state["row_count"] or 0),
+                str(sync_state["latest_update"] or ""),
+            )
+        except sqlite3.Error:
+            logical = ("unavailable",)
+        return hashlib.sha256(
+            json.dumps([file_stats, logical], ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
     def rows_signature(self, datasets: Sequence[str], trade_dates: Sequence[str]) -> str:
         selected_datasets = [str(dataset) for dataset in datasets or [] if str(dataset or "").strip()]
         selected_dates = [str(item) for item in trade_dates or [] if str(item or "").strip()]
@@ -319,6 +369,21 @@ class TushareExtStore:
                 ),
             )
             conn.commit()
+
+    def get_sync_state(self, dataset: str, scope: str = "default") -> dict | None:
+        """Return one dataset watermark for completeness-aware read models."""
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT dataset, scope, start_date, end_date, status,
+                       warning, error, row_count, updated_at
+                FROM ext_sync_state
+                WHERE dataset = ? AND scope = ?
+                """,
+                (str(dataset), str(scope)),
+            ).fetchone()
+        return dict(row) if row else None
 
     def list_warnings(self, *, limit: int = 20, max_age_days: int = 30) -> list[dict]:
         with self.connect() as conn:

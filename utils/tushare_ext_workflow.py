@@ -47,6 +47,9 @@ def extension_store_for_data_root(data_root=None) -> TushareExtStore:
 
 
 def recent_tushare_extension_trade_dates(store, latest_text, count=2) -> list[str]:
+    count = max(int(count or 0), 0)
+    if count == 0:
+        return []
     dates = []
     try:
         for row in store.query_rows("trade_cal", end_date=latest_text, limit=max(count * 4, 10), descending=True):
@@ -62,13 +65,22 @@ def recent_tushare_extension_trade_dates(store, latest_text, count=2) -> list[st
     except Exception:
         dates = []
 
+    # The fallback cursor must advance independently of the number of dates
+    # accepted.  If the local calendar contains Friday only and ``latest`` is
+    # Monday, using ``BDay(len(dates))`` repeatedly points at the same Friday
+    # after the duplicate is rejected and never makes progress.
     current = pd.to_datetime(latest_text)
-    while len(dates) < count:
-        fallback = (current - pd.offsets.BDay(len(dates))).strftime("%Y%m%d")
-        if fallback not in dates:
-            dates.append(fallback)
+    seen = set(dates)
+    scan_limit = min(max(count * 4 + 20, 32), 10_000)
+    for _ in range(scan_limit):
         if len(dates) >= count:
             break
+        current = current - pd.offsets.BDay(1)
+        fallback = current.strftime("%Y%m%d")
+        if fallback in seen:
+            continue
+        seen.add(fallback)
+        dates.append(fallback)
     return dates[:count]
 
 

@@ -217,6 +217,35 @@ def test_market_trading_summary_returns_previous_day_deltas(tmp_path):
     assert summary["metrics"]["market_amount"]["unit"] == "亿元"
 
 
+def test_market_trading_summary_deduplicates_overlapping_top_list_reasons(tmp_path):
+    store = TushareExtStore(tmp_path / "extended")
+    store.upsert_rows(
+        "top_list",
+        [
+            {
+                "trade_date": "20260630",
+                "ts_code": "000001.SZ",
+                "reason": "daily",
+                "net_amount": 100_000_000,
+            },
+            {
+                "trade_date": "20260630",
+                "ts_code": "000001.SZ",
+                "reason": "three_day",
+                "net_amount": 300_000_000,
+            },
+        ],
+        key_fields=("trade_date", "ts_code", "reason"),
+    )
+
+    summary = build_market_trading_summary(store, "20260630")
+
+    assert summary["dragon_tiger_source_row_count"] == 2
+    assert summary["dragon_tiger_unique_stock_count"] == 1
+    assert summary["metrics"]["dragon_tiger_count"]["value"] == 1
+    assert summary["metrics"]["dragon_tiger_net"]["value"] == 3.0
+
+
 def test_market_trading_summary_uses_latest_available_margin_date(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     store.upsert_rows(

@@ -97,11 +97,18 @@ class BaseDataProvider:
         self.full_data_dir = Path(data_dir)
         self.storage_root_dir = Path(data_dir)
         self.stock_names_file = self.full_data_dir / "stock_names.json"
+        # Provider-neutral metadata consumed by CSVManager's analysis view.
+        # Tushare keeps its richer legacy map as well; other providers can
+        # publish just this small listing-date contract.
+        self.listing_dates_file = self.full_data_dir / "listing_dates.json"
         self.fetch_state_file = self.full_data_dir / "fetch_state.json"
         self.trade_calendar_cache_file = self.full_data_dir / "trade_calendar_cache.json"
         self.trade_calendar_seed_file = Path(__file__).resolve().parent.parent / "config" / "trade_calendar_seed_2026.json"
         self._local_trade_calendar_cache = None
         self._sync_lock = Lock()
+        self._stock_metadata_cache_lock = Lock()
+        self._stock_metadata_cache_signature = None
+        self._stock_metadata_cache = {}
         self._sync_max_workers = min(max(os.cpu_count() or 4, 1), 24)
         self.last_sync_summary = None
         self._active_sync_context = {}
@@ -346,6 +353,7 @@ class BaseDataProvider:
                     stock_code=code,
                     list_date=item.get("list_date"),
                     board=item.get("board"),
+                    market="a_share",
                 )
                 if adjustment_gaps:
                     return {"adjustment_gap": True, "gaps": adjustment_gaps[:5]}
@@ -394,6 +402,7 @@ class BaseDataProvider:
                 stock_code=code,
                 list_date=item.get("list_date"),
                 board=item.get("board"),
+                market="a_share",
             )
             if adjustment_gaps:
                 return {
@@ -758,13 +767,23 @@ class BaseDataProvider:
         默认用股票列表构造，provider 可以覆写以提供更完整元数据。
         """
         stock_dict = self.get_all_stock_codes(max_retries=max_retries)
+        metadata_loader = getattr(self, "_load_stock_metadata", None)
+        metadata = metadata_loader() if callable(metadata_loader) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        listing_dates = self._load_listing_dates()
         universe = []
         for code, name in sorted(stock_dict.items()):
+            code = str(code).zfill(6)
+            info = metadata.get(code) if isinstance(metadata.get(code), dict) else {}
             universe.append({
-                "code": str(code).zfill(6),
+                "code": code,
                 "name": name,
-                "board": self.classify_board(code),
+                "board": self.classify_board(code, info),
                 "market": None,
+                "exchange": info.get("exchange"),
+                "ts_code": info.get("ts_code"),
+                "list_date": info.get("list_date") or listing_dates.get(code),
             })
         return universe
 
@@ -775,7 +794,48 @@ class BaseDataProvider:
         universe = sorted(universe, key=lambda item: item["code"])
         if max_stocks:
             universe = universe[:max_stocks]
+        self._save_listing_dates(universe)
         return universe
+
+    def _load_listing_dates(self) -> Dict[str, str]:
+        """Load the provider-neutral listing-date metadata contract."""
+
+        if not self.listing_dates_file.exists():
+            return {}
+        try:
+            with self.listing_dates_file.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        result = {}
+        for code, value in payload.items():
+            code_text = str(code).strip().zfill(6)
+            if isinstance(value, dict):
+                value = value.get("list_date") or value.get("listing_date")
+            value_text = str(value or "").strip()
+            if code_text and value_text:
+                result[code_text] = value_text
+        return result
+
+    def _save_listing_dates(self, universe: List[dict]) -> None:
+        """Persist known listing dates without erasing older provider rows."""
+
+        updates = {
+            str(item.get("code") or "").zfill(6): str(item.get("list_date") or "").strip()
+            for item in universe or []
+            if str(item.get("code") or "").strip()
+            and str(item.get("list_date") or "").strip()
+        }
+        if not updates:
+            return
+        existing = self._load_listing_dates()
+        existing.update(updates)
+        try:
+            atomic_write_json(self.listing_dates_file, existing)
+        except Exception as exc:
+            LOGGER.warning("保存 provider listing_dates.json 失败: %s", exc)
 
     def get_latest_trade_date(self):
         """

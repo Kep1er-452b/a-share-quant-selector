@@ -189,6 +189,39 @@ def test_sync_trading_snapshot_records_permission_warnings(tmp_path):
     assert store.list_warnings()[0]["dataset"] == "top_inst"
 
 
+def test_extension_sync_marks_a_response_at_the_provider_limit_as_truncated(tmp_path):
+    class LimitedPro:
+        def block_trade(self, **kwargs):
+            return pd.DataFrame(
+                [
+                    {
+                        "trade_date": kwargs["trade_date"],
+                        "ts_code": f"000{index:03d}.SZ",
+                        "price": index + 1,
+                        "buyer": "buyer",
+                        "seller": "seller",
+                    }
+                    for index in range(1000)
+                ]
+            )
+
+    store = TushareExtStore(tmp_path / "extended")
+    sync = TushareExtSync(store, LimitedPro())
+
+    result = sync._call_dataset(
+        "block_trade",
+        "block_trade",
+        key_fields=("trade_date", "ts_code", "price", "buyer", "seller"),
+        scope="20260630",
+        params={"trade_date": "20260630"},
+    )
+
+    assert result["status"] == "warning"
+    assert result["truncated"] is True
+    assert result["response_limit"] == 1000
+    assert store.get_sync_state("block_trade", "20260630")["status"] == "warning"
+
+
 def test_sync_basics_writes_stock_metadata_and_calendar(tmp_path):
     store = TushareExtStore(tmp_path / "extended")
     pro = FakePro()

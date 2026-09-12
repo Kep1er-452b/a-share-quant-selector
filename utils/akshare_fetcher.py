@@ -771,7 +771,7 @@ class AKShareFetcher(BaseDataProvider):
                 all_stocks = pd.concat([sh_df[['代码', '名称']], sz_df[['代码', '名称']]])
                 all_stocks = all_stocks.drop_duplicates(subset=['代码'])
                 
-                code_pattern = r'^(00|30|60|68|88)\d{4}$'
+                code_pattern = r'^(00|30|43|60|68|83|87|88|92)\d{4}$'
                 all_stocks = all_stocks[all_stocks['代码'].str.match(code_pattern)]
                 
                 exclude_keywords = ['债', '基', 'ETF', 'LOF', '基金', '理财', '信托', 'B股', '指数', '国债', '企债', '转债', '回购', 'R-', 'GC']

@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from market_data.equity_symbols import canonical_a_share_symbol
+from market_data.tushare_client import ensure_tushare_transport
 from utils.data_provider import BaseDataProvider, DataProviderError
 
 
@@ -120,8 +122,16 @@ class TushareFetcher(BaseDataProvider):
                 setattr(self.pro, "_DataApi__timeout", self.request_timeout)
             except Exception:
                 pass
+        self.pro = ensure_tushare_transport(
+            self.pro,
+            self.token,
+            timeout=self.request_timeout,
+        )
         self.stock_meta_file = Path(data_dir) / "tushare_stock_map.json"
         self.stock_meta_refresh_file = Path(data_dir) / "tushare_stock_map_state.json"
+        self._stock_metadata_cache_lock = Lock()
+        self._stock_metadata_cache_signature = None
+        self._stock_metadata_cache = {}
         self.daily_basic_calls = deque()
         self.daily_basic_limit_per_minute = int(tushare_config.get("daily_basic_limit_per_minute", 180))
         self.daily_basic_rate_limit_wait = 62
@@ -260,7 +270,15 @@ class TushareFetcher(BaseDataProvider):
             bound_query = getattr(func, "func", None)
             query_owner = getattr(bound_query, "__self__", None)
             query_args = getattr(func, "args", ())
-            if query_owner is self.pro and query_args and isinstance(query_args[0], str):
+            if (
+                query_args
+                and isinstance(query_args[0], str)
+                and (
+                    query_owner is self.pro
+                    or getattr(query_owner, "_aqs_tushare_transport", False)
+                    or query_owner.__class__.__name__ == "SecureTushareApi"
+                )
+            ):
                 return self._direct_api.query(query_args[0], *args, **kwargs)
 
             if getattr(func, "__name__", "") == "pro_bar":
@@ -430,13 +448,35 @@ class TushareFetcher(BaseDataProvider):
         return self.get_trade_calendar_status()
 
     def _load_stock_metadata(self):
-        if self.stock_meta_file.exists():
-            try:
-                with open(self.stock_meta_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
+        path = self.stock_meta_file
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            signature = (None, None)
+
+        # This file is consulted once per stock during a full update.  Keep
+        # the parsed mapping in memory, but invalidate it when the provider
+        # refresh atomically replaces the file.
+        cache_lock = getattr(self, "_stock_metadata_cache_lock", None)
+        if cache_lock is None:
+            cache_lock = Lock()
+            self._stock_metadata_cache_lock = cache_lock
+        with cache_lock:
+            if signature == getattr(self, "_stock_metadata_cache_signature", None):
+                return getattr(self, "_stock_metadata_cache", {})
+            payload = {}
+            if signature != (None, None):
+                try:
+                    with path.open("r", encoding="utf-8") as handle:
+                        payload = json.load(handle)
+                    if not isinstance(payload, dict):
+                        payload = {}
+                except (OSError, ValueError, TypeError):
+                    payload = {}
+            self._stock_metadata_cache_signature = signature
+            self._stock_metadata_cache = payload
+            return payload
 
     def _save_stock_metadata(self, stock_map):
         self.stock_meta_file.parent.mkdir(parents=True, exist_ok=True)
@@ -449,6 +489,8 @@ class TushareFetcher(BaseDataProvider):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(stock_map, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, self.stock_meta_file)
+            with self._stock_metadata_cache_lock:
+                self._stock_metadata_cache_signature = None
             state = {
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
                 "stock_count": len(stock_map),
@@ -506,13 +548,8 @@ class TushareFetcher(BaseDataProvider):
         stock_code = str(stock_code).zfill(6)
         metadata = self._load_stock_metadata()
         if stock_code in metadata and metadata[stock_code].get("ts_code"):
-            return metadata[stock_code]["ts_code"]
-
-        if stock_code.startswith(("43", "83", "87", "88", "92")):
-            return f"{stock_code}.BJ"
-        if stock_code.startswith(("60", "68")):
-            return f"{stock_code}.SH"
-        return f"{stock_code}.SZ"
+            return canonical_a_share_symbol(metadata[stock_code]["ts_code"])
+        return canonical_a_share_symbol(stock_code)
 
     def _get_latest_trade_date(self, max_lookback_days=10):
         """获取最近一个可用交易日"""
@@ -1019,8 +1056,8 @@ class TushareFetcher(BaseDataProvider):
     def _stock_basic_maps(frame):
         frame = frame.copy()
         frame["symbol"] = frame["symbol"].astype(str).str.zfill(6)
-        frame = frame[frame["exchange"].isin(["SSE", "SZSE"])]
-        frame = frame[frame["symbol"].str.match(r"^(00|30|60|68)\d{4}$")]
+        frame = frame[frame["exchange"].isin(["SSE", "SZSE", "BSE"])]
+        frame = frame[frame["symbol"].str.match(r"^(00|30|43|60|68|83|87|88|92)\d{4}$")]
         exclude_keywords = ["债", "ETF", "LOF", "基金", "理财", "信托", "B股", "指数", "转债"]
         for keyword in exclude_keywords:
             frame = frame[~frame["name"].astype(str).str.contains(keyword, na=False)]

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import json
 from typing import Iterable
 
 import pandas as pd
 
+from market_data.equity_symbols import canonical_a_share_symbol
 from utils.tushare_ext_store import TushareExtStore
 
 
@@ -77,11 +79,7 @@ def _round_or_none(value, digits: int = 4):
 
 
 def _normalize_stock_code(code: str) -> str:
-    code = str(code or "").strip().upper()
-    if "." in code:
-        return code
-    suffix = "SH" if code.startswith(("5", "6", "9")) else "SZ"
-    return f"{code}.{suffix}"
+    return canonical_a_share_symbol(code)
 
 
 def _normalize_index_symbol(symbol: str) -> dict:
@@ -245,7 +243,16 @@ def build_index_kline_payload(
                 "low": _round_or_none(row.get("low")),
                 "close": _round_or_none(row.get("close")),
                 "volume": _round_or_none(row.get("vol") if row.get("vol") is not None else row.get("volume")),
-                "amount": _round_or_none(row.get("amount")),
+                # Tushare daily.amount is thousand yuan; stock detail
+                # payloads expose amount in ten-thousand yuan, matching the
+                # CSV-backed chart.  Keep the conversion explicit so a
+                # reference candle cannot silently change tooltip units.
+                "amount": _round_or_none(
+                    (_to_number(row.get("amount")) * 1000 / 10000)
+                    if _to_number(row.get("amount")) is not None
+                    else None
+                ),
+                "amount_unit": "wan_yuan",
                 "MA50": ma50_value,
                 "MA200": ma200_value,
             }
@@ -290,6 +297,39 @@ def build_index_kline_payload(
 
 def _rows_for_date(store: TushareExtStore, dataset: str, trade_date: str) -> list[dict]:
     return store.query_rows(dataset, start_date=trade_date, end_date=trade_date, descending=False)
+
+
+def _unique_top_list_rows(rows: Iterable[dict]) -> list[dict]:
+    """Choose one representative ranking row per security for market totals.
+
+    ``top_list`` is an evidence table, not a cash-flow ledger: a security can
+    be listed for several reasons/windows on the same date and those rows may
+    overlap.  Keep the raw rows in SQLite, but make the dashboard's net and
+    count metrics security-level.  The largest absolute reported net amount
+    is a deterministic representative and avoids adding overlapping windows.
+    """
+
+    selected: dict[str, dict] = {}
+    ranks: dict[str, tuple[float, str]] = {}
+    for row in rows:
+        code = str(row.get("ts_code") or row.get("symbol") or "").strip().upper()
+        if not code:
+            # Malformed rows should not make the entire summary fail, but two
+            # anonymous records must not be collapsed into one security.
+            code = f"__row__{len(selected)}"
+        candidate_value = _to_number(row.get("net_amount"))
+        candidate_rank = (
+            abs(float(candidate_value)) if isinstance(candidate_value, (int, float)) else -1.0,
+            str(row.get("reason") or ""),
+        )
+        existing = selected.get(code)
+        if existing is None:
+            selected[code] = dict(row)
+            ranks[code] = candidate_rank
+        elif candidate_rank > ranks[code]:
+            selected[code] = dict(row)
+            ranks[code] = candidate_rank
+    return list(selected.values())
 
 
 def _sum_field(rows: Iterable[dict], field: str) -> float:
@@ -375,6 +415,18 @@ def _latest_dataset_date(store: TushareExtStore, dataset: str, cutoff: str) -> s
     return _date_text(rows[0].get("trade_date")) if rows else None
 
 
+def _dataset_slice_is_incomplete(store, dataset: str, trade_date: str | None) -> bool:
+    """Do not expose totals sourced from a slice that was not proven complete."""
+
+    if not trade_date or not hasattr(store, "get_sync_state"):
+        return False
+    try:
+        state = store.get_sync_state(dataset, trade_date)
+    except Exception:
+        return False
+    return bool(state and state.get("status") in {"warning", "failed", "cancelled"})
+
+
 def _market_summary_signature(
     store: TushareExtStore,
     *,
@@ -390,14 +442,42 @@ def _market_summary_signature(
         source_signature = store.rows_signature(TRADING_SUMMARY_SOURCE_DATASETS, dates)
     else:
         source_signature = ""
+    completeness = []
+    if hasattr(store, "get_sync_state"):
+        for dataset in TRADING_SUMMARY_SOURCE_DATASETS:
+            for trade_date in dates:
+                try:
+                    state = store.get_sync_state(dataset, trade_date)
+                except Exception:
+                    state = None
+                completeness.append(
+                    (dataset, trade_date, (state or {}).get("status"), (state or {}).get("warning"))
+                )
     return {
-        "version": 2,
+        "version": 3,
         "latest": latest,
         "previous": previous,
         "market_amount_yi": market_amount_yi,
         "previous_market_amount_yi": previous_market_amount_yi,
         "source_signature": source_signature,
+        "completeness": completeness,
     }
+
+
+def _same_json_value(left, right) -> bool:
+    """Compare cache metadata before/after JSON persistence.
+
+    SQLite stores the summary payload as JSON, so tuples in the in-memory
+    completeness list come back as lists.  Comparing the Python containers
+    directly would turn every subsequent read into an unnecessary refresh.
+    """
+
+    try:
+        return json.dumps(left, ensure_ascii=False, sort_keys=True, default=str) == json.dumps(
+            right, ensure_ascii=False, sort_keys=True, default=str
+        )
+    except (TypeError, ValueError):
+        return left == right
 
 
 def build_market_trading_summary(
@@ -417,21 +497,31 @@ def build_market_trading_summary(
         previous_market_amount_yi=previous_market_amount_yi,
     )
     cached = store.get_row(TRADING_SUMMARY_CACHE_DATASET, latest) if hasattr(store, "get_row") else None
-    if cached and cached.get("cache_signature") == cache_signature:
+    if cached and _same_json_value(cached.get("cache_signature"), cache_signature):
         cached["cache_status"] = "hit"
         cached["sync_warnings"] = store.list_warnings()
         return cached
 
     current_daily = _rows_for_date(store, "daily", latest)
     previous_daily = _rows_for_date(store, "daily", previous) if previous else []
-    current_top = _rows_for_date(store, "top_list", latest)
-    previous_top = _rows_for_date(store, "top_list", previous) if previous else []
+    current_top_raw = _rows_for_date(store, "top_list", latest)
+    previous_top_raw = _rows_for_date(store, "top_list", previous) if previous else []
+    current_top = _unique_top_list_rows(current_top_raw)
+    previous_top = _unique_top_list_rows(previous_top_raw)
     current_blocks = _rows_for_date(store, "block_trade", latest)
     previous_blocks = _rows_for_date(store, "block_trade", previous) if previous else []
     current_hsgt = _rows_for_date(store, "moneyflow_hsgt", latest)
     previous_hsgt = _rows_for_date(store, "moneyflow_hsgt", previous) if previous else []
     current_moneyflow = _rows_for_date(store, "moneyflow", latest)
     previous_moneyflow = _rows_for_date(store, "moneyflow", previous) if previous else []
+    incomplete_current = {
+        dataset for dataset in ("top_list", "block_trade", "moneyflow", "moneyflow_hsgt")
+        if _dataset_slice_is_incomplete(store, dataset, latest)
+    }
+    incomplete_previous = {
+        dataset for dataset in ("top_list", "block_trade", "moneyflow", "moneyflow_hsgt")
+        if _dataset_slice_is_incomplete(store, dataset, previous)
+    } if previous else set()
     margin_date = _latest_dataset_date(store, "margin", latest)
     margin_cutoff = (
         (pd.to_datetime(margin_date) - timedelta(days=1)).strftime("%Y%m%d")
@@ -449,14 +539,38 @@ def build_market_trading_summary(
     previous_market_amount = previous_market_amount_yi
     if previous_market_amount is None and previous:
         previous_market_amount = _scaled_sum(previous_daily, "amount", 100_000)
-    dragon_tiger_net = _scaled_sum(current_top, "net_amount", 100_000_000)
-    previous_dragon_tiger_net = _scaled_sum(previous_top, "net_amount", 100_000_000) if previous else None
-    block_trade_amount = _scaled_sum(current_blocks, "amount", 10_000)
-    previous_block_trade_amount = _scaled_sum(previous_blocks, "amount", 10_000) if previous else None
-    northbound_money = _sum_field_or_none(current_hsgt, "north_money")
-    previous_northbound_money = _sum_field_or_none(previous_hsgt, "north_money") if previous else None
-    main_money_flow = _scaled_sum(current_moneyflow, "net_mf_amount", 10_000)
-    previous_main_money_flow = _scaled_sum(previous_moneyflow, "net_mf_amount", 10_000) if previous else None
+    dragon_tiger_net = (
+        None if "top_list" in incomplete_current
+        else _scaled_sum(current_top, "net_amount", 100_000_000)
+    )
+    previous_dragon_tiger_net = (
+        None if previous and "top_list" in incomplete_previous
+        else _scaled_sum(previous_top, "net_amount", 100_000_000) if previous else None
+    )
+    block_trade_amount = (
+        None if "block_trade" in incomplete_current
+        else _scaled_sum(current_blocks, "amount", 10_000)
+    )
+    previous_block_trade_amount = (
+        None if previous and "block_trade" in incomplete_previous
+        else _scaled_sum(previous_blocks, "amount", 10_000) if previous else None
+    )
+    northbound_money = (
+        None if "moneyflow_hsgt" in incomplete_current
+        else _sum_field_or_none(current_hsgt, "north_money")
+    )
+    previous_northbound_money = (
+        None if previous and "moneyflow_hsgt" in incomplete_previous
+        else _sum_field_or_none(previous_hsgt, "north_money") if previous else None
+    )
+    main_money_flow = (
+        None if "moneyflow" in incomplete_current
+        else _scaled_sum(current_moneyflow, "net_mf_amount", 10_000)
+    )
+    previous_main_money_flow = (
+        None if previous and "moneyflow" in incomplete_previous
+        else _scaled_sum(previous_moneyflow, "net_mf_amount", 10_000) if previous else None
+    )
     margin_balance = _margin_balance_yi(current_margin)
     previous_margin_balance = _margin_balance_yi(previous_margin) if previous else None
 
@@ -464,7 +578,12 @@ def build_market_trading_summary(
         "market_amount": _metric("市场成交额", market_amount, previous_market_amount, "亿元"),
         "main_money_flow": _metric("主力资金流", main_money_flow, previous_main_money_flow, "亿元"),
         "dragon_tiger_net": _metric("龙虎榜净额", dragon_tiger_net, previous_dragon_tiger_net, "亿元"),
-        "dragon_tiger_count": _metric("龙虎榜数量", float(len(current_top)), float(len(previous_top)) if previous else None, "家"),
+        "dragon_tiger_count": _metric(
+            "龙虎榜数量",
+            None if "top_list" in incomplete_current else float(len(current_top)),
+            None if previous and "top_list" in incomplete_previous else float(len(previous_top)) if previous else None,
+            "家",
+        ),
         "block_trade_amount": _metric("大宗交易金额", block_trade_amount, previous_block_trade_amount, "亿元"),
         "margin_balance": _metric(
             "两融余额",
@@ -481,6 +600,9 @@ def build_market_trading_summary(
         "trade_date_key": latest,
         "previous_trade_date": _display_date(previous) if previous else None,
         "previous_trade_date_key": previous,
+        "dragon_tiger_source_row_count": len(current_top_raw),
+        "dragon_tiger_unique_stock_count": len(current_top),
+        "incomplete_datasets": sorted(incomplete_current),
         "metrics": metrics,
         "sync_warnings": store.list_warnings(),
         "cache_signature": cache_signature,
@@ -618,7 +740,14 @@ def build_adjusted_candles(
                 "low": _round_or_none((_to_number(row.get("low")) or 0) * ratio, 4),
                 "close": _round_or_none((_to_number(row.get("close")) or 0) * ratio, 4),
                 "volume": _round_or_none(row.get("vol") if row.get("vol") is not None else row.get("volume")),
-                "amount": _round_or_none(row.get("amount")),
+                # Tushare daily.amount is thousand yuan; the stock-detail
+                # CSV contract exposes ten-thousand yuan.
+                "amount": _round_or_none(
+                    (_to_number(row.get("amount")) * 1000 / 10000)
+                    if _to_number(row.get("amount")) is not None
+                    else None
+                ),
+                "amount_unit": "wan_yuan",
                 "adj_factor": _round_or_none(factor, 8),
                 "adjustment": "qfq",
             }

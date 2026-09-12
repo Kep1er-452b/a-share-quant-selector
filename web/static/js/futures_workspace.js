@@ -9,6 +9,7 @@
         listeners: [],
         chart: null,
         selectedSymbol: null,
+        mode: 'domestic',
     };
 
     const byId = id => document.getElementById(id);
@@ -117,9 +118,29 @@
         return true;
     }
 
+    function switchMode(mode, { refresh = true } = {}) {
+        const nextMode = ['domestic', 'global', 'ratio'].includes(mode) ? mode : 'domestic';
+        lifecycle.mode = nextMode;
+        document.querySelectorAll('[data-futures-mode]').forEach(button => {
+            button.classList.toggle('active', button.dataset.futuresMode === nextMode);
+        });
+        byId('futures-domestic-view')?.classList.toggle('active', nextMode === 'domestic');
+        byId('futures-global-view')?.classList.toggle('active', nextMode !== 'domestic');
+        if (nextMode === 'domestic') {
+            global.quantCommodityWorkspace?.deactivate?.();
+            if (refresh && lifecycle.active) workspace.refresh();
+            return;
+        }
+        global.quantCommodityWorkspace?.activate?.(nextMode === 'ratio' ? 'ratio' : 'series');
+    }
+
     const workspace = {
         mount() {
             if (lifecycle.mounted) return;
+            listen(byId('futures-mode-nav'), 'click', event => {
+                const button = event.target.closest('[data-futures-mode]');
+                if (button) switchMode(button.dataset.futuresMode);
+            });
             listen(byId('futures-refresh'), 'click', () => workspace.refresh());
             listen(byId('futures-search'), 'input', () => {
                 window.clearTimeout(lifecycle.searchTimer);
@@ -150,11 +171,13 @@
         async activate() {
             workspace.mount();
             if (lifecycle.active) {
-                lifecycle.chart?.resize();
+                if (lifecycle.mode === 'domestic') lifecycle.chart?.resize();
+                else global.quantCommodityWorkspace?.activate?.(lifecycle.mode === 'ratio' ? 'ratio' : 'series');
                 return;
             }
             lifecycle.active = true;
-            await workspace.refresh();
+            switchMode(lifecycle.mode, { refresh: false });
+            if (lifecycle.mode === 'domestic') await workspace.refresh();
         },
 
         deactivate() {
@@ -165,14 +188,25 @@
             lifecycle.listeners.forEach(([element, type, handler]) => element.removeEventListener(type, handler));
             lifecycle.listeners = [];
             lifecycle.mounted = false;
+            global.quantCommodityWorkspace?.deactivate?.();
             lifecycle.chart?.dispose();
             lifecycle.chart = null;
             lifecycle.selectedSymbol = null;
+            lifecycle.mode = 'domestic';
+            document.querySelectorAll('[data-futures-mode]').forEach(button => {
+                button.classList.toggle('active', button.dataset.futuresMode === 'domestic');
+            });
+            byId('futures-domestic-view')?.classList.add('active');
+            byId('futures-global-view')?.classList.remove('active');
             if (byId('futures-sync-contract')) byId('futures-sync-contract').hidden = true;
         },
 
         async refresh() {
             if (!lifecycle.active) return;
+            if (lifecycle.mode !== 'domestic') {
+                await global.quantCommodityWorkspace?.refresh?.();
+                return;
+            }
             const params = new URLSearchParams({ limit: '300' });
             const query = byId('futures-search')?.value.trim();
             const exchange = byId('futures-exchange')?.value;

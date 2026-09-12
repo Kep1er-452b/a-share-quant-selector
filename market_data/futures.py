@@ -110,31 +110,46 @@ def _futures_daily_planner(request, state, store):
         raise ValueError("sync planning requires populated fut_basic metadata")
 
     today = date.today().strftime("%Y%m%d")
+    global_cursor = _valid_day((state or {}).get("cursor"))
     supplied_start = _valid_day(request.params.get("start_date"))
     supplied_end = _valid_day(request.params.get("end_date"))
-    resume_cursor = _valid_day((state or {}).get("cursor"))
-    pages = []
+    eligible_rows = []
     for row in sorted(rows, key=lambda item: item["ts_code"]):
-        symbol = row["ts_code"]
         list_date = _valid_day(row.get("active_from") or row.get("list_date"))
         delist_date = _valid_day(row.get("active_to") or row.get("delist_date"))
+        requested_end = supplied_end or today
+        if supplied_start and delist_date and delist_date < supplied_start:
+            continue
+        # A date-only legacy watermark can still identify contracts that were
+        # already dead before the update horizon.  It must not become the
+        # start date for every surviving contract (the F02 failure mode).
+        if not supplied_start and global_cursor and delist_date and delist_date < global_cursor:
+            continue
+        if requested_end and list_date and list_date > requested_end:
+            continue
+        eligible_rows.append((row, list_date, delist_date))
+
+    pages = []
+    for row, list_date, delist_date in eligible_rows:
+        symbol = row["ts_code"]
         symbol_cursor = (
             _valid_day(store.max_data_date("fut_daily", symbol=symbol))
             if hasattr(store, "max_data_date")
             else ""
         )
-        start_date = supplied_start or max(
-            (
-                value
-                for value in (symbol_cursor, resume_cursor, list_date, "19900101")
-                if value
-            ),
-            default="19900101",
-        )
-        end_date = supplied_end or min(
-            (value for value in (delist_date, today) if value),
-            default=today,
-        )
+        # ``state.cursor`` is a dataset-level display watermark.  It cannot
+        # be used as the lower bound for every contract: one newly added
+        # contract may legitimately lag another by years.  The resumable
+        # page identity is handled by SyncEngine's persisted plan instead.
+        # A legacy single-contract state may only contain a date.  Retain its
+        # useful resume behavior when it is unambiguous, while never applying
+        # one dataset-wide cursor to every eligible contract.  Multi-contract
+        # plans derive each lower bound from that contract's own data/lifetime.
+        legacy_single_cursor = global_cursor if len(eligible_rows) == 1 else None
+        requested_start = supplied_start or symbol_cursor or legacy_single_cursor or "19900101"
+        requested_end = supplied_end or today
+        start_date = max(requested_start, list_date or "19900101")
+        end_date = min(requested_end, delist_date or today)
         if start_date > end_date:
             continue
         pages.append(

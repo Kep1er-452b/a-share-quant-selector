@@ -20,12 +20,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DOMAIN_STORE_PATHS = {
     "hong_kong": Path("markets/hong_kong/hong_kong.sqlite"),
     "futures": Path("markets/futures/futures.sqlite"),
+    "global_commodities": Path("markets/global_commodities/global_commodities.sqlite"),
     "macro": Path("economy/economy.sqlite"),
     "industry": Path("industry/industry.sqlite"),
 }
 _LEGACY_DOMAIN_STORE_FILES = {
     "hong_kong": "hong_kong.sqlite",
     "futures": "futures.sqlite",
+    "global_commodities": "global_commodities.sqlite",
     "macro": "economy.sqlite",
     "industry": "industry.sqlite",
 }
@@ -68,6 +70,7 @@ class RuntimePaths:
         for path in (
             self.data_root / "markets" / "hong_kong",
             self.data_root / "markets" / "futures",
+            self.data_root / "markets" / "global_commodities",
             self.data_root / "economy",
             self.data_root / "industry",
             self.data_root / "ops",

@@ -11,7 +11,7 @@
 ### 多市场 Web 控制台
 
 - **EQUITIES**：A 股和港股市场上下文、概览、热力图、股票列表、选股、策略、自选股和 Wyckoff 分析。
-- **FUTURES**：期货合约目录、合约详情和所选合约的日线同步。
+- **FUTURES**：国内期货合约目录、所选合约日线，以及独立的国际商品 CFD 观测和金油/金银/金铜比值研究。
 - **MACRO**：GDP、PMI、PPI 等宏观数据；增长视图区分累计值和推导的单季度流量。
 - **INDUSTRY**：行业分类、成分股、行业数据和可用时的行业指数 K 线。
 - **SYSTEM**：同步任务、结构化事件、健康检查、性能指标和脱敏诊断。
@@ -22,7 +22,8 @@
 
 - AkShare、Tushare、Tencent 使用独立的本地股票数据仓库，可在配置或命令行中选择提供方。
 - Tushare 扩展数据使用独立 SQLite 仓库，保存指数、估值、财务和市场交易快照；重型历史回补默认关闭。
-- 港股、期货、宏观和行业数据使用独立的领域 SQLite 仓库，不与 A 股 CSV 仓库混用。
+- 港股、期货、全球商品观测、宏观和行业数据使用独立的领域 SQLite 仓库，不与 A 股 CSV 仓库混用。
+- 全球商品第一版使用明确标注为新浪 CFD 的 Brent、Gold、Copper、Silver 日线观测；保留原始单位和换算版本，不将其包装成 ICE/COMEX 真实合约。
 - 选股支持进程、线程和顺序执行；可选的 C 加速层失败时回退到 Python 实现。
 - 本地 CSV 写入经过校验、去重、锁定和原子替换，选股读取会应用必要的分析视图修复而不悄悄改写源文件。
 
@@ -146,7 +147,9 @@ export AQS_TUSHARE_EXTENSION_FULL_BACKFILL=1
 ```text
 data/providers/<provider>/              # A 股 CSV 仓库
 data/providers/tushare/extended/        # Tushare 扩展 SQLite 仓库
-<runtime-data-root>/domains/            # 港股、期货、宏观、行业领域仓库
+<runtime-data-root>/markets/            # 港股、期货、全球商品观测领域仓库
+<runtime-data-root>/economy/            # 宏观领域仓库
+<runtime-data-root>/industry/           # 行业领域仓库
 <runtime-output-root>/                  # 选股结果和 Wyckoff 输出
 logs/                                   # 运行日志和诊断信息
 ```
@@ -180,7 +183,7 @@ GitHub Actions 会在 `main` 推送和 Pull Request 中运行 Python 测试。�
 main.py                 # CLI 和 QuantSystem 编排
 web_server.py           # Web 应用、后台任务和兼容接口
 web_api/                # 按市场/领域拆分的 API 蓝图
-market_data/            # 港股、期货、宏观、行业仓库与同步引擎
+market_data/            # 港股、期货、全球商品、宏观、行业仓库与同步引擎
 strategy/               # 自动发现的选股策略
 utils/                  # 数据源、技术指标、CSV、路径和选股执行器
 ops/                    # 事件、任务、健康、性能和诊断

@@ -20,7 +20,7 @@ from threading import Event, Lock, RLock, Thread, Timer
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import yaml
 import pandas as pd
 
@@ -155,6 +155,59 @@ MAX_STOCK_DETAIL_CACHE_ENTRIES = 12
 ACTIVE_JOB_STATUSES = {'queued', 'running', 'cancelling'}
 MAX_RETAINED_TERMINAL_JOBS = 50
 MAX_QUEUED_JOB_SECONDS = 30
+
+
+def _configured_trusted_hosts() -> set[str]:
+    """Return explicit Host allow-list entries without trusting Host itself."""
+
+    values = {"localhost", "127.0.0.1", "::1"}
+    configured = app.config.get("AQS_TRUSTED_HOSTS") or os.getenv("AQS_TRUSTED_HOSTS", "")
+    if isinstance(configured, str):
+        configured = configured.split(",")
+    if isinstance(configured, (list, tuple, set)):
+        values.update(
+            str(value).strip().lower().strip("[]")
+            for value in configured
+            if str(value).strip()
+        )
+    return values
+
+
+def _host_without_port(host: str) -> str:
+    text = str(host or "").strip().lower().rstrip(".")
+    if text.startswith("[") and "]" in text:
+        return text[1:text.index("]")]
+    return text.rsplit(":", 1)[0] if text.count(":") == 1 else text
+
+
+def _is_trusted_host(host: str) -> bool:
+    normalized = _host_without_port(host)
+    return bool(normalized and normalized in _configured_trusted_hosts())
+
+
+def _same_origin_as_request(origin: str) -> bool:
+    try:
+        parsed = urlsplit(str(origin or ""))
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    try:
+        origin_host = parsed.hostname
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    request_host = _host_without_port(request.host)
+    request_port = request.environ.get("SERVER_PORT")
+    if origin_host.lower().rstrip(".") != request_host:
+        return False
+    if origin_port is None:
+        origin_port = 443 if parsed.scheme == "https" else 80
+    try:
+        request_port = int(request_port)
+    except (TypeError, ValueError):
+        request_port = 443 if request.scheme == "https" else 80
+    return int(origin_port) == request_port
 
 
 class JobAdmissionConflict(RuntimeError):
@@ -327,10 +380,14 @@ def _ops_api_circuit_health():
 
 
 ops_health = HealthService(
-    stores={name: _LazyDomainStore(name) for name in ("hong_kong", "futures", "macro", "industry")},
+    stores={
+        name: _LazyDomainStore(name)
+        for name in ("hong_kong", "futures", "global_commodities", "macro", "industry")
+    },
     datasets={
         "hk_daily": {"store": "hong_kong", "frequency": "daily"},
         "fut_daily": {"store": "futures", "frequency": "daily"},
+        "commodity_daily": {"store": "global_commodities", "frequency": "daily"},
         "cn_gdp": {"store": "macro", "frequency": "quarterly"},
         "cn_cpi": {"store": "macro", "frequency": "monthly"},
         "cn_ppi": {"store": "macro", "frequency": "monthly"},
@@ -1750,11 +1807,15 @@ def _run_hong_kong_selection_job(job_id, formula_spec, service):
         reader = HongKongEquityReader(service)
         candidates = []
         offset = 0
+        page_limit = min(
+            int(getattr(service, 'MAX_PAGE_LIMIT', 200)),
+            200,
+        )
         while True:
             if cancel_event and cancel_event.is_set():
                 _update_job(job_id, status='cancelled', finished_at=_job_timestamp())
                 return
-            page = reader.list_instruments('', limit=2000, offset=offset)
+            page = reader.list_instruments('', limit=page_limit, offset=offset)
             items = page.get('items') or []
             candidates.extend(
                 (item.get('symbol') or item.get('ts_code'), item.get('name') or item.get('symbol'))
@@ -1851,12 +1912,24 @@ def _start_hong_kong_selection(payload, service):
 
 @app.before_request
 def block_requests_after_halt():
+    if not _is_trusted_host(request.host):
+        # Do not render the application shell here: it contains the local
+        # session token used by side-effect APIs.
+        return Response("Invalid Host header", status=400, mimetype="text/plain")
     if request.path.startswith('/api/'):
         g.ops_request_started_at = time.perf_counter()
     sensitive_get = request.path.startswith('/api/ops/')
-    if request.path.startswith('/api/') and (
+    side_effect_request = request.path.startswith('/api/') and (
         request.method not in {'GET', 'HEAD', 'OPTIONS'} or sensitive_get
-    ):
+    )
+    if side_effect_request:
+        origin = request.headers.get("Origin")
+        if origin and not _same_origin_as_request(origin):
+            return jsonify({
+                'success': False,
+                'error': '不受信任的请求来源',
+                'code': 'UNTRUSTED_ORIGIN',
+            }), 403
         token_error = _require_session_token()
         if token_error:
             return token_error
@@ -2908,14 +2981,22 @@ def get_stock_detail(code):
         ext_store = _tushare_ext_store()
         ext_path = Path(ext_store.db_path)
         ext_stat = ext_path.stat() if ext_path.exists() else None
+        try:
+            ext_signature = ext_store.storage_signature()
+        except Exception:
+            ext_signature = (
+                (ext_stat.st_mtime_ns, ext_stat.st_size) if ext_stat else None
+            )
+        active_provider = _active_provider_name()
         cache_key = (
             str(csv_path),
             code,
+            active_provider,
             requested_period,
             str(request.args.get('limit') or ''),
             str(request.args.get('indicator_lookback') or ''),
             (csv_stat.st_mtime_ns, csv_stat.st_size) if csv_stat else None,
-            (ext_stat.st_mtime_ns, ext_stat.st_size) if ext_stat else None,
+            ext_signature,
         )
         cache_enabled = csv_path is not None
         if cache_enabled:
@@ -2979,6 +3060,18 @@ def get_stock_detail(code):
                 'VIOLENT_K_Y': _json_number(overlay_df.iloc[i]['VIOLENT_K_Y'], 2),
             })
         
+        adjusted_data = build_adjusted_candles(
+            ext_store,
+            code,
+            limit=limit,
+            required_trade_dates=[item.get('date') for item in data],
+        )
+        # The CSV-backed frame is the sole chart and indicator source.  A
+        # Tushare-derived qfq series remains available as an explicitly
+        # labelled comparison/reference payload, but it must never silently
+        # replace candles whose indicators were calculated from another
+        # provider (or from a different adjustment snapshot).
+        chart_source = f"a_share_csv:{active_provider}"
         response_payload = {
             'success': True,
             'code': code,
@@ -2988,6 +3081,8 @@ def get_stock_detail(code):
             'limit': limit,
             'total_bars': total_bars,
             'max_limit': STOCK_DETAIL_MAX_LIMIT,
+            'chart_source': chart_source,
+            'calculation_source': chart_source,
             'data': data,
             'calculation_data': [
                 {
@@ -3001,12 +3096,8 @@ def get_stock_detail(code):
                 }
                 for _, row in df.head(context_count).iterrows()
             ],
-            'adjusted_data': build_adjusted_candles(
-                ext_store,
-                code,
-                limit=limit,
-                required_trade_dates=[item.get('date') for item in data],
-            ),
+            'adjusted_data': adjusted_data,
+            'adjusted_data_source': 'tushare_extension_qfq_reference' if adjusted_data else None,
             **build_stock_extension_payload(ext_store, code),
         }
         if cache_enabled:
@@ -4919,6 +5010,14 @@ def run_web_server(host=None, port=None, debug=False, config=None, auto_port=Non
     allow_lan = bool(_config_value(config, "web", "allow_lan", default=False))
     if host not in {"127.0.0.1", "localhost", "::1"} and not allow_lan:
         raise OSError("Web 默认只允许本机访问；如需局域网访问，请在配置中设置 web.allow_lan: true")
+    trusted_hosts = _config_value(config, "web", "trusted_hosts", default=())
+    if isinstance(trusted_hosts, str):
+        trusted_hosts = [item.strip() for item in trusted_hosts.split(",") if item.strip()]
+    app.config["AQS_TRUSTED_HOSTS"] = list(trusted_hosts or ())
+    if host not in {"0.0.0.0", "::", ""}:
+        app.config["AQS_TRUSTED_HOSTS"].append(host)
+    if allow_lan and not app.config["AQS_TRUSTED_HOSTS"]:
+        print("⚠️ web.allow_lan 已启用，但未配置 web.trusted_hosts；非回环 Host 将被拒绝")
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"🌐 启动Web服务器: http://{display_host}:{port}")
     Thread(target=_warm_market_caches_background, daemon=True).start()

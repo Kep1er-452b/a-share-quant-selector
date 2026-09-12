@@ -661,7 +661,7 @@
                     <header class="domain-workspace-bar">
                         <div>
                             <span class="panel-title">FUTURES MARKET</span>
-                            <span class="domain-workspace-sub">合约检索、本地日线与结算字段</span>
+                            <span class="domain-workspace-sub">国内合约、全球商品观测与可解释比值</span>
                         </div>
                         <div class="domain-workspace-actions">
                             <span class="domain-status" id="futures-status">LOCAL STORE</span>
@@ -674,51 +674,120 @@
                             <button class="btn btn-ghost" id="futures-refresh" type="button">REFRESH</button>
                         </div>
                     </header>
-                    <div class="domain-split domain-split-narrow">
-                        <section class="domain-pane">
-                            <div class="domain-filter-grid">
-                                <label class="domain-field domain-field-wide">
-                                    <span>CONTRACT SEARCH</span>
-                                    <input id="futures-search" class="search-input" type="search" placeholder="IF2607 / AU / 合约名称">
-                                </label>
-                                <label class="domain-field">
-                                    <span>EXCHANGE</span>
-                                    <select id="futures-exchange">
-                                        <option value="">全部交易所</option>
-                                        <option value="CFFEX">CFFEX</option>
-                                        <option value="SHFE">SHFE</option>
-                                        <option value="DCE">DCE</option>
-                                        <option value="CZCE">CZCE</option>
-                                        <option value="INE">INE</option>
-                                        <option value="GFEX">GFEX</option>
-                                    </select>
-                                </label>
-                                <label class="domain-field">
-                                    <span>PRODUCT</span>
-                                    <input id="futures-product" class="search-input" type="text" placeholder="IF / AU">
-                                </label>
-                            </div>
-                            <div class="domain-table-shell">
-                                <table class="data-table domain-table">
-                                    <thead><tr><th>合约</th><th>品种</th><th>交易所</th><th>到期日</th></tr></thead>
-                                    <tbody id="futures-contracts-body">
-                                        <tr><td colspan="4" class="state-empty">等待读取本地合约仓库</td></tr>
-                                    </tbody>
-                                </table>
-                            </div>
-                        </section>
-                        <section class="domain-pane domain-chart-pane">
-                            <div class="domain-pane-head">
-                                <div>
-                                    <span class="panel-title" id="futures-chart-title">SELECT CONTRACT</span>
-                                    <span class="domain-workspace-sub" id="futures-chart-meta">OHLC / SETTLE / OI</span>
+                    <nav class="domain-tab-strip futures-mode-switch" id="futures-mode-nav" aria-label="期货与商品视图">
+                        <button class="domain-tab active" data-futures-mode="domestic" type="button">国内合约</button>
+                        <button class="domain-tab" data-futures-mode="global" type="button">国际商品</button>
+                        <button class="domain-tab" data-futures-mode="ratio" type="button">比值研究</button>
+                    </nav>
+                    <div id="futures-domestic-view" class="futures-mode-view active">
+                        <div class="domain-split domain-split-narrow">
+                            <section class="domain-pane">
+                                <div class="domain-filter-grid">
+                                    <label class="domain-field domain-field-wide">
+                                        <span>CONTRACT SEARCH</span>
+                                        <input id="futures-search" class="search-input" type="search" placeholder="IF2607 / AU / 合约名称">
+                                    </label>
+                                    <label class="domain-field">
+                                        <span>EXCHANGE</span>
+                                        <select id="futures-exchange">
+                                            <option value="">全部交易所</option>
+                                            <option value="CFFEX">CFFEX</option>
+                                            <option value="SHFE">SHFE</option>
+                                            <option value="DCE">DCE</option>
+                                            <option value="CZCE">CZCE</option>
+                                            <option value="INE">INE</option>
+                                            <option value="GFEX">GFEX</option>
+                                        </select>
+                                    </label>
+                                    <label class="domain-field">
+                                        <span>PRODUCT</span>
+                                        <input id="futures-product" class="search-input" type="text" placeholder="IF / AU">
+                                    </label>
                                 </div>
-                                <button class="btn btn-ghost" id="futures-sync-contract" type="button" hidden>
-                                    SYNC CONTRACT
-                                </button>
+                                <div class="domain-table-shell">
+                                    <table class="data-table domain-table">
+                                        <thead><tr><th>合约</th><th>品种</th><th>交易所</th><th>到期日</th></tr></thead>
+                                        <tbody id="futures-contracts-body">
+                                            <tr><td colspan="4" class="state-empty">等待读取本地合约仓库</td></tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </section>
+                            <section class="domain-pane domain-chart-pane">
+                                <div class="domain-pane-head">
+                                    <div>
+                                        <span class="panel-title" id="futures-chart-title">SELECT CONTRACT</span>
+                                        <span class="domain-workspace-sub" id="futures-chart-meta">OHLC / SETTLE / OI</span>
+                                    </div>
+                                    <button class="btn btn-ghost" id="futures-sync-contract" type="button" hidden>
+                                        SYNC CONTRACT
+                                    </button>
+                                </div>
+                                <div class="domain-chart" id="futures-kline"></div>
+                            </section>
+                        </div>
+                    </div>
+                    <div id="futures-global-view" class="futures-mode-view">
+                        <section class="domain-pane commodity-overview-pane">
+                            <div class="domain-pane-head domain-pane-head-wrap">
+                                <div>
+                                    <span class="panel-title">GLOBAL COMMODITY OBSERVATION</span>
+                                    <span class="domain-workspace-sub">Sina CFD 观测源；不是 ICE / COMEX 真实合约</span>
+                                </div>
+                                <div class="domain-workspace-actions">
+                                    <span class="domain-status" id="commodity-status">LOCAL STORE</span>
+                                    <div class="domain-sync-controls" data-sync-domain="global_commodities">
+                                        <span class="domain-sync-state">EMPTY</span>
+                                        <button class="btn btn-ghost domain-sync-start" type="button">SYNC</button>
+                                        <button class="btn btn-danger domain-sync-cancel" type="button" hidden>CANCEL</button>
+                                        <button class="btn btn-ghost domain-sync-retry" type="button" hidden>RETRY</button>
+                                    </div>
+                                    <button class="btn btn-ghost" id="commodity-refresh" type="button">REFRESH</button>
+                                </div>
                             </div>
-                            <div class="domain-chart" id="futures-kline"></div>
+                            <div class="commodity-card-grid" id="commodity-cards">
+                                <div class="state-empty">等待读取本地商品观测数据</div>
+                            </div>
                         </section>
+                        <div class="domain-split domain-split-sidebar commodity-analysis-grid">
+                            <aside class="domain-pane commodity-browser">
+                                <div class="domain-pane-head">
+                                    <span class="panel-title">RESEARCH INPUT</span>
+                                    <span class="domain-workspace-sub" id="commodity-source-meta">CFD / CLOSE</span>
+                                </div>
+                                <div class="commodity-control-grid">
+                                    <label class="domain-field">
+                                        <span>LINE</span>
+                                        <select id="commodity-series-select"></select>
+                                    </label>
+                                    <label class="domain-field">
+                                        <span>RATIO</span>
+                                        <select id="commodity-ratio-select"></select>
+                                    </label>
+                                    <label class="domain-field">
+                                        <span>VISIBLE POINTS</span>
+                                        <select id="commodity-limit-select">
+                                            <option value="260">260</option>
+                                            <option value="520" selected>520</option>
+                                            <option value="1000">1000</option>
+                                            <option value="2000">2000</option>
+                                        </select>
+                                    </label>
+                                </div>
+                                <button class="btn btn-primary commodity-load-btn" id="commodity-load" type="button">LOAD CHART</button>
+                                <div class="commodity-quality" id="commodity-quality">QUALITY --</div>
+                            </aside>
+                            <section class="domain-pane domain-chart-pane commodity-chart-pane">
+                                <div class="domain-pane-head domain-pane-head-wrap">
+                                    <div>
+                                        <span class="panel-title" id="commodity-chart-title">SELECT SERIES</span>
+                                        <span class="domain-workspace-sub" id="commodity-chart-meta">LOCAL OBSERVATION / CLOSE</span>
+                                    </div>
+                                    <span class="domain-unit-legend" id="commodity-chart-unit">UNIT --</span>
+                                </div>
+                                <div class="domain-chart" id="commodity-chart"></div>
+                            </section>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -1145,6 +1214,7 @@
 <script src="/static/js/market_context.js"></script>
 <script src="/static/js/equity_router.js"></script>
 <script src="/static/js/futures_workspace.js"></script>
+<script src="/static/js/commodity_workspace.js"></script>
 <script src="/static/js/macro_workspace.js"></script>
 <script src="/static/js/industry_workspace.js"></script>
 <script src="/static/js/system_workspace.js"></script>

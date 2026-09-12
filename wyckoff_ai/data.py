@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from utils.price_adjustment import DEFAULT_GAP_THRESHOLD, repair_adjustment_gaps
+from market_data.equity_symbols import canonical_a_share_symbol
 from market_data.hong_kong import canonical_hk_symbol
 
 
@@ -36,12 +37,10 @@ def _canonical_market_symbol(market: str, symbol: object) -> str:
     if market_id == "hong_kong":
         return canonical_hk_symbol(symbol)
     if market_id == "a_share":
-        text = str(symbol or "").strip().upper()
-        code = text.split(".", 1)[0]
-        if len(code) != 6 or not code.isdigit():
-            raise WyckoffDataError("A 股代码必须为 6 位数字")
-        suffix = "BJ" if code.startswith(("4", "8")) else ("SH" if code.startswith("6") else "SZ")
-        return f"{code}.{suffix}"
+        try:
+            return canonical_a_share_symbol(symbol)
+        except ValueError as exc:
+            raise WyckoffDataError(str(exc)) from exc
     raise WyckoffDataError(f"不支持的股票市场: {market_id}")
 
 
@@ -63,7 +62,13 @@ def build_wyckoff_input(
         raw = reader.read_analysis_frame(canonical)
     except Exception as exc:
         raise WyckoffDataError(f"无法从 {market_id} reader 读取行情: {exc}") from exc
-    frame = normalize_ohlcv(raw, min_rows=min_rows)
+    frame = normalize_ohlcv(
+        raw,
+        min_rows=min_rows,
+        market=market_id,
+        list_date=metadata.get("list_date"),
+        board=metadata.get("board"),
+    )
     canonical = _canonical_market_symbol(
         market_id, metadata.get("symbol") or canonical
     )
@@ -94,7 +99,14 @@ def _find_column(columns: Iterable[str], aliases: list[str]) -> str | None:
     return None
 
 
-def normalize_ohlcv(df: pd.DataFrame, min_rows: int = MIN_REQUIRED_ROWS) -> pd.DataFrame:
+def normalize_ohlcv(
+    df: pd.DataFrame,
+    min_rows: int = MIN_REQUIRED_ROWS,
+    *,
+    market: str | None = None,
+    list_date=None,
+    board: str | None = None,
+) -> pd.DataFrame:
     """Return an ascending-date dataframe with standard OHLCV columns and indicators."""
     if df is None or df.empty:
         raise WyckoffDataError("CSV 数据为空，无法进行威科夫分析")
@@ -126,7 +138,13 @@ def normalize_ohlcv(df: pd.DataFrame, min_rows: int = MIN_REQUIRED_ROWS) -> pd.D
     if len(result) < min_rows:
         raise WyckoffDataError(f"有效行情不足 {min_rows} 条，当前只有 {len(result)} 条")
 
-    result, adjustment_repairs = repair_adjustment_gaps(result, threshold=ADJUSTMENT_GAP_THRESHOLD)
+    result, adjustment_repairs = repair_adjustment_gaps(
+        result,
+        threshold=ADJUSTMENT_GAP_THRESHOLD,
+        market=market,
+        list_date=list_date,
+        board=board,
+    )
     result = result.sort_values("date", ascending=True).reset_index(drop=True)
     result["ma50"] = result["close"].rolling(50, min_periods=1).mean()
     result["ma200"] = result["close"].rolling(200, min_periods=1).mean()
@@ -138,7 +156,14 @@ def normalize_ohlcv(df: pd.DataFrame, min_rows: int = MIN_REQUIRED_ROWS) -> pd.D
     return result
 
 
-def load_stock_csv(path: str | Path, min_rows: int = MIN_REQUIRED_ROWS) -> pd.DataFrame:
+def load_stock_csv(
+    path: str | Path,
+    min_rows: int = MIN_REQUIRED_ROWS,
+    *,
+    market: str | None = None,
+    list_date=None,
+    board: str | None = None,
+) -> pd.DataFrame:
     """Read a local CSV file and return normalized Wyckoff-ready data."""
     csv_path = Path(path)
     if not csv_path.exists():
@@ -147,7 +172,13 @@ def load_stock_csv(path: str | Path, min_rows: int = MIN_REQUIRED_ROWS) -> pd.Da
         raw = pd.read_csv(csv_path)
     except UnicodeDecodeError:
         raw = pd.read_csv(csv_path, encoding="gb18030")
-    return normalize_ohlcv(raw, min_rows=min_rows)
+    return normalize_ohlcv(
+        raw,
+        min_rows=min_rows,
+        market=market,
+        list_date=list_date,
+        board=board,
+    )
 
 
 def model_frame(df: pd.DataFrame, rows: int = MODEL_ROWS) -> pd.DataFrame:

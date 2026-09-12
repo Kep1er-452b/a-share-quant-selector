@@ -63,6 +63,11 @@ def normalize_hk_daily(payload: Any) -> list[dict[str, Any]]:
                 "currency": CURRENCY,
             }
         )
+        # The shared technical/visualization contract calls this field
+        # ``volume``.  Keep the provider-native ``vol`` as evidence and copy
+        # it without guessing a unit conversion.
+        if row.get("volume") in (None, "") and "vol" in row:
+            row["volume"] = row["vol"]
         normalized.append(row)
     return normalized
 

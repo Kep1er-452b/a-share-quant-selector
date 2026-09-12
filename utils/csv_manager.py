@@ -7,6 +7,7 @@ import tempfile
 import hashlib
 import json
 import weakref
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from threading import RLock
 import pandas as pd
@@ -126,6 +127,7 @@ class CSVManager:
             stock_code=stock_code,
             list_date=self._listing_date(stock_code),
             board=self._board_for_code(stock_code),
+            market="a_share",
         )
         repaired.attrs["adjustment_repairs"] = repairs
         return repaired
@@ -141,25 +143,37 @@ class CSVManager:
         return "main"
 
     def _listing_date(self, stock_code):
-        """Read optional provider metadata once per file revision."""
-        path = self.data_dir / "tushare_stock_map.json"
-        try:
-            stat = path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            return None
-        if signature != self._listing_metadata_signature:
+        """Read provider-neutral listing metadata once per file revision."""
+        paths = (
+            self.data_dir / "listing_dates.json",
+            self.data_dir / "tushare_stock_map.json",
+        )
+        signatures = []
+        for path in paths:
             try:
-                with path.open("r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-                self._listing_dates = {
-                    str(code): str(item.get("list_date") or "").strip() or None
-                    for code, item in (payload or {}).items()
-                    if isinstance(item, dict)
-                }
-                self._listing_metadata_signature = signature
-            except (OSError, ValueError, TypeError):
-                return None
+                stat = path.stat()
+                signatures.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                signatures.append((str(path), None, None))
+        signature = tuple(signatures)
+        if signature != self._listing_metadata_signature:
+            listing_dates = {}
+            for path in paths:
+                try:
+                    with path.open("r", encoding="utf-8") as handle:
+                        payload = json.load(handle)
+                except (OSError, ValueError, TypeError):
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                for code, item in payload.items():
+                    if isinstance(item, Mapping):
+                        item = item.get("list_date") or item.get("listing_date")
+                    date_text = str(item or "").strip()
+                    if date_text:
+                        listing_dates[str(code).strip().zfill(6)] = date_text
+            self._listing_dates = listing_dates
+            self._listing_metadata_signature = signature
         return self._listing_dates.get(stock_code)
 
     def _validate_stock_dataframe(self, df):

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from typing import Any
 
 from market_data.catalog import DatasetCatalog
@@ -410,25 +412,60 @@ class SyncEngine:
     ) -> _PlannedOutcome:
         """Execute explicit resumable request slices without retaining all rows."""
 
+        plan_fingerprint = self._request_fingerprint(spec, request)
+        persisted_details = (state or {}).get("details") or {}
+        pages = self._restore_persisted_plan(persisted_details, plan_fingerprint)
         try:
-            raw_pages = tuple(spec.request_planner(request, state, self.store))
-            if len(raw_pages) > spec.max_fetch_pages:
+            if pages is not None and len(pages) > spec.max_fetch_pages:
                 raise ValueError(
-                    f"sync plan for {spec.dataset_id} exceeds {spec.max_fetch_pages} pages"
+                    f"persisted sync plan for {spec.dataset_id} exceeds "
+                    f"{spec.max_fetch_pages} pages"
                 )
-            base_params = self._parameters(spec, request, state)
-            pages = tuple(
-                FetchPage(
-                    cursor=page.cursor,
-                    params={**base_params, **dict(page.params)},
+            if pages is None:
+                raw_pages = tuple(spec.request_planner(request, state, self.store))
+                if len(raw_pages) > spec.max_fetch_pages:
+                    raise ValueError(
+                        f"sync plan for {spec.dataset_id} exceeds {spec.max_fetch_pages} pages"
+                    )
+                base_params = self._parameters(spec, request, state)
+                pages = tuple(
+                    FetchPage(
+                        cursor=page.cursor,
+                        params={**base_params, **dict(page.params)},
+                    )
+                    for page in (self._fetch_page(item) for item in raw_pages)
                 )
-                for page in (self._fetch_page(item) for item in raw_pages)
-            )
             if not pages:
                 raise ValueError(f"sync plan for {spec.dataset_id} is empty")
             if any(not page.params for page in pages):
                 raise ValueError(
                     f"full sync plan for {spec.dataset_id} requires explicit parameters"
+                )
+            plan_details = self._plan_details(
+                spec,
+                request,
+                pages,
+                plan_fingerprint,
+                plan_cursor=None,
+                page_offset=0,
+                page_complete=False,
+            )
+            state_error = self._safe_set_state(
+                spec,
+                request,
+                status="running",
+                cursor=(state or {}).get("cursor"),
+                row_count=0,
+                details=plan_details,
+            )
+            if state_error:
+                return _PlannedOutcome(
+                    DatasetSyncResult(
+                        spec.dataset_id,
+                        "failed",
+                        error=f"sync state write failed: {state_error}",
+                    ),
+                    "failed",
                 )
         except Exception as exc:
             issue = self._record_endpoint_issue(spec, request, state, exc)
@@ -470,6 +507,8 @@ class SyncEngine:
                         page.cursor,
                         offset,
                         False,
+                        pages=pages,
+                        plan_fingerprint=plan_fingerprint,
                     )
                 params = dict(page.params)
                 if spec.fetch_page_size is not None:
@@ -487,6 +526,8 @@ class SyncEngine:
                         data_cursor,
                         page.cursor,
                         offset,
+                        pages=pages,
+                        plan_fingerprint=plan_fingerprint,
                     )
                 fetch_calls += 1
                 self._emit(
@@ -509,6 +550,8 @@ class SyncEngine:
                             page.cursor,
                             offset,
                             False,
+                            pages=pages,
+                            plan_fingerprint=plan_fingerprint,
                         )
                     self._emit(
                         emitter,
@@ -530,6 +573,8 @@ class SyncEngine:
                         data_cursor,
                         page.cursor,
                         offset,
+                        pages=pages,
+                        plan_fingerprint=plan_fingerprint,
                     )
 
                 self._emit(
@@ -561,6 +606,8 @@ class SyncEngine:
                         data_cursor,
                         page.cursor,
                         offset,
+                        pages=pages,
+                        plan_fingerprint=plan_fingerprint,
                     )
                 rows_written += write.rows_written
                 skipped_rows += write.skipped_rows
@@ -593,10 +640,15 @@ class SyncEngine:
                         cursor=data_cursor,
                         row_count=rows_written,
                         details={
-                            "method": spec.method,
-                            "plan_cursor": page.cursor,
-                            "page_offset": next_offset,
-                            "page_complete": page_complete and not write.cancelled,
+                            **self._plan_details(
+                                spec,
+                                request,
+                                pages,
+                                plan_fingerprint,
+                                plan_cursor=page.cursor,
+                                page_offset=next_offset,
+                                page_complete=page_complete and not write.cancelled,
+                            ),
                         },
                     )
                 if state_error:
@@ -620,6 +672,8 @@ class SyncEngine:
                         page.cursor,
                         offset,
                         False,
+                        pages=pages,
+                        plan_fingerprint=plan_fingerprint,
                     )
                 if page_complete:
                     completed_pages = page_index + 1
@@ -655,6 +709,8 @@ class SyncEngine:
                     data_cursor,
                     pages[-1].cursor,
                     0,
+                    pages=pages,
+                    plan_fingerprint=plan_fingerprint,
                 )
             self._emit(
                 emitter,
@@ -724,6 +780,90 @@ class SyncEngine:
         return value
 
     @staticmethod
+    def _request_fingerprint(spec: DatasetSpec, request: SyncRequest) -> str:
+        """Return a stable identity for the plan inputs.
+
+        A retry must use the same concrete plan that was used for the first
+        attempt. Date planners commonly depend on today's date, so rebuilding
+        a failed plan can silently skip or duplicate a window. ``force`` is
+        deliberately excluded because it controls freshness, not slices.
+        """
+
+        payload = {
+            "dataset_id": spec.dataset_id,
+            "domain": spec.domain,
+            "method": spec.method,
+            "scope": request.scope,
+            "datasets": list(request.datasets),
+            "params": dict(request.params),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _plan_details(
+        spec: DatasetSpec,
+        request: SyncRequest,
+        pages: Iterable[FetchPage],
+        plan_fingerprint: str,
+        *,
+        plan_cursor: str | None,
+        page_offset: int,
+        page_complete: bool,
+    ) -> dict[str, Any]:
+        """Serialize the bounded plan together with its exact resume point."""
+
+        return {
+            "method": spec.method,
+            "plan_fingerprint": plan_fingerprint,
+            "plan_pages": [
+                {"cursor": page.cursor, "params": dict(page.params)}
+                for page in pages
+            ],
+            "plan_cursor": plan_cursor,
+            "page_offset": max(0, int(page_offset or 0)),
+            "page_complete": bool(page_complete),
+            "request_scope": request.scope,
+        }
+
+    @staticmethod
+    def _restore_persisted_plan(
+        details: Mapping[str, Any], plan_fingerprint: str
+    ) -> tuple[FetchPage, ...] | None:
+        """Restore a previous bounded plan, rejecting malformed/stale state."""
+
+        if details.get("plan_fingerprint") != plan_fingerprint:
+            return None
+        raw_pages = details.get("plan_pages")
+        if not isinstance(raw_pages, list) or not raw_pages:
+            return None
+        if len(raw_pages) > 100_000:
+            return None
+        pages: list[FetchPage] = []
+        try:
+            for raw_page in raw_pages:
+                if not isinstance(raw_page, Mapping):
+                    return None
+                params = raw_page.get("params")
+                if not isinstance(params, Mapping):
+                    return None
+                pages.append(
+                    FetchPage(
+                        cursor=raw_page.get("cursor"),
+                        params=dict(params),
+                    )
+                )
+        except (TypeError, ValueError):
+            return None
+        return tuple(pages)
+
+    @staticmethod
     def _resume_position(state) -> tuple[str | None, int, bool]:
         if not state or state.get("status") not in {
             "running",
@@ -752,6 +892,9 @@ class SyncEngine:
         plan_cursor,
         page_offset,
         page_complete,
+        *,
+        pages: Iterable[FetchPage],
+        plan_fingerprint: str,
     ) -> _PlannedOutcome:
         state_error = self._safe_set_state(
             spec,
@@ -759,12 +902,15 @@ class SyncEngine:
             status="cancelled",
             cursor=cursor,
             row_count=rows_written,
-            details={
-                "method": spec.method,
-                "plan_cursor": plan_cursor,
-                "page_offset": page_offset,
-                "page_complete": bool(page_complete),
-            },
+            details=self._plan_details(
+                spec,
+                request,
+                pages,
+                plan_fingerprint,
+                plan_cursor=plan_cursor,
+                page_offset=page_offset,
+                page_complete=page_complete,
+            ),
         )
         message = f"sync state write failed: {state_error}" if state_error else None
         status = "failed" if state_error else "cancelled"
@@ -789,6 +935,9 @@ class SyncEngine:
         cursor,
         plan_cursor,
         page_offset,
+        *,
+        pages: Iterable[FetchPage],
+        plan_fingerprint: str,
     ) -> _PlannedOutcome:
         provider_issue = classify_provider_error(exc)
         message = provider_issue.message or self._message(exc)
@@ -803,10 +952,15 @@ class SyncEngine:
             warning=warning,
             row_count=rows_written,
             details={
-                "method": spec.method,
-                "plan_cursor": plan_cursor,
-                "page_offset": page_offset,
-                "page_complete": False,
+                **self._plan_details(
+                    spec,
+                    request,
+                    pages,
+                    plan_fingerprint,
+                    plan_cursor=plan_cursor,
+                    page_offset=page_offset,
+                    page_complete=False,
+                ),
                 "error_code": provider_issue.code,
                 "retryable": provider_issue.retryable,
             },

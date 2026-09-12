@@ -28,16 +28,40 @@ def _prepare_prices(df: pd.DataFrame) -> pd.DataFrame:
     return result.sort_values("date", ascending=True).reset_index(drop=True)
 
 
+def _repair_policy(market: str | None, board: str | None) -> tuple[bool, str]:
+    """Return whether the legacy heuristic is safe for this analysis view.
+
+    The old public functions intentionally keep their historical behaviour
+    when ``market`` is omitted.  New market-aware callers must opt into the
+    A-share policy explicitly.  In particular, Hong Kong prices have no
+    A-share limit model and Beijing-listed equities have a 30% limit, so a
+    generic 26% discontinuity is not evidence of a mixed-adjustment series.
+    """
+
+    if market is None:
+        return True, "legacy_unspecified_market"
+    market_id = str(market or "").strip().lower()
+    if market_id != "a_share":
+        return False, "market_not_supported_by_a_share_heuristic"
+    if str(board or "").strip().lower() in {"beijing", "bse"}:
+        return False, "beijing_limit_model_requires_explicit_adjustment_evidence"
+    return True, "a_share_mixed_adjustment_heuristic"
+
+
 def detect_adjustment_gaps(
     df: pd.DataFrame,
     threshold: float = DEFAULT_GAP_THRESHOLD,
     stock_code: str | None = None,
     list_date=None,
     board: str | None = None,
+    market: str | None = None,
 ) -> list[dict]:
     """Find likely mixed-qfq discontinuities in an ascending analysis series."""
     prices = _prepare_prices(df)
     if len(prices) < 2:
+        return []
+    enabled, _policy_reason = _repair_policy(market, board)
+    if not enabled:
         return []
 
     # 向量化检测 gap
@@ -106,11 +130,24 @@ def repair_adjustment_gaps(
     stock_code: str | None = None,
     list_date=None,
     board: str | None = None,
+    market: str | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Return an adjusted analysis view without mutating the source CSV."""
     result = _prepare_prices(df)
     if result.empty:
         return df.copy() if df is not None else pd.DataFrame(), []
+
+    enabled, policy_reason = _repair_policy(market, board)
+    if not enabled:
+        result.attrs["adjustment_repairs"] = []
+        result.attrs["adjustment_policy"] = {
+            "market": market,
+            "board": board,
+            "enabled": False,
+            "reason": policy_reason,
+            "version": "2",
+        }
+        return result.sort_values("date", ascending=False).reset_index(drop=True), []
 
     for column in PRICE_COLUMNS:
         if column not in result.columns and column in df.columns:
@@ -125,6 +162,13 @@ def repair_adjustment_gaps(
     
     if length < 2:
         result.attrs["adjustment_repairs"] = repairs
+        result.attrs["adjustment_policy"] = {
+            "market": market,
+            "board": board,
+            "enabled": True,
+            "reason": policy_reason,
+            "version": "2",
+        }
         return result.sort_values("date", ascending=False).reset_index(drop=True), repairs
     
     prev_close = close_arr[:-1]
@@ -177,6 +221,9 @@ def repair_adjustment_gaps(
         repairs.append({
             "stock_code": stock_code,
             "date": pd.Timestamp(result.at[actual_idx, "date"]).strftime("%Y-%m-%d"),
+            "reason": "mixed_adjustment_gap_heuristic",
+            "source": "local_ohlcv_gap_detector",
+            "version": "2",
             "gap_pct": round(overnight_gap[idx] * 100, 4),
             "factor": round(factor_val, 8),
             "previous_close_before_repair": round(float(prev_close[idx]), 4),
@@ -184,4 +231,11 @@ def repair_adjustment_gaps(
         })
 
     result.attrs["adjustment_repairs"] = repairs
+    result.attrs["adjustment_policy"] = {
+        "market": market,
+        "board": board,
+        "enabled": True,
+        "reason": policy_reason,
+        "version": "2",
+    }
     return result.sort_values("date", ascending=False).reset_index(drop=True), repairs

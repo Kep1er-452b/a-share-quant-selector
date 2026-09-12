@@ -147,6 +147,7 @@ def test_packaged_first_start_creates_approved_empty_runtime_layout(tmp_path):
     expected = (
         paths.data_root / "markets" / "hong_kong",
         paths.data_root / "markets" / "futures",
+        paths.data_root / "markets" / "global_commodities",
         paths.data_root / "economy",
         paths.data_root / "industry",
         paths.data_root / "ops",
@@ -174,6 +175,9 @@ def test_approved_domain_and_ops_store_paths_match_packaged_layout(tmp_path):
     )
     assert paths.domain_store_path("futures") == (
         paths.data_root / "markets" / "futures" / "futures.sqlite"
+    )
+    assert paths.domain_store_path("global_commodities") == (
+        paths.data_root / "markets" / "global_commodities" / "global_commodities.sqlite"
     )
     assert paths.domain_store_path("macro") == paths.data_root / "economy" / "economy.sqlite"
     assert paths.domain_store_path("industry") == paths.data_root / "industry" / "industry.sqlite"

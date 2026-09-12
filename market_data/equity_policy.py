@@ -7,7 +7,8 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 import pandas as pd
 
-from market_data.hong_kong import canonical_hk_symbol
+from market_data.equity_symbols import a_share_code, canonical_a_share_symbol
+from market_data.hong_kong import canonical_hk_symbol, normalize_hk_daily
 from utils.strategy_labels import is_invalid_stock_name
 
 
@@ -79,12 +80,8 @@ class EquityPolicy:
 
 
 def _canonical_a_share_symbol(value: object) -> tuple[str, str]:
-    text = str(value or "").strip().upper()
-    code = text.split(".", 1)[0]
-    if len(code) != 6 or not code.isdigit():
-        raise ValueError("A-share symbol must contain six digits")
-    suffix = "BJ" if code.startswith(("4", "8")) else ("SH" if code.startswith("6") else "SZ")
-    return code, f"{code}.{suffix}"
+    canonical = canonical_a_share_symbol(value)
+    return a_share_code(canonical), canonical
 
 
 class AShareEquityReader:
@@ -124,8 +121,38 @@ class HongKongEquityReader:
         return self.service.search(query, limit, offset)
 
     def read_analysis_frame(self, symbol: str):
-        payload = self.service.kline(canonical_hk_symbol(symbol), limit=1000, adjustment="raw")
-        return pd.DataFrame(payload.get("items") or [])
+        canonical = canonical_hk_symbol(symbol)
+        payload = self.service.kline(canonical, limit=1000, adjustment="raw")
+        items = payload.get("items") or []
+        # Some HK providers omit the symbol on each candle because it is
+        # already present in the request envelope.  Reattach that identity
+        # before applying the shared normalizer; otherwise a valid response
+        # is rejected as if it contained mixed instruments.
+        normalized_items = [
+            {**dict(item), "ts_code": item.get("ts_code") or canonical}
+            for item in items
+            if isinstance(item, Mapping)
+        ]
+        frame = pd.DataFrame(normalize_hk_daily(normalized_items))
+        if frame.empty:
+            return frame
+        missing = {"date", "open", "high", "low", "close", "volume"} - set(frame.columns)
+        if missing:
+            # Keep the provider response inspectable for callers that only
+            # display a partial candle.  The selection worker enforces this
+            # contract before technical features are prepared, so malformed
+            # data can never reach the Python/C indicator paths.
+            frame.attrs["missing_required_columns"] = tuple(sorted(missing))
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        for column in ("open", "high", "low", "close", "volume", "amount"):
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        present_required = [
+            column for column in ("date", "open", "high", "low", "close", "volume")
+            if column in frame.columns
+        ]
+        frame = frame.dropna(subset=present_required)
+        return frame.sort_values("date", ascending=False).reset_index(drop=True)
 
     def instrument_metadata(self, symbol: str) -> dict:
         canonical = canonical_hk_symbol(symbol)

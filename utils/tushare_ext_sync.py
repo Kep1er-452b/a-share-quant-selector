@@ -64,7 +64,9 @@ FINANCIAL_ENDPOINTS = {
     "stk_holdernumber": {"method": "stk_holdernumber", "key_fields": ("ts_code", "end_date", "ann_date")},
 }
 TRADING_ENDPOINTS = {
-    "top_list": {"method": "top_list", "key_fields": ("trade_date", "ts_code")},
+    # ``reason`` is part of the provider row identity: one stock can appear
+    # more than once on a date for different ranking windows/reasons.
+    "top_list": {"method": "top_list", "key_fields": ("trade_date", "ts_code", "reason")},
     "top_inst": {"method": "top_inst", "key_fields": ("trade_date", "ts_code", "exalter", "side", "reason")},
     "block_trade": {"method": "block_trade", "key_fields": ("trade_date", "ts_code", "price", "buyer", "seller")},
     "moneyflow": {"method": "moneyflow", "key_fields": ("trade_date", "ts_code")},
@@ -72,6 +74,42 @@ TRADING_ENDPOINTS = {
     "margin_detail": {"method": "margin_detail", "key_fields": ("trade_date", "ts_code")},
     "moneyflow_hsgt": {"method": "moneyflow_hsgt", "key_fields": ("trade_date",)},
     "hk_hold": {"method": "hk_hold", "key_fields": ("trade_date", "ts_code", "exchange")},
+}
+
+# Tushare caps several endpoints per response.  These are safety limits, not
+# pagination instructions: unless an endpoint's pagination contract is
+# explicitly implemented below, reaching its cap is evidence that the local
+# slice may be incomplete and must remain a warning rather than a completed
+# watermark.  The values are kept with the adapter so callers cannot silently
+# forget the check when adding a new sync stage.
+DATASET_RESPONSE_LIMITS = {
+    "stock_basic": 5000,
+    "namechange": 5000,
+    "hs_const": 5000,
+    "trade_cal": 5000,
+    "index_daily": 5000,
+    "daily_basic": 5000,
+    "daily": 5000,
+    "weekly": 5000,
+    "monthly": 5000,
+    "adj_factor": 5000,
+    "daily_qfq": 5000,
+    "income": 5000,
+    "balancesheet": 5000,
+    "cashflow": 5000,
+    "fina_indicator": 5000,
+    "express": 5000,
+    "forecast": 5000,
+    "dividend": 5000,
+    "stk_holdernumber": 5000,
+    "top_list": 5000,
+    "top_inst": 5000,
+    "block_trade": 1000,
+    "moneyflow": 5000,
+    "margin": 5000,
+    "margin_detail": 5000,
+    "moneyflow_hsgt": 5000,
+    "hk_hold": 5000,
 }
 
 
@@ -107,6 +145,17 @@ class TushareExtSync:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             return []
         return frame.where(pd.notna(frame), None).to_dict("records")
+
+    @staticmethod
+    def _stage_status(results: dict) -> tuple[str, list[str]]:
+        warnings = []
+        for dataset, result in results.items():
+            if not isinstance(result, dict):
+                continue
+            if result.get("status") in {"warning", "completed_with_warnings"}:
+                warning = result.get("warning") or f"{dataset}: sync completed with warnings"
+                warnings.append(str(warning))
+        return ("completed_with_warnings" if warnings else "completed", warnings)
 
     @staticmethod
     def _is_permission_error(error: Exception) -> bool:
@@ -157,12 +206,20 @@ class TushareExtSync:
         params: dict,
         ts_code_field: str = "ts_code",
         trade_date_field: str = "trade_date",
+        max_response_rows: int | None = None,
         progress_callback: Callable[[dict], None] | None = None,
     ) -> dict:
         try:
             method = getattr(self.pro, method_name)
             frame = self._invoke_provider(method, **params)
             rows = self._rows(frame)
+            response_limit = (
+                max_response_rows
+                if max_response_rows is not None
+                else DATASET_RESPONSE_LIMITS.get(dataset)
+            )
+            if response_limit is not None:
+                response_limit = max(1, int(response_limit))
             written = self.store.upsert_rows(
                 dataset,
                 rows,
@@ -170,15 +227,32 @@ class TushareExtSync:
                 ts_code_field=ts_code_field,
                 trade_date_field=trade_date_field,
             )
+            possibly_truncated = response_limit is not None and len(rows) >= response_limit
+            warning = None
+            if possibly_truncated:
+                warning = (
+                    f"Tushare {dataset} returned {len(rows)} rows, reaching the "
+                    f"configured response limit {response_limit}; the slice may be "
+                    "truncated and was not marked complete"
+                )
             self.store.set_sync_state(
                 dataset,
                 scope=scope,
-                status="completed",
+                status="warning" if possibly_truncated else "completed",
                 start_date=params.get("start_date") or params.get("trade_date"),
                 end_date=params.get("end_date") or params.get("trade_date"),
+                warning=warning,
                 row_count=written,
             )
-            result = {"status": "completed", "rows": written}
+            result = {
+                "status": "warning" if possibly_truncated else "completed",
+                "rows": written,
+                **({
+                    "warning": warning,
+                    "truncated": True,
+                    "response_limit": response_limit,
+                } if possibly_truncated else {}),
+            }
         except Exception as exc:
             if not self._is_permission_error(exc):
                 raise
@@ -235,7 +309,13 @@ class TushareExtSync:
             )
             fetched_rows += int(result.get("rows") or 0)
             datasets[symbol] = result
-        return {"status": "completed", "fetched_rows": fetched_rows, "datasets": datasets}
+        status, warnings = self._stage_status(datasets)
+        return {
+            "status": status,
+            "fetched_rows": fetched_rows,
+            "datasets": datasets,
+            "warnings": warnings,
+        }
 
     def sync_basics(
         self,
@@ -293,7 +373,8 @@ class TushareExtSync:
             progress_callback=progress_callback,
         )
         results["trade_cal"] = trade_cal
-        return {"status": "completed", "datasets": results}
+        status, warnings = self._stage_status(results)
+        return {"status": status, "datasets": results, "warnings": warnings}
 
     def sync_valuation_snapshot(
         self,
@@ -321,7 +402,8 @@ class TushareExtSync:
                     progress_callback=progress_callback,
                 )
                 results[dataset] = result
-        return {"status": "completed", "datasets": results}
+        status, warnings = self._stage_status(results)
+        return {"status": status, "datasets": results, "warnings": warnings}
 
     def sync_price_tracks(
         self,
@@ -367,7 +449,8 @@ class TushareExtSync:
                 results[dataset]["rows"] += int(result.get("rows") or 0)
                 if result.get("status") == "warning":
                     results[dataset] = result
-        return {"status": "completed", "datasets": results}
+        status, warnings = self._stage_status(results)
+        return {"status": status, "datasets": results, "warnings": warnings}
 
     def _call_qfq_price_track(
         self,
@@ -403,16 +486,34 @@ class TushareExtSync:
                 end_date=end_date,
             )
             rows = self._rows(frame)
+            response_limit = DATASET_RESPONSE_LIMITS.get("daily_qfq")
+            possibly_truncated = response_limit is not None and len(rows) >= response_limit
+            truncation_warning = None
+            if possibly_truncated:
+                truncation_warning = (
+                    f"Tushare daily_qfq returned {len(rows)} rows, reaching the "
+                    f"configured response limit {response_limit}; the slice may be "
+                    "truncated and was not marked complete"
+                )
             written = self.store.upsert_rows("daily_qfq", rows, key_fields=("ts_code", "trade_date"))
             self.store.set_sync_state(
                 "daily_qfq",
                 scope=ts_code,
-                status="completed",
+                status="warning" if possibly_truncated else "completed",
                 start_date=start_date,
                 end_date=end_date,
+                warning=truncation_warning,
                 row_count=written,
             )
-            result = {"status": "completed", "rows": written}
+            result = {
+                "status": "warning" if possibly_truncated else "completed",
+                "rows": written,
+                **({
+                    "warning": truncation_warning,
+                    "truncated": True,
+                    "response_limit": response_limit,
+                } if possibly_truncated else {}),
+            }
         except Exception as exc:
             if not self._is_permission_error(exc):
                 raise
@@ -474,7 +575,8 @@ class TushareExtSync:
                 results[dataset]["rows"] += int(result.get("rows") or 0)
                 if result.get("status") == "warning":
                     results[dataset] = result
-        return {"status": "completed", "datasets": results}
+        status, warnings = self._stage_status(results)
+        return {"status": status, "datasets": results, "warnings": warnings}
 
     def sync_trading_snapshot(
         self,
@@ -503,4 +605,5 @@ class TushareExtSync:
                     progress_callback=progress_callback,
                 )
                 results[dataset] = result
-        return {"status": "completed", "datasets": results}
+        status, warnings = self._stage_status(results)
+        return {"status": status, "datasets": results, "warnings": warnings}

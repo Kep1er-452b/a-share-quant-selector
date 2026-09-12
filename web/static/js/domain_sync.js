@@ -138,12 +138,16 @@
         if (domain === 'futures') {
             return { datasets: ['fut_basic'], scope: 'metadata' };
         }
+        if (domain === 'global_commodities') {
+            return { datasets: ['commodity_daily'], scope: 'default' };
+        }
         return {};
     }
 
     function refreshWorkspace(domain) {
         const buttonId = {
             futures: 'futures-refresh',
+            global_commodities: 'commodity-refresh',
             macro: 'macro-refresh',
             industry: 'industry-refresh',
         }[domain];

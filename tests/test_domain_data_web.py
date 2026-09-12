@@ -80,6 +80,55 @@ def test_sync_start_reports_missing_local_token_without_exposing_value(monkeypat
     assert "token_present" not in str(payload).lower()
 
 
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ([], "INVALID_REQUEST_BODY"),
+        ("bad", "INVALID_REQUEST_BODY"),
+        (123, "INVALID_REQUEST_BODY"),
+        ({"domain": "macro", "params": []}, "INVALID_PARAMS"),
+        ({"domain": "macro", "force": "false"}, "INVALID_FORCE"),
+        ({"domain": "macro", "scope": "x" * 129}, "INVALID_SCOPE"),
+        ({"domain": "macro", "datasets": [""]}, "INVALID_DATASETS"),
+    ],
+)
+def test_sync_start_rejects_malformed_json_shapes_before_client_or_job_creation(
+    body, code, monkeypatch
+):
+    monkeypatch.setattr(
+        domain_data.TushareClientFactory,
+        "from_config",
+        lambda *_args, **_kwargs: pytest.fail("invalid request must not create a client"),
+    )
+    before = domain_data.sync_jobs_snapshot()
+    response = web_server.app.test_client().post(
+        "/api/sync/start",
+        json=body,
+        headers={"X-Quant-Session": web_server.WEB_SESSION_TOKEN},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == code
+    assert domain_data.sync_jobs_snapshot() == before
+
+
+def test_sync_start_rejects_an_invalid_json_body(monkeypatch):
+    monkeypatch.setattr(
+        domain_data.TushareClientFactory,
+        "from_config",
+        lambda *_args, **_kwargs: pytest.fail("invalid request must not create a client"),
+    )
+    response = web_server.app.test_client().post(
+        "/api/sync/start",
+        data="[",
+        content_type="application/json",
+        headers={"X-Quant-Session": web_server.WEB_SESSION_TOKEN},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "INVALID_REQUEST_BODY"
+
+
 def test_domain_status_exposes_empty_local_state_without_invented_zeroes():
     response = web_server.app.test_client().get("/api/domain-status/hong_kong")
     assert response.status_code == 200

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -13,6 +14,8 @@ import uuid
 from flask import Blueprint, jsonify, request
 
 from market_data.services import EconomyService, FuturesService, HongKongService, IndustryService
+from market_data.global_commodities import CommodityService, commodity_catalog
+from market_data.commodity_providers import SinaCFDProvider
 from market_data.economy import economy_catalog
 from market_data.futures import futures_catalog
 from market_data.hong_kong import hong_kong_catalog
@@ -30,12 +33,14 @@ domain_data_blueprint = Blueprint("domain_data_api", __name__, url_prefix="/api"
 _DOMAIN_FILES = {
     "hong_kong": "hong_kong.sqlite",
     "futures": "futures.sqlite",
+    "global_commodities": "global_commodities.sqlite",
     "macro": "economy.sqlite",
     "industry": "industry.sqlite",
 }
 _CATALOGS = {
     "hong_kong": hong_kong_catalog,
     "futures": futures_catalog,
+    "global_commodities": commodity_catalog,
     "macro": economy_catalog,
     "industry": industry_catalog,
 }
@@ -51,6 +56,17 @@ _ACTIVE_SYNC_DOMAINS: dict[str, str] = {}
 _MAX_TERMINAL_SYNC_JOBS = 50
 _TERMINAL_SYNC_STATES = {"completed", "completed_with_warnings", "failed", "error", "cancelled"}
 _SYNC_EVENT_OBSERVER = None
+
+# Keep the request boundary small and predictable.  The catalog itself is the
+# authority for valid dataset names; these limits protect the job registry and
+# prevent a malformed request from becoming a very large background task.
+_MAX_SYNC_DATASETS = 32
+_MAX_SYNC_DATASET_NAME = 96
+_MAX_SYNC_SCOPE_LENGTH = 128
+_MAX_SYNC_PARAMS = 64
+_MAX_SYNC_PARAM_NAME = 96
+_MAX_SYNC_PARAM_TEXT = 512
+_MAX_SYNC_BODY_BYTES = 256 * 1024
 
 
 def _utc_now() -> str:
@@ -105,6 +121,7 @@ def _service(domain: str):
     return {
         "hong_kong": HongKongService,
         "futures": FuturesService,
+        "global_commodities": CommodityService,
         "macro": EconomyService,
         "industry": IndustryService,
     }[domain](store)
@@ -256,6 +273,37 @@ def futures_kline(symbol: str):
     return _call(lambda: _service("futures").kline(symbol, limit=_integer("limit", 260, 2000)))
 
 
+@domain_data_blueprint.get("/commodities/catalog")
+def commodity_catalog_route():
+    return _call(lambda: _service("global_commodities").catalog())
+
+
+@domain_data_blueprint.get("/commodities/overview")
+def commodity_overview_route():
+    return _call(lambda: _service("global_commodities").overview())
+
+
+@domain_data_blueprint.get("/commodities/series/<path:series_id>")
+def commodity_series(series_id: str):
+    return _call(lambda: _service("global_commodities").series(
+        series_id,
+        start=request.args.get("start"),
+        end=request.args.get("end"),
+        limit=_integer("limit", 520, 2000),
+    ))
+
+
+@domain_data_blueprint.get("/commodities/ratios/<path:ratio_id>")
+def commodity_ratio(ratio_id: str):
+    return _call(lambda: _service("global_commodities").ratios(
+        ratio_id,
+        start=request.args.get("start"),
+        end=request.args.get("end"),
+        limit=_integer("limit", 520, 2000),
+        alignment=request.args.get("alignment", "intersection"),
+    ))
+
+
 @domain_data_blueprint.get("/macro/catalog")
 def macro_catalog():
     return _call(lambda: {"items": _service("macro").series_catalog(request.args.get("family"))})
@@ -288,27 +336,110 @@ def industry_cycle_series():
 
 @domain_data_blueprint.post("/sync/start")
 def sync_start():
-    payload = request.get_json(silent=True) or {}
-    domain = str(payload.get("domain") or "").strip()
+    if request.content_length and request.content_length > _MAX_SYNC_BODY_BYTES:
+        return jsonify({
+            "error": "sync request body is too large",
+            "code": "REQUEST_TOO_LARGE",
+        }), 413
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, Mapping):
+        return jsonify({
+            "error": "sync request body must be a JSON object",
+            "code": "INVALID_REQUEST_BODY",
+        }), 400
+
+    domain_value = payload.get("domain", "")
+    if not isinstance(domain_value, str) or not domain_value.strip():
+        return jsonify({
+            "error": "domain must be a non-empty string",
+            "code": "INVALID_DOMAIN",
+        }), 400
+    domain = domain_value.strip()
     if domain not in _CATALOGS:
         return jsonify({"error": "unknown domain", "code": "INVALID_DOMAIN"}), 400
-    datasets = payload.get("datasets") or ()
-    if not isinstance(datasets, (list, tuple)) or any(not isinstance(item, str) for item in datasets):
+
+    raw_datasets = payload.get("datasets", ())
+    if raw_datasets is None or not isinstance(raw_datasets, (list, tuple)):
         return jsonify({"error": "datasets must be a string list", "code": "INVALID_DATASETS"}), 400
-    factory = TushareClientFactory.from_config(load_config_file(), os.environ)
-    if not factory.token_present:
+    if len(raw_datasets) > _MAX_SYNC_DATASETS:
         return jsonify({
-            "error": "未找到本机 Tushare Token；请设置 TUSHARE_TOKEN 或 config/config_local.yaml",
-            "code": "TOKEN_MISSING",
+            "error": f"datasets must contain at most {_MAX_SYNC_DATASETS} items",
+            "code": "INVALID_DATASETS",
         }), 400
+    datasets = []
+    for item in raw_datasets:
+        if not isinstance(item, str) or not item.strip() or len(item.strip()) > _MAX_SYNC_DATASET_NAME:
+            return jsonify({
+                "error": "datasets must contain bounded non-empty strings",
+                "code": "INVALID_DATASETS",
+            }), 400
+        datasets.append(item.strip())
+    if len(datasets) != len(set(datasets)):
+        return jsonify({
+            "error": "datasets must not contain duplicates",
+            "code": "INVALID_DATASETS",
+        }), 400
+
+    scope = payload.get("scope", "default")
+    if scope is None:
+        scope = "default"
+    if not isinstance(scope, str) or len(scope.strip()) > _MAX_SYNC_SCOPE_LENGTH:
+        return jsonify({
+            "error": f"scope must be a string of at most {_MAX_SYNC_SCOPE_LENGTH} characters",
+            "code": "INVALID_SCOPE",
+        }), 400
+    scope = scope.strip() or "default"
+
+    params = payload.get("params", {})
+    if params is None or not isinstance(params, Mapping):
+        return jsonify({
+            "error": "params must be a JSON object",
+            "code": "INVALID_PARAMS",
+        }), 400
+    if len(params) > _MAX_SYNC_PARAMS:
+        return jsonify({
+            "error": f"params must contain at most {_MAX_SYNC_PARAMS} keys",
+            "code": "INVALID_PARAMS",
+        }), 400
+    for key, value in params.items():
+        if not isinstance(key, str) or not key.strip() or len(key.strip()) > _MAX_SYNC_PARAM_NAME:
+            return jsonify({
+                "error": "params keys must be bounded non-empty strings",
+                "code": "INVALID_PARAMS",
+            }), 400
+        if isinstance(value, str) and len(value) > _MAX_SYNC_PARAM_TEXT:
+            return jsonify({
+                "error": "params string values are too long",
+                "code": "INVALID_PARAMS",
+            }), 400
+
+    force = payload.get("force", False)
+    if not isinstance(force, bool):
+        return jsonify({
+            "error": "force must be a boolean",
+            "code": "INVALID_FORCE",
+        }), 400
+
     try:
-        client = factory.client()
+        if domain == "global_commodities":
+            # The public CFD observation source needs no Tushare credential.
+            # Keep it on its own adapter so a commodity sync can never fall
+            # through to an A-share or domestic-futures endpoint.
+            client = SinaCFDProvider.from_config(load_config_file(), os.environ)
+        else:
+            factory = TushareClientFactory.from_config(load_config_file(), os.environ)
+            if not factory.token_present:
+                return jsonify({
+                    "error": "未找到本机 Tushare Token；请设置 TUSHARE_TOKEN 或 config/config_local.yaml",
+                    "code": "TOKEN_MISSING",
+                }), 400
+            client = factory.client()
         sync_request = SyncRequest(
             domain=domain,
             datasets=tuple(datasets),
-            scope=str(payload.get("scope") or "default"),
-            params=payload.get("params") or {},
-            force=bool(payload.get("force")),
+            scope=scope,
+            params=dict(params),
+            force=force,
         )
     except (RuntimeError, TypeError, ValueError) as exc:
         return jsonify({"error": str(exc), "code": "INVALID_REQUEST"}), 400
@@ -354,6 +485,12 @@ def sync_start():
             cancel,
         )
     except Exception as exc:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
         with _SYNC_LOCK:
             _SYNC_JOBS.pop(job_id, None)
             _SYNC_CANCEL.pop(job_id, None)
@@ -418,6 +555,12 @@ def _run_sync_job(job_id, sync_request, catalog, store, client, cancel):
             "retryable": issue.retryable,
         })
     finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
         with _SYNC_LOCK:
             job = _SYNC_JOBS.get(job_id)
             if job is not None:

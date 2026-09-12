@@ -2827,7 +2827,8 @@ async function viewStockDetail(code, name, period = state.currentStockPeriod || 
         syncIndicatorControls();
         const rawData = result.data || [];
         let chartData = rawData;
-        if (Array.isArray(result.adjusted_data) && result.adjusted_data.length) {
+        if (result.adjusted_data_source && result.adjusted_data_source === result.chart_source
+            && Array.isArray(result.adjusted_data) && result.adjusted_data.length) {
             const adjustedByDate = new Map(result.adjusted_data.map(item => [item.date, item]));
             chartData = rawData.map(item => adjustedByDate.has(item.date)
                 ? { ...item, ...adjustedByDate.get(item.date) }

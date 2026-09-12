@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from market_data.equity_symbols import canonical_a_share_symbol
 from utils.csv_manager import CSVManager
 from utils.runtime_paths import wyckoff_results_dir
 from utils.stock_exporter import resolve_stock_query
@@ -83,11 +84,11 @@ class WyckoffPipeline:
         csv_path = self.csv_manager.get_stock_path(code, create_dirs=False)
         if not csv_path.exists():
             raise WyckoffPipelineError(f"本地 CSV 不存在: {code}")
-        suffix = "BJ" if code.startswith(("4", "8")) else ("SH" if code.startswith("6") else "SZ")
+        symbol = canonical_a_share_symbol(code)
         return {
             **match,
             "code": code,
-            "symbol": f"{code}.{suffix}",
+            "symbol": symbol,
             "market": "a_share",
             "currency": "CNY",
             "source": "a_share_provider_csv",

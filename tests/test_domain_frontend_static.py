@@ -6,6 +6,7 @@ INDEX_HTML = PROJECT_ROOT / "web" / "templates" / "index.html"
 STYLE_CSS = PROJECT_ROOT / "web" / "static" / "css" / "style.css"
 APP_JS = PROJECT_ROOT / "web" / "static" / "js" / "app.js"
 FUTURES_JS = PROJECT_ROOT / "web" / "static" / "js" / "futures_workspace.js"
+COMMODITY_JS = PROJECT_ROOT / "web" / "static" / "js" / "commodity_workspace.js"
 MACRO_JS = PROJECT_ROOT / "web" / "static" / "js" / "macro_workspace.js"
 INDUSTRY_JS = PROJECT_ROOT / "web" / "static" / "js" / "industry_workspace.js"
 DOMAIN_SYNC_JS = PROJECT_ROOT / "web" / "static" / "js" / "domain_sync.js"
@@ -25,6 +26,7 @@ def test_domain_workspace_scripts_load_before_the_application_shell():
 
     for script in (
         "futures_workspace.js",
+        "commodity_workspace.js",
         "macro_workspace.js",
         "industry_workspace.js",
     ):
@@ -36,7 +38,7 @@ def test_domain_workspaces_offer_sync_status_cancel_and_retry_controls():
     html = INDEX_HTML.read_text(encoding="utf-8")
     js = DOMAIN_SYNC_JS.read_text(encoding="utf-8")
 
-    for domain in ("hong_kong", "futures", "macro", "industry"):
+    for domain in ("hong_kong", "futures", "global_commodities", "macro", "industry"):
         assert f'data-sync-domain="{domain}"' in html
     assert "/api/sync/start" in js
     assert "/api/sync/status/" in js
@@ -83,7 +85,7 @@ def test_domain_sync_button_visibility_and_permission_failures_have_explicit_con
 
 
 def test_each_domain_controller_has_a_bounded_abortable_lifecycle():
-    for path in (FUTURES_JS, MACRO_JS, INDUSTRY_JS):
+    for path in (FUTURES_JS, COMMODITY_JS, MACRO_JS, INDUSTRY_JS):
         js = path.read_text(encoding="utf-8")
         for method in ("mount()", "activate()", "deactivate()", "refresh()"):
             assert method in js
@@ -113,6 +115,32 @@ def test_futures_workspace_supports_contract_search_and_kline():
     assert "hasCandles ? 'KLINE READY' : 'NO LOCAL DAILY DATA'" in js
     assert "datasets: ['fut_daily']" in js
     assert "scope: `contract:${symbol}`" in js
+
+
+def test_futures_workspace_exposes_global_commodity_and_ratio_views():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    futures_js = FUTURES_JS.read_text(encoding="utf-8")
+    commodity_js = COMMODITY_JS.read_text(encoding="utf-8")
+
+    for control in (
+        "futures-mode-nav",
+        "futures-domestic-view",
+        "futures-global-view",
+        "commodity-cards",
+        "commodity-series-select",
+        "commodity-ratio-select",
+        "commodity-chart",
+    ):
+        assert f'id="{control}"' in html
+    for mode in ("domestic", "global", "ratio"):
+        assert f'data-futures-mode="{mode}"' in html
+    assert "quantCommodityWorkspace" in futures_js
+    assert "switchMode" in futures_js
+    assert "/api/commodities/catalog" in commodity_js
+    assert "/api/commodities/series/" in commodity_js
+    assert "/api/commodities/ratios/" in commodity_js
+    assert "connectNulls: false" in commodity_js
+    assert "Sina CFD" in html
 
 
 def test_macro_workspace_exposes_family_series_units_and_exact_table():

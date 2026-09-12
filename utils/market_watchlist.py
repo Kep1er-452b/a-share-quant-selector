@@ -9,11 +9,16 @@ from threading import RLock
 from typing import Any
 
 from market_data.hong_kong import canonical_hk_symbol
+from market_data.equity_symbols import canonical_a_share_symbol
 from utils.atomic_io import atomic_write_json
 
 
 WATCHLIST_VERSION = 2
 SUPPORTED_MARKETS = frozenset({"a_share", "hong_kong"})
+
+
+class WatchlistStorageError(RuntimeError):
+    """The watchlist cannot be read or does not satisfy its storage schema."""
 
 
 def canonical_equity_symbol(market: str, symbol: object) -> str:
@@ -22,13 +27,7 @@ def canonical_equity_symbol(market: str, symbol: object) -> str:
         raise ValueError(f"unsupported equity market: {market_id}")
     if market_id == "hong_kong":
         return canonical_hk_symbol(symbol)
-
-    text = str(symbol or "").strip().upper()
-    code = text.split(".", 1)[0]
-    if len(code) != 6 or not code.isdigit():
-        raise ValueError("A-share symbol must contain six digits")
-    suffix = "BJ" if code.startswith(("4", "8")) else ("SH" if code.startswith("6") else "SZ")
-    return f"{code}.{suffix}"
+    return canonical_a_share_symbol(symbol)
 
 
 def watchlist_identity(market: str, symbol: object) -> str:
@@ -51,17 +50,30 @@ class MarketWatchlistStore:
         if not self.path.exists():
             return {"version": WATCHLIST_VERSION, "items": {}}, False
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8")) or {}
-        except (OSError, json.JSONDecodeError):
-            return {"version": WATCHLIST_VERSION, "items": {}}, False
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise WatchlistStorageError(
+                f"自选列表读取失败，未修改原文件: {self.path}"
+            ) from exc
 
-        source_items = raw.get("items") if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            raise WatchlistStorageError(
+                f"自选列表格式损坏（根节点必须是对象），未修改原文件: {self.path}"
+            )
+
+        source_items = raw.get("items")
         if not isinstance(source_items, dict):
-            source_items = {}
+            raise WatchlistStorageError(
+                f"自选列表格式损坏（items 必须是对象），未修改原文件: {self.path}"
+            )
         normalized: dict[str, dict[str, Any]] = {}
         changed = raw.get("version") != WATCHLIST_VERSION
         for source_key, source_meta in source_items.items():
-            meta = dict(source_meta) if isinstance(source_meta, dict) else {}
+            if not isinstance(source_meta, dict):
+                raise WatchlistStorageError(
+                    f"自选列表格式损坏（条目 {source_key!r} 必须是对象），未修改原文件: {self.path}"
+                )
+            meta = dict(source_meta)
             market = str(meta.get("market") or "a_share").strip()
             candidate = meta.get("symbol") or meta.get("code") or source_key
             if ":" in str(source_key) and not meta.get("market"):
@@ -70,9 +82,10 @@ class MarketWatchlistStore:
                     market, candidate = possible_market, possible_symbol
             try:
                 symbol = canonical_equity_symbol(market, candidate)
-            except ValueError:
-                changed = True
-                continue
+            except ValueError as exc:
+                raise WatchlistStorageError(
+                    f"自选列表格式损坏（条目 {source_key!r} 身份无效），未修改原文件: {self.path}"
+                ) from exc
             identity = watchlist_identity(market, symbol)
             item = {
                 **meta,
@@ -146,6 +159,7 @@ class MarketWatchlistStore:
 __all__ = [
     "MarketWatchlistStore",
     "WATCHLIST_VERSION",
+    "WatchlistStorageError",
     "canonical_equity_symbol",
     "watchlist_identity",
 ]
