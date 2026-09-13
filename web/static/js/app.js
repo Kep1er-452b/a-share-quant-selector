@@ -875,6 +875,7 @@ function switchPage(page, { syncRoute = true } = {}) {
     document.querySelectorAll('.page').forEach(pageEl => {
         pageEl.classList.toggle('active', pageEl.id === `${page}-page`);
     });
+    window.dispatchEvent(new CustomEvent('quant:page-change', { detail: { page } }));
 
     document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
     setCommandOutput(`FUNC ${String(page).toUpperCase()}<GO>`, 'info');
@@ -5382,6 +5383,10 @@ async function runSelection() {
 
     if (state.currentPage !== 'selection') {
         switchPage('selection');
+    }
+    if (currentEquityMarket() === 'a_share' && document.getElementById('selection-result-source')?.value === 'server') {
+        await window.quantServerResults?.sync();
+        return;
     }
     state.expandedSelectionResults.clear();
 

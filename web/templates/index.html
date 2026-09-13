@@ -545,7 +545,41 @@
             </section>
 
             <section id="selection-page" class="page">
-                <div class="selection-layout">
+                <div class="panel server-result-source" id="server-result-source">
+                    <div class="panel-body inline-actions">
+                        <label for="selection-result-source">结果来源</label>
+                        <select id="selection-result-source">
+                            <option value="server">Azure 服务器日报</option>
+                            <option value="local">本机自定义选股</option>
+                        </select>
+                        <span id="server-result-connection">正在检查服务器结果连接…</span>
+                    </div>
+                </div>
+                <section class="panel" id="server-result-panel" hidden>
+                    <div class="panel-header panel-header-wrap">
+                        <div><span class="panel-title">SERVER DAILY RESULTS</span><div class="panel-subtitle" id="server-result-status" role="status"></div></div>
+                        <div class="inline-actions">
+                            <button class="btn btn-primary" id="server-result-sync" type="button">同步服务器结果</button>
+                            <button class="btn btn-ghost" id="server-result-cancel" type="button" disabled>取消同步</button>
+                            <a class="btn btn-ghost" id="server-result-auth" target="_blank" rel="noopener noreferrer" hidden>验证 Tailscale 登录</a>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <p class="panel-subtitle">服务器在交易日 17:00 开始运行，发布后自动获取。这里只读取服务器结果，不在本机重复选股。</p>
+                        <div class="inline-actions server-result-toolbar">
+                            <label for="server-result-release">结果日期 / 修订</label><select id="server-result-release"></select>
+                            <label for="server-result-view">内容</label>
+                            <select id="server-result-view"><option value="selection-items">策略选股</option><option value="tracking-daily">每日追踪</option><option value="selection-tracking">B1/B2 持续周期</option><option value="watchlist-snapshot">服务器自选池</option><option value="report">完整日报</option><option value="charts">服务器图表</option></select>
+                            <select id="server-result-strategy" aria-label="筛选服务器策略"><option value="">全部策略</option></select>
+                        </div>
+                        <div id="server-result-summary" class="server-result-summary"></div>
+                        <div id="server-result-content" class="server-result-content"><div class="state-empty">同步后可离线查看最近已验证的结果。</div></div>
+                        <div class="inline-actions server-result-toolbar" id="server-result-pagination">
+                            <button class="btn btn-ghost" id="server-result-prev" type="button">上一页</button><span id="server-result-page"></span><button class="btn btn-ghost" id="server-result-next" type="button">下一页</button>
+                        </div>
+                    </div>
+                </section>
+                <div class="selection-layout" id="local-selection-layout">
                     <section class="panel control-panel">
                         <div class="panel-header panel-header-wrap">
                             <div>
@@ -914,8 +948,34 @@
                     </nav>
                     <div class="domain-pane ops-view active" id="ops-tasks"><div class="state-loading">加载活动任务...</div></div>
                     <div class="domain-pane ops-view" id="ops-events">
-                        <div class="domain-toolbar"><select id="ops-event-severity"><option value="">全部级别</option><option value="warning">警告</option><option value="error">错误</option><option value="info">信息</option></select><button class="btn btn-ghost" id="ops-events-refresh" type="button">刷新</button></div>
-                        <div id="ops-events-content" class="state-loading">加载结构化事件...</div>
+                        <div class="ops-event-controls">
+                            <div class="ops-severity-switch" role="group" aria-label="事件级别">
+                                <input id="ops-event-severity" type="hidden" value="">
+                                <button class="active" data-ops-severity="" type="button" aria-pressed="true">全部</button>
+                                <button data-ops-severity="critical" type="button" aria-pressed="false">严重</button>
+                                <button data-ops-severity="error" type="button" aria-pressed="false">错误</button>
+                                <button data-ops-severity="warning" type="button" aria-pressed="false">警告</button>
+                                <button data-ops-severity="info" type="button" aria-pressed="false">信息</button>
+                            </div>
+                            <div class="ops-event-filter-grid">
+                                <label><span>开始时间</span><input class="search-input" data-ops-filter="since" type="datetime-local"></label>
+                                <label><span>结束时间</span><input class="search-input" data-ops-filter="until" type="datetime-local"></label>
+                                <label><span>业务域</span><input class="search-input" data-ops-filter="domain" type="search" placeholder="例如 macro"></label>
+                                <label><span>市场</span><input class="search-input" data-ops-filter="market" type="search" placeholder="例如 a_share"></label>
+                            </div>
+                            <details class="ops-filter-more">
+                                <summary>更多筛选</summary>
+                                <div class="ops-event-filter-grid ops-event-filter-advanced">
+                                    <label><span>模块</span><input class="search-input" data-ops-filter="module" type="search"></label>
+                                    <label><span>数据集</span><input class="search-input" data-ops-filter="dataset" type="search"></label>
+                                    <label><span>证券代码</span><input class="search-input" data-ops-filter="symbol" type="search"></label>
+                                    <label><span>任务 ID</span><input class="search-input" data-ops-filter="job_id" type="search"></label>
+                                    <label><span>错误码</span><input class="search-input" data-ops-filter="error_code" type="search"></label>
+                                </div>
+                            </details>
+                            <div class="ops-event-actions"><button class="btn btn-ghost" id="ops-events-clear" type="button">清除筛选</button><button class="btn btn-primary" id="ops-events-refresh" type="button">刷新事件</button></div>
+                        </div>
+                        <div id="ops-events-content" class="ops-events-content"><div class="state-loading">加载结构化事件...</div></div>
                     </div>
                     <div class="domain-pane ops-view" id="ops-health"><div class="state-loading">检查仓库与数据新鲜度...</div></div>
                     <div class="domain-pane ops-view" id="ops-performance"><div class="state-loading">加载性能指标...</div></div>
@@ -1219,6 +1279,7 @@
 <script src="/static/js/industry_workspace.js"></script>
 <script src="/static/js/system_workspace.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/server_results.js"></script>
 <script src="/static/js/domain_sync.js"></script>
 </body>
 </html>

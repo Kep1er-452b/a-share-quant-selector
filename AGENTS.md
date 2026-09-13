@@ -93,6 +93,15 @@ environment variables or ignored local config files, never in committed docs.
 - `market_data/`: independent Hong Kong, futures, global-commodity, macro, and industry catalogs,
   SQLite stores, read models, capabilities, Tushare client, and sync engine.
 - `web_api/`: market-explicit equity, domain-data, and operations blueprints.
+- `utils/server_results/` and `web_api/server_results.py`: independent read-only
+  Azure daily-result consumer. Download immutable exports through authenticated
+  SSH, verify hashes and dataset relations, then atomically activate the local
+  cache under `data/server_results/`. Never start local selection/provider updates
+  as a fallback. Connection settings live only in ignored runtime
+  `data/server_results/connection.json`; packaged artifacts must not contain it.
+- `web/static/js/server_results.js`: A-share Selection source switch, server
+  release browsing, bounded tables, reports/charts and cancellable synchronization.
+  Server results do not activate a provider warehouse or overwrite local watchlists.
 - `ops/`: structured events, bounded task registry, health, performance, and
   sanitized diagnostic exports.
 - `utils/technical.py`: Tongdaxin-style indicators and shared feature preparation.

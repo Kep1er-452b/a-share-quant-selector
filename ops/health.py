@@ -75,6 +75,14 @@ class HealthService:
                 checks[name] = self._safe_error(exc)
         warning_states = {"warning", "error", "critical", "open"}
         has_warning = any(item.get("status") == "error" for item in stores.values())
+        dataset_warning_states = warning_states | {
+            "failed", "completed_with_warnings", "permission_denied",
+        }
+        has_warning = has_warning or any(
+            str(item.get("status") or "").lower() in dataset_warning_states
+            or item.get("freshness") == "stale"
+            for item in datasets.values()
+        )
         has_warning = has_warning or any(
             str(item.get("status") or "").lower() in warning_states
             for item in checks.values()

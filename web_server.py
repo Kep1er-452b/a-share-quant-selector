@@ -130,6 +130,15 @@ app.register_blueprint(domain_data_blueprint)
 halt_event = Event()
 shutdown_event = Event()
 WEB_SESSION_TOKEN = secrets.token_urlsafe(32)
+
+from utils.server_results.service import ServerResultService
+from web_api.server_results import create_server_results_blueprint
+
+server_result_service = ServerResultService(
+    platform_runtime_paths().data_root / 'server_results',
+    platform_runtime_paths().data_root / 'server_results' / 'connection.json',
+)
+app.register_blueprint(create_server_results_blueprint(server_result_service, WEB_SESSION_TOKEN))
 selection_jobs = {}
 selection_jobs_lock = Lock()
 selection_cancel_events = {}
@@ -254,6 +263,7 @@ def _snapshot_jobs(jobs, lock):
 
 
 ops_tasks = TaskRegistry({
+    "server_results": server_result_service.snapshot,
     "selection": lambda: _snapshot_jobs(selection_jobs, selection_jobs_lock),
     "update": lambda: _snapshot_jobs(update_jobs, update_jobs_lock),
     "diagnostic": lambda: _snapshot_jobs(diagnostic_jobs, diagnostic_jobs_lock),
@@ -433,7 +443,7 @@ def _record_domain_sync_event(job_id, domain, event):
     }:
         return
     severity = 'error' if status in {'failed', 'error'} else (
-        'warning' if status in {'warning', 'cancelled', 'completed_with_warnings'} else 'info'
+        'warning' if status in {'warning', 'completed_with_warnings'} else 'info'
     )
     ops_logger.emit(
         message=str(event.get('message') or f'{domain} sync {phase} {status}'),
@@ -475,6 +485,7 @@ app.register_blueprint(create_ops_blueprint(
         performance=ops_performance,
         diagnostics=ops_diagnostics,
         task_cancellers={
+            'server_results': server_result_service.cancel,
             'selection': lambda job_id: cancel_selection_job(job_id),
             'update': lambda job_id: cancel_update_job(job_id),
             'diagnostic': lambda job_id: cancel_diagnostic_job(job_id),
@@ -1303,7 +1314,7 @@ def _record_ops_task_event(task_type, job_id, job, *, message=None):
         return
     status = str(job.get('status') or 'unknown')
     severity = 'error' if status in {'failed', 'error', 'halted'} else (
-        'warning' if status in {'cancelled', 'completed_with_warnings'} else 'info'
+        'warning' if status == 'completed_with_warnings' else 'info'
     )
     event_message = message or f'{task_type} task {status}'
     current_stock = job.get('current_stock')
@@ -1918,7 +1929,7 @@ def block_requests_after_halt():
         return Response("Invalid Host header", status=400, mimetype="text/plain")
     if request.path.startswith('/api/'):
         g.ops_request_started_at = time.perf_counter()
-    sensitive_get = request.path.startswith('/api/ops/')
+    sensitive_get = request.path.startswith(('/api/ops/', '/api/server-results/'))
     side_effect_request = request.path.startswith('/api/') and (
         request.method not in {'GET', 'HEAD', 'OPTIONS'} or sensitive_get
     )
@@ -4765,6 +4776,7 @@ def get_system_status():
 @app.route('/api/emergency_stop', methods=['POST'])
 def emergency_stop():
     """触发事故急停：记录现场、阻止新任务，并退出当前 Web 服务进程。"""
+    server_result_service.cancel()
     incident_path = _trigger_emergency_stop()
     return jsonify({
         'success': True,
@@ -4783,6 +4795,7 @@ def _terminate_current_process():
 
 def _prepare_graceful_shutdown():
     """Cancel active local jobs and persist an interrupted terminal snapshot."""
+    server_result_service.cancel()
     halt_event.set()
     shutdown_event.set()
     timestamp = _job_timestamp()

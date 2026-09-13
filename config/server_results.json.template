@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "host": "your-server.tailnet.ts.net",
+  "user": "your_ssh_user",
+  "port": 22,
+  "tailscale": true,
+  "identity_file": "~/.ssh/your_server_key"
+}

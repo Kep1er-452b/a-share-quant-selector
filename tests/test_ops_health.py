@@ -79,6 +79,7 @@ def test_health_reports_frequency_aware_freshness_without_paths():
     assert payload["datasets"]["cn_gdp"]["frequency"] == "quarterly"
     assert payload["datasets"]["cn_gdp"]["freshness"] == "fresh"
     assert payload["datasets"]["hk_daily"]["freshness"] == "stale"
+    assert payload["status"] == "warning"
     assert "/Users/private" not in str(payload)
     assert payload["stores"]["economy"]["integrity"] == "not_checked"
 
@@ -117,6 +118,25 @@ def test_health_includes_safe_operational_checks_for_disk_tasks_cache_and_circui
     assert payload["api_circuits"]["providers"]["tushare"]["state"] == "open"
     assert payload["status"] == "warning"
     assert "path" not in str(payload).lower()
+
+
+def test_health_summary_surfaces_fresh_dataset_warnings():
+    store = FakeDomainStore({
+        ("cn_pmi", "default"): {
+            "status": "completed_with_warnings",
+            "updated_at": NOW.isoformat(),
+        },
+    })
+    service = HealthService(
+        stores={"macro": store},
+        datasets={"cn_pmi": {"store": "macro", "frequency": "monthly"}},
+        now=lambda: NOW,
+    )
+
+    payload = service.snapshot()
+
+    assert payload["datasets"]["cn_pmi"]["freshness"] == "fresh"
+    assert payload["status"] == "warning"
 
 
 def test_performance_recorder_keeps_bounded_numeric_summaries():
