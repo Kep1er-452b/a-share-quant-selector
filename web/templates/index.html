@@ -123,6 +123,7 @@
                 <span class="nav-fn">E7</span>
                 <span class="nav-label">WYCKOFF</span>
             </li>
+            <li class="nav-item" data-page="research" data-equity-page="research"><span class="nav-fn">E8</span><span class="nav-label">RESEARCH</span></li>
         </ul>
         <div class="asset-tabs equity-market-switch" id="equity-market-switch" aria-label="股票市场">
             <button class="asset-tab active" data-market="a_share" type="button" aria-pressed="true">A 股</button>
@@ -145,6 +146,7 @@
 
     <main class="main">
         <div class="content">
+            {% include 'research.html' %}
             <section id="dashboard-page" class="page active">
                 <div class="dashboard-terminal-grid">
                     <section class="panel quote-panel">
@@ -1046,6 +1048,7 @@
                 </div>
                 <label class="update-token-label" for="update-tushare-token">TUSHARE TOKEN</label>
                 <input class="search-input update-token-input" id="update-tushare-token" type="password" placeholder="INPUT TOKEN OR LEAVE BLANK">
+                <label class="update-token-label"><input id="update-batch-daily" type="checkbox"> 按交易日批量更新（验证阶段，可取消勾选回到逐股更新）</label>
                 <div class="update-token-actions">
                     <button class="btn btn-secondary" id="update-token-default-btn" type="button">使用默认 Token</button>
                     <button class="btn btn-primary" id="update-token-confirm-btn" type="button">开始更新</button>
@@ -1278,6 +1281,7 @@
 <script src="/static/js/macro_workspace.js"></script>
 <script src="/static/js/industry_workspace.js"></script>
 <script src="/static/js/system_workspace.js"></script>
+<script src="/static/js/research_workspace.js"></script>
 <script src="/static/js/app.js"></script>
 <script src="/static/js/server_results.js"></script>
 <script src="/static/js/domain_sync.js"></script>

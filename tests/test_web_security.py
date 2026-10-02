@@ -327,6 +327,10 @@ def test_selection_job_surfaces_strategy_errors(monkeypatch, tmp_path):
         data_dir = tmp_path
 
         @staticmethod
+        def read_stock_for_analysis(code):
+            return web_server.pd.DataFrame()
+
+        @staticmethod
         def list_all_stocks():
             return ["000001"]
 
@@ -338,9 +342,9 @@ def test_selection_job_surfaces_strategy_errors(monkeypatch, tmp_path):
         "chunk_size": 1,
     })
     monkeypatch.setattr(web_server, "_resolve_selection_backend", lambda *args: "sequential")
-    monkeypatch.setattr(web_server, "build_worker_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr('research.service.build_worker_context', lambda *args, **kwargs: {})
     monkeypatch.setattr(web_server, "_save_selection_markdown", lambda *args, **kwargs: str(tmp_path / "result.md"))
-    monkeypatch.setattr(web_server, "process_selection_chunk", lambda *args, **kwargs: {
+    monkeypatch.setattr('research.service.process_selection_chunk', lambda *args, **kwargs: {
         "processed_count": 1,
         "valid_count": 1,
         "skipped_count": 0,

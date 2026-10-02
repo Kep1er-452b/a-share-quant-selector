@@ -30,6 +30,9 @@ sys.path.insert(0, str(project_root))
 
 from utils.csv_manager import CSVManager
 from utils.atomic_io import atomic_write_json
+from utils.update_service import UpdateService
+from research.store import ResearchStore, warehouse_research_root
+from research.service import ResearchService
 from utils.data_provider import BOARD_LABELS, create_data_provider, get_config_value, DataProviderError
 from utils.error_logging import append_system_log as shared_append_system_log, write_error_report
 from utils.update_diagnostics import attach_auto_snapshot, resolve_update_error_report, run_update_diagnostics
@@ -909,6 +912,8 @@ def _parse_requested_strategies(raw_value, allow_empty=False):
 def _parse_formula_spec(raw_value):
     if not isinstance(raw_value, dict) or not raw_value.get('enabled'):
         return None
+    if raw_value.get('formula_id'):
+        return _research_service().resolve_formula(raw_value['formula_id'], raw_value.get('revision'), raw_value.get('parameters'))
     formula = _bounded_text(raw_value.get('expression') or raw_value.get('formula'), '条件公式', max_length=2000)
     label = _bounded_text(raw_value.get('name') or raw_value.get('label'), '公式名称', max_length=40) or FORMULA_DISPLAY_NAME
     try:
@@ -1929,7 +1934,7 @@ def block_requests_after_halt():
         return Response("Invalid Host header", status=400, mimetype="text/plain")
     if request.path.startswith('/api/'):
         g.ops_request_started_at = time.perf_counter()
-    sensitive_get = request.path.startswith(('/api/ops/', '/api/server-results/'))
+    sensitive_get = request.path.startswith(('/api/ops/', '/api/server-results/', '/api/research/'))
     side_effect_request = request.path.startswith('/api/') and (
         request.method not in {'GET', 'HEAD', 'OPTIONS'} or sensitive_get
     )
@@ -2117,46 +2122,18 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
                     f"已处理 {completed_candidates}/{len(candidates)}，当前至 {current_stock['name']}({current_stock['code']})。"
                 )
 
-        if backend == 'thread':
-            worker_context = build_worker_context(
-                data_dir,
-                requested_strategies,
-                str(registry.params_file),
-                runtime_strategy_params,
-            )
-            worker_context['cancel_event'] = cancel_event
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = [
-                    executor.submit(process_selection_chunk, chunk, "all", False, worker_context)
-                    for chunk in candidate_chunks
-                ]
-                for future in as_completed(futures):
-                    if is_cancelled():
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        finish_cancelled()
-                        return
-                    if _is_halted():
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        _update_job(job_id, status='halted', error='系统已急停')
-                        _append_job_log_by_id(job_id, '任务因系统急停而终止。')
-                        return
-                    consume_chunk(future.result())
-        else:
-            worker_context = build_worker_context(
-                data_dir,
-                requested_strategies,
-                str(registry.params_file),
-                runtime_strategy_params,
-            )
-            for chunk in candidate_chunks:
-                if is_cancelled():
-                    finish_cancelled()
-                    return
-                if _is_halted():
-                    _update_job(job_id, status='halted', error='系统已急停')
-                    _append_job_log_by_id(job_id, '任务因系统急停而终止。')
-                    return
-                consume_chunk(process_selection_chunk(chunk, "all", False, worker_context))
+        research = ResearchService(ResearchStore(warehouse_research_root(manager.data_dir)))
+        _update_job(job_id, current_step='冻结选股输入')
+        snapshot = research.capture(manager, candidates,
+            provider=Path(manager.data_dir).name if Path(manager.data_dir).parent.name == 'providers' else 'local',
+            cancel=lambda: is_cancelled() or _is_halted())
+        _update_job(job_id, snapshot_id=snapshot['id'])
+        recorded_run = research.execute(snapshot['id'], requested_strategies, str(registry.params_file),
+            runtime_params=runtime_strategy_params, backend=backend, observer=consume_chunk,
+            max_workers=max(effective_workers, 1), chunk_size=settings['chunk_size'],
+            cancel=lambda: is_cancelled() or _is_halted())
+        results = recorded_run['results']
+        _update_job(job_id, run_id=recorded_run['id'])
 
         for strategy_name in results:
             results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
@@ -2201,6 +2178,11 @@ def _run_selection_job(job_id, requested_boards, requested_strategies, formula_s
             )
         )
         _append_job_log_by_id(job_id, f"选股记录已保存: {report_path}")
+    except InterruptedError:
+        if _is_halted():
+            _update_job(job_id, status='halted', current_stock=None, error='系统已急停')
+        else:
+            finish_cancelled()
     except Exception as exc:
         error_report_path = write_error_report(
             'selection',
@@ -2237,6 +2219,9 @@ def _emit_update_progress(job_id, payload, phase_offset=0, phase_weight=100):
         retry_count=retry_count,
         current_step=current_step,
         current_stock=current_stock,
+        stage=payload.get('stage'),
+        core_elapsed_seconds=payload.get('core_elapsed_seconds'),
+        batch=payload.get('batch'),
     )
 
 
@@ -2447,6 +2432,11 @@ def _provider_switch_warnings(data_root, provider, provider_state=None):
 
 def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
     config = _load_config()
+    with update_jobs_lock:
+        batch_override = (update_jobs.get(job_id) or {}).get('batch_daily')
+    if batch_override is not None:
+        config = deepcopy(config)
+        config.setdefault('data_source', {}).setdefault('tushare', {})['batch_daily_enabled'] = batch_override
     data_dir = str(_config_value(config, 'data_dir', default='data'))
     provider = None
     cancel_event = _update_cancel_event(job_id)
@@ -2574,7 +2564,7 @@ def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
                         f"{step}: {stock.get('name', '未知')}({stock.get('code', '--')}) {processed}/{max(total, 1)}"
                     )
 
-        sync_summary = provider.sync_target_data(
+        sync_summary = UpdateService().execute(provider,
             target_universe,
             board='all',
             max_stocks=max_stocks,
@@ -2582,6 +2572,7 @@ def _run_update_job(job_id, provider_name, provider_token, max_stocks=None):
             progress_callback=progress_callback,
             halt_checker=lambda: _is_halted() or is_cancelled(),
         )
+        _update_update_job(job_id, core_timings=getattr(provider,'update_timings',{}))
 
         ensure_update_continues()
 
@@ -4253,6 +4244,7 @@ def get_update_options():
             'data': {
                 'default_provider': configured_provider,
                 'has_tushare_token': has_tushare_token,
+                'batch_daily_enabled': bool(get_config_value(config,'data_source','tushare','batch_daily_enabled',default=False)),
                 'latest_date': latest_date,
                 'active_provider': active_state.get('active_provider'),
                 'active_provider_state': active_state,
@@ -4282,6 +4274,9 @@ def start_update_job():
             return jsonify({'success': False, 'error': '不支持的数据源'}), 400
 
         tushare_token = _bounded_text(payload.get('tushare_token'), 'Tushare Token', max_length=128)
+        batch_daily = payload.get('batch_daily')
+        if batch_daily is not None and not isinstance(batch_daily, bool):
+            return jsonify({'success': False, 'error': 'batch_daily 必须为布尔值'}), 400
         max_stocks = payload.get('max_stocks')
         if max_stocks in ('', None):
             max_stocks = None
@@ -4316,6 +4311,8 @@ def start_update_job():
                     'job': running_selection,
                 }), 409
             job_id = _create_update_job(provider, max_stocks=max_stocks)
+            if batch_daily is not None:
+                _update_update_job(job_id, batch_daily=batch_daily)
         thread = _job_thread(
             target=_run_update_job,
             args=(job_id, provider, tushare_token, max_stocks),
@@ -5014,6 +5011,50 @@ app.register_blueprint(create_equities_blueprint(services={
     'a_share': _AShareEquityWebAdapter(),
     'hong_kong': _HongKongEquityWebAdapter(),
 }))
+
+
+def _research_service():
+    return ResearchService(ResearchStore(warehouse_research_root(_active_csv_manager().data_dir)))
+
+
+def _start_research_job(title, work):
+    with job_admission_lock:
+        conflict = _selection_conflict_response()
+        if conflict:
+            return conflict
+        job_id = _create_selection_job(['research'], [])
+        _update_job(job_id, market='a_share', domain='research', current_step=title)
+    def execute():
+        with selection_jobs_lock:
+            event = selection_cancel_events[job_id]
+        cancel = lambda: event.is_set() or _is_halted()
+        try:
+            if cancel():
+                raise InterruptedError('研究任务已取消')
+            _update_job(job_id, status='running')
+            def progress(done, total):
+                _update_job(job_id, processed_count=done, total_count=total,
+                            progress_pct=int(done/max(total,1)*100))
+            result = work(cancel, progress)
+            if cancel():
+                raise InterruptedError('研究任务已取消')
+            preview = {key:value for key,value in result.items()
+                       if key in {'id','snapshot_id','status','market','provider','price_view'}}
+            _update_job(job_id, status='completed_with_warnings' if result.get('status')=='partial' else 'completed',
+                        research_result=preview, progress_pct=100, finished_at=_job_timestamp())
+        except InterruptedError:
+            _update_job(job_id, status='halted' if _is_halted() else 'cancelled', finished_at=_job_timestamp())
+        except Exception as exc:
+            _update_job(job_id, status='error', error=str(exc), finished_at=_job_timestamp())
+    thread = _job_thread(target=execute, args=(), name=f'aqs-research-{job_id[:8]}')
+    _start_background_job(thread, lambda exc:_update_job(job_id,status='error',error=str(exc)))
+    return jsonify(success=True, job_id=job_id), 202
+
+
+from web_api.research import create_research_blueprint
+app.register_blueprint(create_research_blueprint(lambda:_research_service(), start_job=_start_research_job,
+    params_file=lambda:str(registry.params_file), manager_factory=lambda:_active_csv_manager(),
+    watchlist_factory=lambda:MarketWatchlistStore(_watchlist_path())))
 
 
 def run_web_server(host=None, port=None, debug=False, config=None, auto_port=None):

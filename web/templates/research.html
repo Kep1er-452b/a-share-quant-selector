@@ -1,0 +1,73 @@
+<section id="research-page" class="page">
+  <section class="panel research-panel">
+    <div class="panel-header"><span class="panel-title">RESEARCH LAB / A 股研究</span><span class="panel-meta">公式版本 · 冻结输入 · 历史会话 · 模拟账本</span></div>
+    <div id="research-unavailable" class="panel-body research-unavailable" hidden>当前研究工作台支持 A 股。港股的历史回放与模拟账户尚未开放，请切换到 A 股。</div>
+    <div class="panel-body research-content">
+      <div class="research-toolbar">
+        <button class="btn btn-ghost" data-research-view="formulas">公式与运行</button><button class="btn btn-ghost" data-research-view="pools">研究池</button><button class="btn btn-ghost" data-research-view="chart">图表复盘</button><button class="btn btn-ghost" data-research-view="replay">历史回放</button><button class="btn btn-ghost" data-research-view="account">模拟账户</button><button class="btn btn-ghost" data-research-action="refresh">刷新</button>
+      </div>
+      <div id="research-status" role="status" class="research-status">选择公式和冻结输入，建立可追溯的研究记录。</div>
+      <button class="btn btn-danger" id="research-cancel" data-research-action="cancel" hidden>停止研究任务</button>
+      <div class="research-context">
+        <label>冻结数据 <select id="research-snapshot"></select></label>
+        <label>证券 <input id="research-symbol" class="search-input" value="000001.SZ" maxlength="12"></label>
+        <label>历史会话 <select id="research-session"><option value="">实时研究</option></select></label>
+        <span id="research-clock" class="panel-meta">当前仓库 / 冻结版本</span>
+      </div>
+      <div data-research-panel="formulas">
+        <div class="research-grid">
+          <div>
+            <label>公式版本 <select id="research-formula"><option value="">新建公式</option></select></label>
+            <label>名称 <input id="research-formula-name" class="search-input" maxlength="80" placeholder="例如：站上20日均线"></label>
+            <label>说明 <input id="research-formula-description" class="search-input" maxlength="1000"></label>
+            <label>白名单条件公式 <textarea id="research-formula-source" maxlength="2000" rows="4" placeholder="C > MA(C, N) AND V > MA(V, 5)"></textarea></label>
+            <label>参数定义（JSON）<textarea id="research-formula-parameters" rows="2">{"N":{"default":20,"min":2,"max":250}}</textarea></label>
+            <div class="research-toolbar"><button class="btn btn-primary" data-research-action="save-formula">保存新版本</button><button class="btn btn-ghost" data-research-action="new-formula">新建</button><button class="btn btn-ghost" data-research-action="archive-formula">归档</button><button class="btn btn-ghost" data-research-action="test-formula">单股测试</button></div>
+          </div>
+          <div>
+            <label>快照证券（逗号分隔；空白冻结当前仓库）<input id="research-capture-symbols" class="search-input" placeholder="000001,600000"></label>
+            <button class="btn btn-ghost" data-research-action="capture">冻结行情输入</button>
+            <label>运行公式版本（留空使用当前版本）<input id="research-formula-revision" type="number" min="1" max="100000" class="search-input"></label>
+            <label>运行参数（JSON；空对象使用版本默认值）<textarea id="research-run-parameters" rows="2">{}</textarea></label>
+            <label>执行方式 <select id="research-backend"><option value="thread">线程</option><option value="sequential">顺序</option><option value="process">进程</option></select></label>
+            <label>排序 <select id="research-score"><option value="">证券代码</option><option value="activity_v1">量能活跃度 v1（不改变入选条件）</option></select></label>
+            <button class="btn btn-primary" data-research-action="run">执行版本公式</button>
+            <p class="panel-meta">活跃度分是量比的展示映射，不能解释为上涨概率；缺分数时保持代码排序。</p>
+          </div>
+        </div>
+        <label>历史运行 <select id="research-run"></select></label>
+        <div id="research-results"></div>
+        <details><summary>运行上下文和原始结果</summary><pre id="research-run-detail" class="research-json"></pre></details>
+      </div>
+      <div data-research-panel="pools" hidden>
+        <div class="research-toolbar"><button class="btn btn-ghost" data-research-action="initialize-pools">创建四类研究池并迁入原自选</button><input id="research-pool-name" class="search-input" placeholder="池名称" maxlength="80"><button class="btn btn-primary" data-research-action="save-pool">新建池</button><button class="btn btn-ghost" data-research-action="rename-pool">改名</button></div>
+        <label>当前研究池 <select id="research-pool"></select></label>
+        <label>备注 <input id="research-note" class="search-input" maxlength="2000"></label>
+        <div class="research-toolbar"><button class="btn btn-primary" data-research-action="add-member">加入当前池</button><label>冷却至 <input id="research-cooldown" type="date"></label><button class="btn btn-ghost" data-research-action="cooldown">保存冷却标记</button><label><input id="research-hide-cooling" type="checkbox">在研究视图隐藏冷却证券</label></div>
+        <div id="research-members"></div>
+        <p class="panel-meta">从当前池移除只影响该池。冷却是研究视图过滤，不改写选股结果。原自选文件保留。</p>
+      </div>
+      <div data-research-panel="chart" hidden>
+        <div class="research-toolbar"><label>起始 <input id="research-range-start" type="date"></label><label>截止 <input id="research-range-end" type="date"></label><button class="btn btn-primary" data-research-action="chart">加载图表和区间统计</button></div>
+        <div id="research-range" class="research-status"></div>
+        <div id="research-chart" class="research-chart"></div>
+        <pre id="research-signal-detail" class="research-json"></pre>
+      </div>
+      <div data-research-panel="replay" hidden>
+        <label>导入原始行情档案（JSON，最大10 MiB）<input id="research-archive-file" type="file" accept="application/json,.json"></label><button class="btn btn-ghost" data-research-action="import-archive">导入冻结档案</button>
+        <p class="panel-meta">普通 CSV 支持价格复盘。时点研究要求原始价格、复权因子、历史上市/退市与名称记录；范围仅限提供的历史集合，财务公告数据不足时不支持相关条件。</p>
+        <div class="research-toolbar"><label>虚拟日期 <input id="research-asof" type="date"></label><label>阶段 <select id="research-phase"><option value="close">收盘后</option><option value="open">开盘前</option></select></label><label>模式 <select id="research-replay-mode"><option value="price_only">价格复盘</option><option value="point_in_time">时点研究（需完整档案）</option></select></label><button class="btn btn-primary" data-research-action="create-session">创建会话</button></div>
+        <div class="research-toolbar"><button class="btn btn-primary" data-research-action="advance">推进一个阶段</button><button class="btn btn-ghost" data-research-action="checkpoint">保存检查点</button><label>检查点 <select id="research-checkpoint"></select></label><button class="btn btn-ghost" data-research-action="restore">从检查点创建分支</button><button class="btn btn-ghost" data-research-action="run">按当前时点选股</button></div>
+        <pre id="research-session-detail" class="research-json"></pre>
+      </div>
+      <div data-research-panel="account" hidden>
+        <div class="research-toolbar"><label>模拟账户 <select id="research-account"></select></label><label>初始资金（元）<input id="research-cash" class="search-input" type="number" value="100000" min="100" max="1000000000"></label><button class="btn btn-primary" data-research-action="create-account">在当前会话创建账户</button></div>
+        <label>成交假设（新账户保存后固定）<textarea id="research-assumptions" rows="3">{"commission_rate":0.0003,"minimum_commission":5,"slippage_bps":5,"previous_volume_capacity":0.01}</textarea></label>
+        <p class="panel-meta">日线模拟按下一交易日开盘及前日成交量容量撮合，涨跌停开盘保守不成交；需要原始价格、明确涨跌停价格和公司行动。规则版本支持2023-08-28之后，不连接券商。</p>
+        <div class="research-toolbar"><label>方向 <select id="research-order-side"><option value="buy">买入</option><option value="sell">卖出</option></select></label><label>股数 <input id="research-order-quantity" class="search-input" type="number" value="100" min="1" max="1000000"></label><button class="btn btn-primary" data-research-action="order">提交模拟订单</button><button class="btn btn-ghost" data-research-action="settle">开盘撮合</button><button class="btn btn-ghost" data-research-action="mark">记录收盘净值</button></div>
+        <div id="research-account-summary" class="research-status"></div><div id="research-orders"></div><div id="research-nav" class="research-chart"></div>
+        <details><summary>持仓、事件账本与费用</summary><pre id="research-ledger" class="research-json"></pre></details>
+      </div>
+    </div>
+  </section>
+</section>

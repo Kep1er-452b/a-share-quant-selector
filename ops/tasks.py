@@ -13,6 +13,7 @@ _FIELDS = (
     "elapsed_seconds", "progress_pct", "current_step", "current_stock", "domain",
     "market", "provider", "dataset", "symbol", "warning", "error", "error_code",
     "processed_count", "total_count", "success_count", "failed_count",
+    "stage", "snapshot_id", "run_id", "core_elapsed_seconds",
 )
 _ACTIVE = {"queued", "running", "cancelling"}
 

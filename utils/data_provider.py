@@ -716,6 +716,13 @@ class BaseDataProvider:
         """Provider hook for warming batch auxiliary data before per-stock updates."""
         return None
 
+    def prepare_incremental_updates(self, items, status_map, latest_trade_date, trade_dates,
+                                    *, halt_checker=None, progress_callback=None):
+        """Shared CLI/Web lifecycle; providers may prepare a frozen batch view."""
+        if halt_checker and halt_checker():
+            raise InterruptedError("系统已急停或任务已取消")
+        self.prefetch_incremental_aux_data(trade_dates)
+
     def get_runtime_stats(self) -> dict:
         """Provider hook for exposing lightweight sync diagnostics."""
         return {}
@@ -1276,7 +1283,10 @@ class BaseDataProvider:
             latest_local_date = pd.to_datetime(latest_local).date() if latest_local else None
             incremental_missing_dates.extend(self.get_missing_trade_dates(latest_local_date, latest_trade_date))
         if incremental_missing_dates:
-            self.prefetch_incremental_aux_data(incremental_missing_dates)
+            self.prepare_incremental_updates(
+                incremental, status_map, latest_trade_date, incremental_missing_dates,
+                halt_checker=halt_checker, progress_callback=progress_callback,
+            )
 
         processed = 0
         total_work = len(incremental) + len(full_refresh)

@@ -9,6 +9,7 @@ import re
 import tempfile
 import time
 import urllib.request
+import uuid
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ import requests
 from market_data.equity_symbols import canonical_a_share_symbol
 from market_data.tushare_client import ensure_tushare_transport
 from utils.data_provider import BaseDataProvider, DataProviderError
+from utils.tushare_batch import BatchSliceStore, BatchSliceError, fetch_date_slice, qfq_stock_frame
 
 
 class _DirectTushareApi:
@@ -173,7 +175,150 @@ class TushareFetcher(BaseDataProvider):
         self._preflight_stock_basic_df = pd.DataFrame()
         self._preflight_used_stock_cache = False
         self._preflight_warnings = []
+        self.batch_daily_enabled = bool(tushare_config.get("batch_daily_enabled", False))
+        self.batch_store = BatchSliceStore(Path(data_dir) / "batch")
+        self._batch_frames = {}
+        self._batch_context = None
+        self._batch_diagnostics = {}
+        self._batch_call_windows = {name: (Lock(), deque()) for name in ("daily", "adj_factor")}
         self._load_trade_calendar_cache()
+
+    def _call_batch_endpoint(self, endpoint, **kwargs):
+        for attempt in range(3):
+            try:
+                if endpoint == "daily_basic":
+                    return self._call_daily_basic(**kwargs)
+                lock, calls = self._batch_call_windows[endpoint]
+                self._throttle_call_window(lock, calls, self.pro_bar_limit_per_minute, endpoint)
+                return self._call_tracked(endpoint, getattr(self.pro, endpoint), retry_on_none=True, **kwargs)
+            except TushareProviderError:
+                raise
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                time.sleep(self.pro_bar_rate_limit_wait if self._is_rate_limit_error(exc) else 0.5 * (attempt + 1))
+
+    def prepare_incremental_updates(self, items, status_map, latest_trade_date, trade_dates,
+                                    *, halt_checker=None, progress_callback=None):
+        self._batch_frames = {}
+        self._batch_context = None
+        if not getattr(self, "batch_daily_enabled", False):
+            return super().prepare_incremental_updates(items, status_map, latest_trade_date, trade_dates,
+                                                      halt_checker=halt_checker, progress_callback=progress_callback)
+        started = time.perf_counter()
+        end = pd.Timestamp(latest_trade_date).strftime("%Y%m%d")
+        ranges, starts = {}, {}
+        for item in items:
+            local = status_map[item["code"]].get("latest_date")
+            if local not in starts:
+                count = max(len(self.get_missing_trade_dates(pd.Timestamp(local).date(), latest_trade_date)), 1)
+                starts[local] = self._resolve_update_start_date(min(count, 1000), latest_trade_date)
+            ranges[item["code"]] = pd.Timestamp(starts[local]).strftime("%Y%m%d")
+        dates = [pd.Timestamp(value).strftime("%Y%m%d") for value in
+                 self.get_trade_dates_between(min(starts.values()), latest_trade_date)]
+        plan_context = {'market': 'a_share', 'provider': 'tushare', 'price_adapter': 'pro_bar_qfq_2dp_v1',
+                        'sdk_version': getattr(getattr(self, 'ts', None), '__version__', 'unknown')}
+        retry_plans = {}
+        for key, plan in self.batch_store.state().get('plans', {}).items():
+            if (plan.get('status') in ('fetching', 'failed', 'cancelled')
+                    and set(plan.get('stock_ranges', {})) == set(ranges)
+                    and plan.get('end_date', '') <= end):
+                if plan.get('context', plan_context) != plan_context:
+                    raise TushareProviderError('未完成批量计划的执行环境已变化，请恢复原 SDK/价格适配版本后重试',
+                                               code='BATCH_PLAN_CONTEXT_CHANGED')
+                retry_plans[key] = plan
+        # Preserve the exact unfinished slices even if the local warehouse or
+        # today's calculated overlap has advanced since the interrupted job.
+        dates = sorted(set(dates) | {key.split('/')[1] for plan in retry_plans.values()
+                                     for key in plan['planned_slices']})
+        if not dates or len(dates) > 40:
+            if retry_plans:
+                raise TushareProviderError('未完成计划与新增日期合计超过40个交易日；请先关闭批量开关，通过原路径补齐历史',
+                                           code='BATCH_RETRY_WINDOW_EXCEEDED')
+            self._batch_diagnostics = {"mode": "stock_fallback", "reason": "batch_window_exceeds_40_days"}
+            return super().prepare_incremental_updates(items, status_map, latest_trade_date, trade_dates,
+                                                      halt_checker=halt_checker, progress_callback=progress_callback)
+        plan_id = f"{dates[0]}-{end}-{uuid.uuid4().hex[:8]}"
+        diagnostics = {"mode": "date_batch", "plan_id": plan_id, "dates": dates,
+                       "slice_count": 3 * len(dates), "cache_hits": 0, "stock_fallbacks": {},
+                       "resumed_plans": list(retry_plans)}
+        self._batch_diagnostics = diagnostics
+        self.batch_store.record_plan(plan_id,status='fetching',end_date=end,stock_ranges=ranges,context=plan_context,
+            resumed_plans=list(retry_plans),
+            planned_slices=[f'{dataset}/{date}' for date in dates for dataset in ('daily','daily_basic','adj_factor')])
+        try:
+            slices = {name: [] for name in ("daily", "daily_basic", "adj_factor")}
+            for date in dates:
+                for dataset in slices:
+                    if halt_checker and halt_checker():
+                        raise InterruptedError("系统已急停或任务已取消")
+                    if progress_callback:
+                        progress_callback({"stage": "batch_fetch", "current_step": f"按日批量获取 {dataset} {date}",
+                                           "batch": dict(diagnostics)})
+                    # Refetch the latest two dates for upstream revisions; old revisions
+                    # are immutable and available to research snapshots.
+                    frame = self.batch_store.load(dataset, date) if date not in dates[-2:] else None
+                    if frame is not None:
+                        diagnostics["cache_hits"] += 1
+                    else:
+                        previous = self.batch_store.state()["slices"].get(f"{dataset}/{date}", {})
+                        self.batch_store.record(dataset, date, status="pending", plan_id=plan_id,
+                                                attempts=previous.get("attempts", 0) + 1)
+                        try:
+                            frame = fetch_date_slice(self._call_batch_endpoint, dataset, date, halt_checker=halt_checker)
+                            if halt_checker and halt_checker():
+                                raise InterruptedError("系统已急停或任务已取消")
+                            frame = self.batch_store.save(dataset, date, frame)
+                        except Exception as exc:
+                            self.batch_store.record(dataset, date, status="cancelled" if isinstance(exc, InterruptedError) else "failed",
+                                                    error=type(exc).__name__)
+                            if isinstance(exc, (InterruptedError, TushareProviderError, OSError)):
+                                raise
+                            raise TushareProviderError(str(exc), code="BATCH_SLICE_INCOMPLETE", endpoint=dataset) from exc
+                    slices[dataset].append(frame)
+                raw_keys = set(slices["daily"][-1].ts_code)
+                for auxiliary in ("daily_basic", "adj_factor"):
+                    if raw_keys - set(slices[auxiliary][-1].ts_code):
+                        self.batch_store.record(auxiliary, date, status="failed", error="daily_coverage_mismatch")
+                        raise TushareProviderError(f"{auxiliary}/{date}: 行情缺少配套数据", code="BATCH_COVERAGE_MISMATCH", endpoint=auxiliary)
+            grouped = {dataset: {key: group for key, group in pd.concat(frames).groupby("ts_code")}
+                       for dataset, frames in slices.items()}
+            for item in items:
+                code, symbol = item["code"], self._to_ts_code(item["code"])
+                expected = {date for date in dates if date >= ranges[code]}
+                price = grouped["daily"].get(symbol)
+                factors = grouped["adj_factor"].get(symbol)
+                basic = grouped["daily_basic"].get(symbol)
+                if price is None or factors is None or basic is None:
+                    diagnostics["stock_fallbacks"][code] = "security_missing_in_batch"
+                    continue
+                price = price[price.trade_date >= ranges[code]]
+                factors = factors[factors.trade_date >= ranges[code]]
+                basic = basic[basic.trade_date >= ranges[code]]
+                # An absent day can be a suspension or a truncated response. Verify
+                # using the authoritative per-stock range instead of guessing.
+                if expected - set(price.trade_date) or expected - set(factors.trade_date):
+                    diagnostics["stock_fallbacks"][code] = "missing_dates_or_suspension"
+                    continue
+                self._batch_frames[code] = self._normalize_history_dataframe(qfq_stock_frame(price, factors), basic)
+            self._batch_context = (ranges, end)
+            diagnostics["prepared_stocks"] = len(self._batch_frames)
+            diagnostics["prepare_seconds"] = round(time.perf_counter() - started, 3)
+            state_slices = self.batch_store.state()['slices']
+            for old_id, old_plan in retry_plans.items():
+                self.batch_store.record_plan(old_id, status='resumed', resumed_by=plan_id,
+                    slices={key:state_slices[key]['checksum'] for key in old_plan['planned_slices']})
+            self.batch_store.record_plan(plan_id,status='prepared',stock_fallbacks=diagnostics['stock_fallbacks'],
+                prepared_stocks=len(self._batch_frames),slices={key:state_slices[key]['checksum']
+                    for key in [f'{dataset}/{date}' for date in dates for dataset in slices]})
+
+        except Exception as exc:
+            self._batch_frames = {}
+            self._batch_context = None
+            self.batch_store.record_plan(plan_id,
+                status='cancelled' if isinstance(exc, InterruptedError) else 'failed',
+                error=type(exc).__name__)
+            raise
 
     def _record_api_success(self, endpoint, result):
         empty = result is None or (isinstance(result, pd.DataFrame) and result.empty)
@@ -940,6 +1085,7 @@ class TushareFetcher(BaseDataProvider):
                 },
                 "daily_basic_failed_dates": sorted(self.daily_basic_by_date_failures),
                 "preflight": dict(self._preflight_result or {}),
+                "batch": dict(getattr(self, "_batch_diagnostics", {})),
             }
 
     @staticmethod
@@ -1314,6 +1460,14 @@ class TushareFetcher(BaseDataProvider):
         """
         抓取近期数据用于增量更新
         """
+        code = str(stock_code).zfill(6)
+        batch = getattr(self, "_batch_frames", {}).get(code)
+        context = getattr(self, "_batch_context", None)
+        if batch is not None and context:
+            current_end = self.get_latest_trade_date() or datetime.now().date()
+            if (pd.Timestamp(current_end).strftime('%Y%m%d') == context[1]
+                    and pd.Timestamp(self._resolve_update_start_date(days, current_end)).strftime('%Y%m%d') == context[0].get(code)):
+                return batch.copy()
         ts_code = self._to_ts_code(stock_code)
         end_date = self.get_latest_trade_date() or datetime.now().date()
         start_date = self._resolve_update_start_date(days, end_date)

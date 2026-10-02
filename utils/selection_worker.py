@@ -87,11 +87,18 @@ def build_worker_context(
     }
 
 
-def initialize_selection_worker(data_dir, strategy_names, params_file, runtime_strategy_params=None):
+def initialize_selection_worker(data_dir, strategy_names, params_file, runtime_strategy_params=None, reader_spec=None):
     """进程池初始化。"""
     global _WORKER_CONTEXT
     with contextlib.redirect_stdout(io.StringIO()):
-        _WORKER_CONTEXT = build_worker_context(data_dir, strategy_names, params_file, runtime_strategy_params)
+        reader = None
+        market = 'a_share'
+        if reader_spec:
+            from research.service import reader_from_descriptor
+            reader = reader_from_descriptor(reader_spec)
+            market = reader.snapshot['market']
+        _WORKER_CONTEXT = build_worker_context(data_dir, strategy_names, params_file, runtime_strategy_params,
+                                              market_id=market, reader=reader)
 
 
 def process_selection_chunk(candidates, category="all", return_data=False, context=None):
@@ -230,6 +237,7 @@ def process_selection_chunk(candidates, category="all", return_data=False, conte
                     "symbol": canonical_symbol,
                     "code": result_code,
                     "name": name,
+                    "data_as_of": pd.Timestamp(df.iloc[0]['date']).strftime('%Y-%m-%d'),
                     "signals": filtered_signals,
                 })
                 if return_data:

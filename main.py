@@ -44,6 +44,9 @@ from utils.strategy_labels import (
 )
 from utils.tushare_ext_workflow import refresh_tushare_extension_data
 from utils.local_config import load_config_file
+from utils.update_service import UpdateService
+from research.store import ResearchStore, warehouse_research_root
+from research.service import ResearchService
 
 
 def prompt_yes_no(message, default=True):
@@ -222,7 +225,7 @@ class QuantSystem:
         target_universe = self._resolve_target_universe(board=board, max_stocks=max_stocks)
         if not target_universe:
             return []
-        sync_summary = self.fetcher.sync_target_data(
+        sync_summary = UpdateService().execute(self.fetcher,
             target_universe,
             board=board,
             max_stocks=max_stocks,
@@ -553,55 +556,19 @@ class QuantSystem:
             print(f"工作单元数: {effective_workers}")
             print(f"批次大小: {chunk_size}")
 
-        if execution_backend == 'process':
-            with ProcessPoolExecutor(
-                max_workers=effective_workers,
-                initializer=initialize_selection_worker,
-                initargs=(str(self.csv_manager.data_dir), selected_strategy_names, str(self.registry.params_file)),
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        process_selection_chunk,
-                        chunk,
-                        category,
-                        return_data,
-                    )
-                    for chunk in candidate_chunks
-                ]
-                for future in as_completed(futures):
-                    consume_chunk(future.result())
-        elif execution_backend == 'thread':
-            worker_context = build_worker_context(
-                str(self.csv_manager.data_dir),
-                selected_strategy_names,
-                str(self.registry.params_file),
-            )
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = [
-                    executor.submit(
-                        process_selection_chunk,
-                        chunk,
-                        category,
-                        return_data,
-                        worker_context,
-                    )
-                    for chunk in candidate_chunks
-                ]
-                for future in as_completed(futures):
-                    consume_chunk(future.result())
-        else:
-            worker_context = build_worker_context(
-                str(self.csv_manager.data_dir),
-                selected_strategy_names,
-                str(self.registry.params_file),
-            )
-            for chunk in candidate_chunks:
-                consume_chunk(process_selection_chunk(
-                    chunk,
-                    category,
-                    return_data,
-                    worker_context,
-                ))
+        research = ResearchService(ResearchStore(warehouse_research_root(self.csv_manager.data_dir)))
+        snapshot = research.capture(self.csv_manager, candidates,
+                                    provider=getattr(self, 'provider_name', 'local'))
+        recorded_run = research.execute(
+            snapshot['id'], selected_strategy_names, str(self.registry.params_file),
+            backend=execution_backend, observer=consume_chunk, return_data=return_data,
+            max_workers=max(effective_workers, 1), chunk_size=chunk_size, category=category,
+        )
+        results = recorded_run['results']
+        self.last_selection_run_id = recorded_run['id']
+        if return_data:
+            indicators_dict = recorded_run['indicators_dict']
+        print(f"研究运行快照: {recorded_run['id']}")
 
         for strategy_name in results:
             results[strategy_name] = sorted(results[strategy_name], key=lambda item: item['code'])
@@ -921,7 +888,7 @@ class QuantSystem:
             is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
             message = "检测到本地数据不是最新，是否先抓取/补齐目标股票池再筛选？"
             if is_interactive and prompt_yes_no(message, default=True):
-                self.fetcher.sync_target_data(target_universe, board=board, max_stocks=max_stocks, purpose='run')
+                UpdateService().execute(self.fetcher, target_universe, board=board, max_stocks=max_stocks, purpose='run')
                 self._activate_fetcher_provider()
             else:
                 print("⚠️ 本地数据不是最新，已停止筛选。可使用 `select --force-select` 强制按现有数据筛选。")

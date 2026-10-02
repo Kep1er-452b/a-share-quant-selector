@@ -13,9 +13,11 @@ const PAGE_TITLES = {
     macro: '宏观经济',
     industry: '行业研究',
     system: '系统运维',
+    research: '研究工作台',
 };
 
 const quantDomainWorkspaces = {
+    research: window.quantResearchWorkspace,
     futures: window.quantFuturesWorkspace,
     macro: window.quantMacroWorkspace,
     industry: window.quantIndustryWorkspace,
@@ -4361,6 +4363,8 @@ async function loadUpdateOptions() {
         }
         const data = result.data || {};
         state.updateHasTushareToken = Boolean(data.has_tushare_token);
+        const batchDailyOption = document.getElementById('update-batch-daily');
+        if (batchDailyOption) batchDailyOption.checked = Boolean(data.batch_daily_enabled);
         state.updateDefaultProvider = data.default_provider || 'tushare';
         if (!state.updateProvider) {
             state.updateProvider = state.updateDefaultProvider;
@@ -4556,6 +4560,7 @@ async function startUpdateJob(provider, token = '') {
             body: JSON.stringify({
                 provider,
                 tushare_token: token,
+                batch_daily: Boolean(document.getElementById('update-batch-daily')?.checked),
             }),
         });
         if (!result.success) {
